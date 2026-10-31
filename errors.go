@@ -49,7 +49,8 @@ type Error struct {
 
 func (e *Error) Error() string {
 	text := string(e.Body.Code) + ": " + e.Body.Message
-	for name, message := range e.Body.Fields {
+	for _, name := range sortedKeys(e.Body.Fields) {
+		message := e.Body.Fields[name]
 		text += " (" + name + ": " + message + ")"
 	}
 	return text

@@ -149,14 +149,14 @@ func (m *Mutation) validate(handleMissing bool) {
 		}
 	}
 	if m.clientID != ClientIDNone {
-		m.failWith(requireJSONField(m.requestType, keyFieldJSON, "ClientID accepts"))
+		m.failWith(requireJSONField(m.requestType, keyFieldJSON, "ClientID accepts it"))
 	}
 	for _, name := range sortedKeys(m.fieldChecks) {
 		if m.fieldChecks[name] == nil {
 			m.fail("FieldChecks[%q] is nil", name)
 			return
 		}
-		m.failWith(requireJSONField(m.requestType, name, "FieldChecks names"))
+		m.failWith(requireJSONField(m.requestType, name, "FieldChecks names it"))
 	}
 }
 
@@ -226,13 +226,13 @@ func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := m.checkClientID(present); err != nil {
+		return nil, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(body); err != nil {
 		return nil, bodyError(err)
-	}
-	if err := m.checkClientID(present); err != nil {
-		return nil, err
 	}
 	if err := m.checkWrites(ctx, present); err != nil {
 		return nil, err
@@ -243,12 +243,17 @@ func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 // presentFields returns the body's top-level fields; an unknown one is refused by name,
 // which the decoder cannot do (its message is text only).
 func (m *Mutation) presentFields(raw []byte) (map[string]json.RawMessage, error) {
-	var present map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &present); err != nil {
-		return nil, bodyError(err)
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, invalidParameter("body", "required")
 	}
-	if present == nil {
+	var present map[string]json.RawMessage
+	var typeError *json.UnmarshalTypeError
+	err := json.Unmarshal(raw, &present)
+	switch {
+	case errors.As(err, &typeError), err == nil && present == nil:
 		return nil, invalidParameter("body", "must be an object")
+	case err != nil:
+		return nil, bodyError(err)
 	}
 	known := jsonFieldsOf(m.requestType)
 	for _, name := range sortedKeys(present) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 
 	"github.com/govengers/auth/authorization"
 )
@@ -80,7 +81,7 @@ func (u *Upload) validate(handleMissing bool) {
 	}
 	for _, contentType := range u.contentTypes {
 		mediaType, _, err := mime.ParseMediaType(contentType)
-		if err != nil || mediaType != contentType {
+		if err != nil || mediaType != contentType || strings.Count(mediaType, "/") != 1 {
 			u.fail("ContentTypes has %q, which is not a plain media type", contentType)
 		}
 	}

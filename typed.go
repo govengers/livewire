@@ -156,7 +156,7 @@ func validateGuards(itemType reflect.Type, guarded []GuardedField) error {
 			return fmt.Errorf("the field %q is guarded twice", guard.Name)
 		}
 		seen[guard.Name] = true
-		if err := requireJSONField(itemType, guard.Name, "Guarded names"); err != nil {
+		if err := requireJSONField(itemType, guard.Name, "Guarded names it"); err != nil {
 			return err
 		}
 	}

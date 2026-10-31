@@ -73,11 +73,6 @@ func (r *Registry) Add(declarations ...Declaration) error {
 }
 
 func (r *Registry) stage(declaration Declaration) error {
-	switch declaration.(type) {
-	case *Resource, *List, *Object, *Mutation, *Upload:
-	default:
-		return fmt.Errorf("livewire: %T is not a declaration kind", declaration)
-	}
 	name := declaration.Name()
 	if err := declaration.signature().err; err != nil {
 		return fmt.Errorf("livewire: %s %q: %w", declaration.Kind(), name, err)

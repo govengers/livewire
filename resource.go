@@ -209,7 +209,7 @@ func (r *Resource) validate(listMissing, getMissing bool) {
 		r.failWith(requireJSONField(r.itemType, keyFieldJSON, liveListNeedsID))
 	}
 	if r.versioned {
-		r.failWith(requireJSONField(r.itemType, "version", "a versioned resource exposes (D34)"))
+		r.failWith(requireJSONField(r.itemType, "version", "a versioned resource exposes it, D34"))
 	}
 }
 
@@ -226,7 +226,7 @@ func (r *Resource) validateItem(getMissing bool) {
 	case getMissing:
 		r.fail("Get is required with Item")
 	default:
-		r.failWith(requireJSONField(r.itemType, r.item.Field, "the item key reads"))
+		r.failWith(requireJSONField(r.itemType, r.item.Field, "the item key reads it"))
 	}
 }
 
@@ -453,7 +453,7 @@ func (r *Resource) distinctField(ctx context.Context, name string) (query.Field,
 	switch {
 	case !ok || !field.Filter:
 		return query.Field{}, invalidParameter(ParameterField, "must be a filterable field")
-	case hiddenFields(ctx, query.Fields{field})[name]:
+	case field.Read != nil && field.Read(ctx) != nil:
 		return query.Field{}, ForbiddenField(name)
 	}
 	return field, nil

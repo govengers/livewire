@@ -23,8 +23,8 @@ const (
 )
 
 // Declaration is one entry of the registry: a *Resource, *List, *Object, *Mutation or
-// *Upload. The interface is sealed to those five kinds; Registry.Add refuses anything else.
-// Path is relative to the registry's BasePath and uses `{name}` placeholders.
+// *Upload. The interface is sealed to those five kinds. Path is relative to the registry's
+// BasePath and uses `{name}` placeholders.
 type Declaration interface {
 	Kind() Kind
 	Name() string
@@ -196,18 +196,20 @@ func jsonName(field reflect.StructField) (name string, tagged bool) {
 	return name, true
 }
 
+// requireJSONField checks that a struct type marshals a field named name; why says who needs
+// it. A type that is not a struct cannot be checked and passes.
 func requireJSONField(itemType reflect.Type, name, why string) error {
 	if itemType.Kind() != reflect.Struct {
 		return nil
 	}
 	if _, ok := jsonFieldsOf(itemType)[name]; !ok {
-		return fmt.Errorf("the item type %s has no JSON field %q, which %s", itemType, name, why)
+		return fmt.Errorf("the type %s has no JSON field %q (%s)", itemType, name, why)
 	}
 	return nil
 }
 
 const (
-	liveListNeedsID = "a live list is diffed by it"
+	liveListNeedsID = "a live list is diffed by id"
 	keyFieldJSON    = "id"
 )
 

@@ -317,7 +317,7 @@ func setScalar(target reflect.Value, parameter Parameter, raw string) error {
 		if err != nil {
 			return invalidParameter(parameter.Name, "must be an RFC 3339 time")
 		}
-		target.Set(reflect.ValueOf(instant))
+		target.Set(reflect.ValueOf(instant.UTC()))
 	case target.Kind() == reflect.String:
 		if err := checkEnum(parameter, raw); err != nil {
 			return err
