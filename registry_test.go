@@ -94,6 +94,16 @@ func TestRegistryAddRefusals(t *testing.T) {
 			options.Effect = livewire.Upserts("parts")
 		})}, want: "Upserts needs a response to upsert"},
 		{name: "effect target not live", declarations: []livewire.Declaration{newParameterizedList("byPart", "/by/{id}"), createMutation(func(options *createOptionsType) { options.Effect = livewire.Upserts("byPart") })}, want: `Effect target "byPart" is not live`},
+		{name: "upserts with a scalar response", declarations: []livewire.Declaration{parts(), livewire.NewMutation("rename", http.MethodPost, "/rename", &livewire.MutationOptions[livewire.NoParameters, createPart, string]{
+			Check: authorization.IsUser(), Effect: livewire.Upserts("parts"),
+			Handle: func(context.Context, *livewire.NoParameters, *createPart) (*string, error) { return new("x"), nil },
+		})}, want: "is a scalar and can carry no JSON field"},
+		{name: "upserts with a response without id", declarations: []livewire.Declaration{parts(), livewire.NewMutation("rename", http.MethodPost, "/rename", &livewire.MutationOptions[livewire.NoParameters, createPart, dashboard]{
+			Check: authorization.IsUser(), Effect: livewire.Upserts("parts"),
+			Handle: func(context.Context, *livewire.NoParameters, *createPart) (*dashboard, error) {
+				return &dashboard{}, nil
+			},
+		})}, want: `no JSON field "id" (Upserts keys the optimistic item by it)`},
 		{name: "construction error", declarations: []livewire.Declaration{livewire.NewResource[part]("parts", "/parts", nil)}, want: `resource "parts": Check is required`},
 		{name: "duplicate name", declarations: []livewire.Declaration{parts(), newDashboard("parts", "/dashboard")}, want: `object "parts": the name is already registered`},
 		{name: "duplicate route", declarations: []livewire.Declaration{parts(), newDashboard("dashboard", "/parts")}, want: `the route GET /parts is already registered by "parts"`},
@@ -166,6 +176,8 @@ func TestRegistryAddLeavesDeclarationsUntouchedOnFailure(t *testing.T) {
 	err = failing.Add(livewire.NewResource("parts", "/parts", strict), create, livewire.NewMutation("other", http.MethodPost, "/other", unbound))
 	require.ErrorContains(t, err, `Effect target "nope"`, "the later declaration fails in bind, after create was bound in staging")
 	require.Empty(t, failing.Declarations())
+	_, err = create.DecodeBody(userContext(), []byte(`{"name":"bolt"}`))
+	require.NoError(t, err, "the failed Add published no binding: name is not admin-only on create")
 
 	open, err := livewire.NewRegistry(nil)
 	require.NoError(t, err)
@@ -296,6 +308,10 @@ func TestTypedDeclarationErrors(t *testing.T) {
 			Tables: []string{"t"}, Read: authorization.IsUser(),
 			Load: func(context.Context, *livewire.NoParameters) ([][]string, error) { return nil, nil },
 		}), want: "is a scalar and can carry no JSON field"},
+		{name: "live list with a guarded id", declaration: livewire.NewList("s", "/s", &livewire.ListOptions[part, livewire.NoParameters]{
+			Tables: []string{"t"}, Read: authorization.IsUser(), Guarded: []livewire.GuardedField{{Name: "id", Read: authorization.IsAdmin()}},
+			Load: func(context.Context, *livewire.NoParameters) ([]part, error) { return nil, nil },
+		}), want: `the field "id" of a live list cannot be guarded`},
 		{name: "guard unknown field", declaration: livewire.NewList("s", "/s", &livewire.ListOptions[part, livewire.NoParameters]{
 			Read: authorization.IsUser(), Guarded: []livewire.GuardedField{{Name: "nope", Read: authorization.IsAdmin()}},
 			Load: func(context.Context, *livewire.NoParameters) ([]part, error) { return nil, nil },
@@ -340,6 +356,45 @@ func TestLiveRawMessageItems(t *testing.T) {
 		Load: func(context.Context, *livewire.NoParameters) ([]json.RawMessage, error) { return nil, nil },
 	})
 	require.NoError(t, addError(t, list), "a marshaler type may carry an id; it cannot be checked at Add")
+}
+
+type badlyNamed struct {
+	ID     string `json:"id"`
+	Hidden string `json:"bad'name"` //nolint:staticcheck // SA5008: the malformed tag is the subject of the test
+	Quoted string `json:"'quoted'"` // a tag name encoding/json drops for the Go name
+}
+
+// TestOddJSONTagNamesFollowEncodingJSON pins that the field model names a field exactly as
+// the toolchain's encoding/json marshals it, whatever it makes of an odd tag.
+func TestOddJSONTagNamesFollowEncodingJSON(t *testing.T) {
+	marshaled, err := json.Marshal(badlyNamed{ID: "a", Hidden: "h", Quoted: "q"})
+	require.NoError(t, err)
+	var keys map[string]string
+	require.NoError(t, json.Unmarshal(marshaled, &keys))
+	require.Len(t, keys, 3)
+	require.NotContains(t, keys, "bad'name")
+	require.Contains(t, keys, "Quoted", "an unusable name falls back to the Go name")
+	var secretKey string
+	for key, value := range keys {
+		if value == "h" {
+			secretKey = key
+		}
+	}
+	require.NotEmpty(t, secretKey)
+
+	load := func(context.Context, *livewire.NoParameters) ([]badlyNamed, error) { return nil, nil }
+	err = addError(t, livewire.NewList("s", "/s", &livewire.ListOptions[badlyNamed, livewire.NoParameters]{
+		Read: authorization.IsUser(), Guarded: []livewire.GuardedField{{Name: "bad'name", Read: authorization.IsAdmin()}}, Load: load,
+	}))
+	require.ErrorContains(t, err, `no JSON field "bad'name"`, "a guard under the tag as written protects nothing")
+
+	list := livewire.NewList("s", "/s", &livewire.ListOptions[badlyNamed, livewire.NoParameters]{
+		Read: authorization.IsUser(), Guarded: []livewire.GuardedField{{Name: secretKey, Read: authorization.IsAdmin()}, {Name: "Quoted", Read: authorization.IsAdmin()}}, Load: load,
+	})
+	require.NoError(t, addError(t, list))
+	redacted, err := livewire.RedactItems(userContext(), list.Fields(), json.RawMessage(`[`+string(marshaled)+`]`))
+	require.NoError(t, err)
+	require.JSONEq(t, `[{"id":"a"}]`, string(redacted), "the guard under the marshaled name strips the value")
 }
 
 func TestLivePointerItemsWithID(t *testing.T) {

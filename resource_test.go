@@ -53,6 +53,9 @@ func TestResourceDeclarationErrors(t *testing.T) {
 		{name: "write-guarded field not in the item type", change: func(options *livewire.ResourceOptions[part]) {
 			options.Fields = append(options.Fields, query.Field{Name: "cost", Type: query.TypeFloat, SQL: "parts.cost", Write: authorization.IsAdmin()})
 		}, want: `no JSON field "cost"`},
+		{name: "live resource with a guarded id", change: func(options *livewire.ResourceOptions[part]) {
+			options.Fields[0].Read = authorization.IsAdmin()
+		}, want: `the field "id" of a live resource cannot have a Read check`},
 		{name: "cursor without a uuid id", change: func(options *livewire.ResourceOptions[part]) {
 			options.Cursor = true
 			options.Fields[0] = query.Field{Name: "id", Type: query.TypeInteger, SQL: "parts.number", Filter: true, Sort: true}

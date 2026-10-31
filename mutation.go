@@ -3,7 +3,6 @@ package livewire
 import (
 	"bytes"
 	"context"
-	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
-	"strings"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
@@ -54,7 +52,8 @@ type Effect struct {
 	Target string
 }
 
-// Upserts is the effect that upserts the response into the live lists of target.
+// Upserts is the effect that upserts the response into the live lists of target; the
+// response type must carry a JSON field "id".
 func Upserts(target string) Effect { return Effect{Kind: EffectUpserts, Target: target} }
 
 // Removes is the effect that removes the item named by the `id` path parameter from the live
@@ -63,12 +62,13 @@ func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: 
 
 // MutationOptions declares a write. Check and Handle are required. Status is the success
 // status (default 200; a NoContent response defaults to 204 and may set another 2xx, 204 with
-// a response body is refused). ClientID
-// accepts a client-generated `id` in the body of a create (POST, D18); the body of any other
-// method may carry an id and the handler judges it. Resource names a registered resource
-// whose field Write checks apply to the body by JSON name (D39); FieldChecks adds a check per
-// JSON field of Request. Effect is the optimistic effect on live lists (D36). The body is
-// validated with `validate` tags (go-playground/validator) after the structural checks.
+// a response body is refused). ClientID accepts a client-generated `id` in the body of a
+// create (POST, D18); the body of any other method may carry an id and the handler judges
+// it. Resource names a registered resource whose field Write checks apply to the body by
+// JSON name (D39); FieldChecks adds a check per JSON field of Request. Effect is the
+// optimistic effect on live lists (D36). The body is validated with `validate` tags
+// (go-playground/validator, D44) after the structural checks; a tag the validator cannot
+// parse, on any struct reachable from Request, is a declaration error.
 type MutationOptions[Parameters, Request, Response any] struct {
 	Check       authorization.Check
 	Status      int
@@ -80,7 +80,7 @@ type MutationOptions[Parameters, Request, Response any] struct {
 }
 
 // Mutation is a write: a JSON body decoded with unknown fields refused (D40), checked field
-// by field (D39), validated, handled in the engine's transaction (D31).
+// by field (D39), validated (D44), handled in the engine's transaction (D31).
 type Mutation struct {
 	signature
 	parametersType reflect.Type
@@ -93,6 +93,7 @@ type Mutation struct {
 	writeChecks    map[string]authorization.Check
 	effect         Effect
 	validate       *validator.Validate
+	fields         fieldIndex
 	handle         func(ctx context.Context, parameters, body any) (any, error)
 }
 
@@ -127,6 +128,7 @@ func NewMutation[Parameters, Request, Response any](name, method, path string, o
 	}
 	if mutation.HasBody() {
 		mutation.validate = validator.New(validator.WithRequiredStructEnabled())
+		mutation.fields = indexFields(mutation.requestType)
 	}
 	mutation.compileParameters(mutation.parametersType)
 	mutation.failWith(mutation.validateDeclaration(options.Status))
@@ -164,15 +166,17 @@ func (m *Mutation) Resource() string { return m.resource }
 // Effect is the optimistic effect (D36); the zero value is none.
 func (m *Mutation) Effect() Effect { return m.effect }
 
-// DecodeBody decodes raw into a new body value (a *Request) under the identity in ctx. A
-// body that is not a JSON object of the request type, or that carries an unknown field at
-// any depth, is 400 invalid_request naming the field by its path (D40); a client id a create
-// does not accept, or of the wrong form or version, is 400 naming "id" (D18); a field whose
-// write check refuses is 403 forbidden_field (D39); a body that fails its `validate` tags is
-// 400 naming each field with the failed tag. Every text in the response is fixed; the cause
-// of a decoding failure stays on the server. A member that repeats in an object is taken
-// last-wins, as encoding/json does, for the checks and the decode alike. A mutation without
-// a body refuses a non-empty raw.
+// DecodeBody decodes raw into a new body value (a *Request) under the identity in ctx. The
+// body is read once as a token stream alongside the request type: a body that is not a JSON
+// object, an unknown member at any depth (struct fields, array elements and map values
+// included) and a member that repeats within one object are 400 invalid_request naming the
+// member by its path (D40); a client id a create does not accept, or of the wrong form or
+// version, is 400 naming "id" (D18); a field whose write check refuses is 403
+// forbidden_field (D39); a body that fails its `validate` tags is 400 naming each field with
+// the failed tag (D44). Every text in the response is fixed; the cause of a decoding failure
+// stays on the server. A validator fault that only shows at run time (an argument behind
+// omitempty) is answered as an internal error, never as a panic. A mutation without a body
+// refuses a non-empty raw.
 func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	body := reflect.New(m.requestType).Interface()
 	if !m.HasBody() {
@@ -181,7 +185,7 @@ func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 		}
 		return body, nil
 	}
-	present, err := m.presentFields(raw)
+	present, err := inspectBody(raw, m.requestType, m.fields)
 	if err != nil {
 		return nil, err
 	}
@@ -196,8 +200,8 @@ func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	if err := m.checkWrites(ctx, present); err != nil {
 		return nil, err
 	}
-	if err := m.validate.StructCtx(ctx, body); err != nil {
-		return nil, m.validationError(err)
+	if err := m.validateBody(ctx, body); err != nil {
+		return nil, err
 	}
 	return body, nil
 }
@@ -244,21 +248,45 @@ func (m *Mutation) validateDeclaration(status int) error {
 	return m.validateFieldChecks()
 }
 
-// preflightValidateTags runs the validator once over a zero body: the validator parses tags
-// lazily and panics on a tag it cannot parse, which must be an Add error (D44), never a
-// request-time panic. The zero body's own validation failures are not the question here.
-func (m *Mutation) preflightValidateTags() (err error) {
+// preflightValidateTags runs the validator over a zero value of every struct type reachable
+// from the request type (through pointers, slices, arrays and maps): the validator parses
+// tags lazily and panics on a tag it cannot parse, which must be an Add error (D44), never a
+// request-time panic. The zero values' own validation failures are not the question here.
+func (m *Mutation) preflightValidateTags() error {
 	if m.validate == nil || m.requestType.Kind() != reflect.Struct {
 		return nil
 	}
+	for _, structType := range reachableStructs(m.requestType) {
+		if err := m.preflightStruct(structType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Mutation) preflightStruct(structType reflect.Type) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("the validate tags of %s cannot be parsed: %v", m.requestType, recovered)
+			err = fmt.Errorf("the validate tags of %s cannot be parsed: %v", structType, recovered)
 		}
 	}()
 	var failures validator.ValidationErrors
-	if err := m.validate.Struct(reflect.New(m.requestType).Interface()); err != nil && !errors.As(err, &failures) {
-		return fmt.Errorf("the validate tags of %s cannot be used: %w", m.requestType, err)
+	if err := m.validate.Struct(reflect.New(structType).Interface()); err != nil && !errors.As(err, &failures) {
+		return fmt.Errorf("the validate tags of %s cannot be used: %w", structType, err)
+	}
+	return nil
+}
+
+// validateBody runs the validate tags; a fault the preflight could not see (an argument
+// behind omitempty, evaluated only on a value) is an internal error, not a panic.
+func (m *Mutation) validateBody(ctx context.Context, body any) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("livewire: the validate tags of %s failed at run time: %v", m.requestType, recovered)
+		}
+	}()
+	if err := m.validate.StructCtx(ctx, body); err != nil {
+		return m.validationError(err)
 	}
 	return nil
 }
@@ -296,28 +324,6 @@ func (m *Mutation) writeChecksFor(fields query.Fields) map[string]authorization.
 		checks[field.Name] = authorization.Check(check)
 	}
 	return checks
-}
-
-// presentFields returns the body's top-level fields after refusing an unknown field at any
-// depth by its path, which the decoder cannot do (its message is text only).
-func (m *Mutation) presentFields(raw []byte) (map[string]json.RawMessage, error) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, invalidParameter("body", "required")
-	}
-	var present map[string]json.RawMessage
-	var typeError *json.UnmarshalTypeError
-	err := json.Unmarshal(raw, &present)
-	isObject := err == nil && present != nil
-	switch {
-	case errors.As(err, &typeError), err == nil && !isObject:
-		return nil, invalidParameter("body", "must be an object")
-	case err != nil:
-		return nil, invalidParameter("body", "must be valid JSON")
-	}
-	if path, unknown := unknownField(present, m.requestType, ""); unknown {
-		return nil, invalidParameter(path, "unknown field")
-	}
-	return present, nil
 }
 
 func (m *Mutation) checkClientID(present map[string]json.RawMessage) error {
@@ -363,78 +369,6 @@ func (m *Mutation) checkWrites(ctx context.Context, present map[string]json.RawM
 	return nil
 }
 
-var (
-	jsonUnmarshalerType = reflect.TypeFor[json.Unmarshaler]()
-	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
-)
-
-// unknownField finds the first JSON key of object that the struct type does not marshal,
-// descending into nested structs and arrays of structs; the path is dotted ("nested.note",
-// "lines[1].sku"). Types with their own unmarshaler are theirs to judge.
-func unknownField(object map[string]json.RawMessage, structType reflect.Type, prefix string) (string, bool) {
-	known := jsonFieldsOf(structType)
-	for _, key := range sortedKeys(object) {
-		field, ok := known[key]
-		if !ok {
-			return prefix + key, true
-		}
-		if path, unknown := unknownNested(object[key], field.Type, prefix+key); unknown {
-			return path, true
-		}
-	}
-	return "", false
-}
-
-func unknownNested(raw json.RawMessage, fieldType reflect.Type, path string) (string, bool) {
-	fieldType = unwrapPointer(fieldType)
-	switch {
-	case hasOwnUnmarshaler(fieldType):
-		return "", false
-	case fieldType.Kind() == reflect.Struct:
-		var nested map[string]json.RawMessage
-		if json.Unmarshal(raw, &nested) != nil || nested == nil {
-			return "", false // the decoder reports the shape
-		}
-		return unknownField(nested, fieldType, path+".")
-	case fieldType.Kind() == reflect.Slice || fieldType.Kind() == reflect.Array:
-		return unknownInElements(raw, fieldType.Elem(), path)
-	case fieldType.Kind() == reflect.Map && fieldType.Key().Kind() == reflect.String:
-		return unknownInEntries(raw, fieldType.Elem(), path)
-	}
-	return "", false
-}
-
-func unknownInElements(raw json.RawMessage, elementType reflect.Type, path string) (string, bool) {
-	var elements []json.RawMessage
-	if json.Unmarshal(raw, &elements) != nil {
-		return "", false
-	}
-	for position, element := range elements {
-		if nestedPath, unknown := unknownNested(element, elementType, fmt.Sprintf("%s[%d]", path, position)); unknown {
-			return nestedPath, true
-		}
-	}
-	return "", false
-}
-
-func unknownInEntries(raw json.RawMessage, valueType reflect.Type, path string) (string, bool) {
-	var entries map[string]json.RawMessage
-	if json.Unmarshal(raw, &entries) != nil {
-		return "", false
-	}
-	for _, key := range sortedKeys(entries) {
-		if nestedPath, unknown := unknownNested(entries[key], valueType, path+"."+key); unknown {
-			return nestedPath, true
-		}
-	}
-	return "", false
-}
-
-func hasOwnUnmarshaler(fieldType reflect.Type) bool {
-	pointer := reflect.PointerTo(fieldType)
-	return pointer.Implements(jsonUnmarshalerType) || pointer.Implements(textUnmarshalerType)
-}
-
 // bodyError maps a decoder failure to a fixed text; the decoder's own message, which may
 // repeat a custom unmarshaler's text, never reaches the client.
 func bodyError(err error) *Error {
@@ -456,40 +390,6 @@ func (m *Mutation) validationError(err error) error {
 		fields[jsonPathOf(m.requestType, failure.StructNamespace())] = failure.Tag()
 	}
 	return Invalid(fields)
-}
-
-// jsonPathOf translates the validator's Go namespace ("createPart.Nested.Note",
-// "audited.createPart.Secret", "order.Lines[1].SKU", "settings.Flags[key]") to the body's
-// JSON path: the root type is dropped, embedded structs contribute no segment, every other
-// field its JSON name, and the index or key suffixes stay.
-func jsonPathOf(rootType reflect.Type, structNamespace string) string {
-	_, remainder, _ := strings.Cut(structNamespace, ".")
-	var path []string
-	currentType := unwrapPointer(rootType)
-	for segment := range strings.SplitSeq(remainder, ".") {
-		goName, suffix := splitIndexSuffix(segment)
-		field, ok := currentType.FieldByName(goName)
-		if !ok {
-			return remainder // the namespace does not follow the type; report it as it is
-		}
-		if !field.Anonymous {
-			name, _ := jsonName(field)
-			path = append(path, name+suffix)
-		}
-		currentType = unwrapPointer(field.Type)
-		for currentType.Kind() == reflect.Slice || currentType.Kind() == reflect.Array || currentType.Kind() == reflect.Map {
-			currentType = unwrapPointer(currentType.Elem())
-		}
-	}
-	return strings.Join(path, ".")
-}
-
-// splitIndexSuffix separates "Lines[1]" into "Lines" and "[1]".
-func splitIndexSuffix(segment string) (name, suffix string) {
-	if open := strings.IndexByte(segment, '['); open >= 0 {
-		return segment[:open], segment[open:]
-	}
-	return segment, ""
 }
 
 func sortedKeys[Value any](values map[string]Value) []string {

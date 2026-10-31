@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"strconv"
 )
 
 // ListState is what a list subscription last pushed (the engine keeps one per list
@@ -83,24 +82,25 @@ func (s *ListState) ChangesSince(previous *ListState) *ListChange {
 	return changes
 }
 
-// itemID is the item's id as the key of the list: a JSON string as it is, a JSON number in
-// its canonical spelling (1, 1.0 and 1e0 are one id, as a JavaScript client sees them).
+// itemID is the item's id as the key of the list, read from the member spelled exactly "id"
+// (no case-insensitive alias): a JSON string as it is, a JSON number as JavaScript's Number
+// toString writes it (1, 1.0 and 1e0 are one id; 1234567 stays plain; 1e21 and 1e-7 take
+// exponent form; -0 is 0), so the server and the browser key the same.
 func itemID(item json.RawMessage) (string, error) {
-	var keyed struct {
-		ID json.RawMessage `json:"id"`
-	}
-	err := json.Unmarshal(item, &keyed)
-	missing := err != nil || len(keyed.ID) == 0 || bytes.Equal(keyed.ID, []byte("null"))
+	var members map[string]json.RawMessage
+	err := json.Unmarshal(item, &members)
+	rawID, present := members[keyFieldJSON]
+	missing := err != nil || !present || bytes.Equal(rawID, []byte("null"))
 	if missing {
 		return "", fmt.Errorf("livewire: a list item has no id: %s", item)
 	}
 	var text string
-	if err := json.Unmarshal(keyed.ID, &text); err == nil {
+	if err := json.Unmarshal(rawID, &text); err == nil {
 		return text, nil
 	}
 	var number float64
-	if err := json.Unmarshal(keyed.ID, &number); err == nil {
-		return strconv.FormatFloat(number, 'g', -1, 64), nil
+	if err := json.Unmarshal(rawID, &number); err == nil {
+		return formatNumberID(number), nil
 	}
-	return "", fmt.Errorf("livewire: a list item's id is neither a string nor a number: %s", keyed.ID)
+	return "", fmt.Errorf("livewire: a list item's id is neither a string nor a number: %s", rawID)
 }

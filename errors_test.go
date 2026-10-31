@@ -57,6 +57,12 @@ func TestResponseFor(t *testing.T) {
 		{name: "wrapped typed nil core error", err: fmt.Errorf("load: %w", (*livewire.Error)(nil)), status: http.StatusInternalServerError, code: livewire.CodeInternal},
 		{name: "typed nil query error", err: (*query.Error)(nil), status: http.StatusInternalServerError, code: livewire.CodeInternal},
 		{name: "typed nil auth error", err: (*auth.Error)(nil), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "zero core error", err: new(livewire.Error), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "wrapped zero core error", err: fmt.Errorf("x: %w", new(livewire.Error)), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "hand-built query error keeps only code and fields", err: &query.Error{Code: query.CodeInvalidFilter, Message: "secret text", Fields: map[string]string{"where": "x"}}, status: http.StatusBadRequest, code: livewire.CodeInvalidFilter, wantFields: map[string]string{"where": "x"}},
+		{name: "hand-built query error with a code outside the set", err: &query.Error{Code: "bogus", Message: "secret text"}, status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "wrapper whose Is matches a refusal", err: &matchingError{kind: auth.ErrForbidden, cause: errors.New("pq: connection refused to 10.0.0.1")}, status: http.StatusForbidden, code: livewire.CodeForbidden},
+		{name: "wrapper whose Is matches nothing known", err: &matchingError{kind: errors.New("odd"), cause: livewire.NotFound()}, status: http.StatusNotFound, code: livewire.CodeNotFound},
 		{name: "nil", err: nil, status: http.StatusInternalServerError, code: livewire.CodeInternal},
 	}
 	for _, testCase := range testCases {
@@ -68,9 +74,20 @@ func TestResponseFor(t *testing.T) {
 			require.Equal(t, testCase.wantFields, body.Fields)
 			require.NotContains(t, body.Message, "10.0.0.1")
 			require.NotContains(t, body.Message, "missing role")
+			require.NotContains(t, body.Message, "secret text")
 		})
 	}
 }
+
+// matchingError reports a kind through Is while its Unwrap returns an unrelated cause.
+type matchingError struct {
+	kind  error
+	cause error
+}
+
+func (w *matchingError) Error() string        { return w.cause.Error() }
+func (w *matchingError) Unwrap() error        { return w.cause }
+func (w *matchingError) Is(target error) bool { return target == w.kind }
 
 func TestErrorText(t *testing.T) {
 	err := livewire.Invalid(map[string]string{"name": "required", "age": "must be an integer"})

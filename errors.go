@@ -116,25 +116,40 @@ func ResponseFor(err error) (int, ErrorBody) {
 func responseForOne(err error) (int, ErrorBody, bool) {
 	switch typed := err.(type) { //nolint:errorlint // one node of the chain, not the chain: errors.As would look past it
 	case *Error:
-		if typed == nil {
-			return 0, ErrorBody{}, false
+		if typed == nil || typed.status == 0 {
+			return 0, ErrorBody{}, false // a nil or zero value was never built by a constructor
 		}
 		return typed.status, typed.Body(), true
 	case *query.Error:
-		if typed == nil {
-			return 0, ErrorBody{}, false
-		}
-		return http.StatusBadRequest, ErrorBody{Code: Code(typed.Code), Message: typed.Message, Fields: typed.Fields}, true
+		return queryResponse(typed)
 	case *auth.Error:
 		if typed == nil {
 			return 0, ErrorBody{}, false
 		}
-		return authResponse(typed.Kind)
+		return authResponse(typed.Kind, true)
 	}
-	if isLeaf(err) {
-		return authResponse(err)
+	return authResponse(err, isLeaf(err))
+}
+
+// queryMessages are the fixed texts of the query codes; a *query.Error built by hand keeps
+// only a code from the set and its fields.
+var queryMessages = map[Code]string{
+	CodeInvalidFilter: "the filter is not valid for this resource",
+	CodeInvalidSort:   "the sort is not valid for this resource",
+	CodeInvalidPage:   "the page is not valid",
+	CodeInvalidCursor: "the cursor is not valid for this sort",
+}
+
+func queryResponse(queryError *query.Error) (int, ErrorBody, bool) {
+	if queryError == nil {
+		return 0, ErrorBody{}, false
 	}
-	return 0, ErrorBody{}, false
+	code := Code(queryError.Code)
+	message, known := queryMessages[code]
+	if !known {
+		return 0, ErrorBody{}, false
+	}
+	return http.StatusBadRequest, ErrorBody{Code: code, Message: message, Fields: maps.Clone(queryError.Fields)}, true
 }
 
 var authCodes = []struct {
@@ -147,16 +162,26 @@ var authCodes = []struct {
 	{auth.ErrConflict, CodeConflict},
 }
 
-// authResponse answers the auth kind err is; errors.Is never hashes or compares a value of
-// a non-comparable type, so a slice-typed error is safe here.
-func authResponse(err error) (int, ErrorBody, bool) {
+// authResponse answers the auth kind err is. A leaf is matched with errors.Is (identity or
+// its own Is method; never a hash or comparison of a non-comparable value); a node that
+// wraps causes is asked its own Is method only, so a cause the walk visits later cannot
+// override an outer known error.
+func authResponse(err error, leaf bool) (int, ErrorBody, bool) {
 	for _, known := range authCodes {
-		if errors.Is(err, known.kind) {
+		if matchesKind(err, known.kind, leaf) {
 			status, response := auth.ResponseFor(known.kind)
 			return status, ErrorBody{Code: known.code, Message: response.Message}, true
 		}
 	}
 	return 0, ErrorBody{}, false
+}
+
+func matchesKind(err, kind error, leaf bool) bool {
+	if leaf {
+		return errors.Is(err, kind)
+	}
+	matcher, ok := err.(interface{ Is(error) bool })
+	return ok && matcher.Is(kind)
 }
 
 // errorChain walks the error tree outermost first, depth first, like errors.As does.

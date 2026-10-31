@@ -89,10 +89,13 @@ func (l *List) validate(guarded []GuardedField) error {
 	if err := validateGuards(l.itemType, guarded); err != nil {
 		return err
 	}
-	if len(l.tables) > 0 {
-		return requireJSONField(l.itemType, keyFieldJSON, liveListNeedsID)
+	if !l.live() {
+		return nil
 	}
-	return nil
+	if _, guardedID := l.guarded.Lookup(keyFieldJSON); guardedID {
+		return errors.New(`the field "id" of a live list cannot be guarded: a list without ids cannot be diffed`)
+	}
+	return requireJSONField(l.itemType, keyFieldJSON, liveListNeedsID)
 }
 
 // ObjectOptions declares a typed-parameters object. Read and Load are required; Guarded

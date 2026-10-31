@@ -395,6 +395,9 @@ func (r *Resource) validateGuardedFields() error {
 		if err := requireJSONField(r.itemType, field.Name, "a guarded field is redacted by it"); err != nil {
 			return err
 		}
+		if r.live() && field.Name == keyFieldJSON && field.Read != nil {
+			return errors.New(`the field "id" of a live resource cannot have a Read check: a list without ids cannot be diffed`)
+		}
 	}
 	return nil
 }

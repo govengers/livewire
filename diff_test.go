@@ -26,6 +26,7 @@ func TestNewListStateRefusesUnusableIDs(t *testing.T) {
 		{name: "number and string collide", raw: `[{"id":1},{"id":"1"}]`, want: `two list items carry the id "1"`},
 		{name: "number spellings collide", raw: `[{"id":1},{"id":1.0}]`, want: `two list items carry the id "1"`},
 		{name: "exponent spelling collides", raw: `[{"id":1},{"id":1e0}]`, want: `two list items carry the id "1"`},
+		{name: "uppercase alias is no id", raw: `[{"ID":"b"}]`, want: "has no id"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -33,6 +34,14 @@ func TestNewListStateRefusesUnusableIDs(t *testing.T) {
 			require.ErrorContains(t, err, testCase.want)
 		})
 	}
+}
+
+func TestListStateKeysNumbersLikeJavaScript(t *testing.T) {
+	state, err := livewire.NewListState(json.RawMessage(`[{"id":1234567},{"id":1000000},{"id":1e21},{"id":1e-7},{"id":-0},{"id":"a","ID":"b"}]`), 6)
+	require.NoError(t, err)
+	previous, err := livewire.NewListState(json.RawMessage(`[]`), 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"1234567", "1000000", "1e+21", "1e-7", "0", "a"}, state.ChangesSince(previous).Order, "competing spellings key by the exact id member")
 }
 
 func TestListStateSnapshotKeepsOrderAndNumericIDs(t *testing.T) {

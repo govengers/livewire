@@ -41,37 +41,6 @@ type createPart struct {
 	} `json:"attributes,omitempty"`
 }
 
-func TestMutationRefusesUnparseableValidateTags(t *testing.T) {
-	type typo struct {
-		Name string `json:"name" validate:"reqd"`
-	}
-	type badArgument struct {
-		Count int `json:"count" validate:"min=abc"`
-	}
-	type misplacedDive struct {
-		Name string `json:"name" validate:"dive"`
-	}
-	declare := func(declaration livewire.Declaration) error { return addError(t, declaration) }
-	require.ErrorContains(t, declare(livewire.NewMutation("a", http.MethodPost, "/a", &livewire.MutationOptions[livewire.NoParameters, typo, livewire.NoContent]{
-		Check: authorization.IsUser(),
-		Handle: func(context.Context, *livewire.NoParameters, *typo) (*livewire.NoContent, error) {
-			return &livewire.NoContent{}, nil
-		},
-	})), "validate tags")
-	require.ErrorContains(t, declare(livewire.NewMutation("b", http.MethodPost, "/b", &livewire.MutationOptions[livewire.NoParameters, badArgument, livewire.NoContent]{
-		Check: authorization.IsUser(),
-		Handle: func(context.Context, *livewire.NoParameters, *badArgument) (*livewire.NoContent, error) {
-			return &livewire.NoContent{}, nil
-		},
-	})), "validate tags")
-	require.ErrorContains(t, declare(livewire.NewMutation("c", http.MethodPost, "/c", &livewire.MutationOptions[livewire.NoParameters, misplacedDive, livewire.NoContent]{
-		Check: authorization.IsUser(),
-		Handle: func(context.Context, *livewire.NoParameters, *misplacedDive) (*livewire.NoContent, error) {
-			return &livewire.NoContent{}, nil
-		},
-	})), "validate tags")
-}
-
 // Line is exported because encoding/json refuses to allocate an embedded pointer to an unexported struct.
 type Line struct {
 	SKU      string `json:"sku"`
@@ -133,9 +102,9 @@ func TestMutationUnknownFieldInsideMapValuesAndDuplicateMembers(t *testing.T) {
 	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "attributes.color.nope")
 	require.Equal(t, "unknown field", fields["attributes.color.nope"])
 
-	body, err := mutation.DecodeBody(userContext(), []byte(`{"name":"first","name":"last"}`))
-	require.NoError(t, err)
-	require.Equal(t, "last", body.(*createPart).Name, "a repeated member is taken last-wins")
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"name":"first","name":"last"}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "name")
+	require.Equal(t, "duplicate member", fields["name"])
 }
 
 type partID struct {

@@ -206,6 +206,11 @@ func (s *staging) bindEffect(mutation *Mutation) error {
 	case effect.Kind == EffectRemoves && !mutation.hasPathParameter(keyFieldJSON):
 		return fmt.Errorf("livewire: mutation %q: Removes needs the path parameter %q to remove by", mutation.name, keyFieldJSON)
 	}
+	if effect.Kind == EffectUpserts {
+		if err := requireJSONField(mutation.responseType, keyFieldJSON, "Upserts keys the optimistic item by it"); err != nil {
+			return fmt.Errorf("livewire: mutation %q: %w", mutation.name, err)
+		}
+	}
 	return nil
 }
 

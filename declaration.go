@@ -279,7 +279,7 @@ func (c *jsonFieldCollector) collectLevel(current []embeddedLevel, count map[ref
 // record lists the candidate once per occurrence of its struct on the level, so a struct
 // embedded twice cancels its fields in the dominance rule.
 func (c *jsonFieldCollector) record(field reflect.StructField, depth, occurrences int) {
-	name, tagged := jsonName(field)
+	name, tagged, _ := jsonName(field)
 	candidate := jsonFieldCandidate{field: field, depth: depth, tagged: tagged}
 	for range max(occurrences, 1) {
 		c.byName[name] = append(c.byName[name], candidate)
@@ -295,10 +295,10 @@ const (
 )
 
 func classifyJSONField(field reflect.StructField, embeddedType reflect.Type) jsonFieldClass {
-	_, tagged := jsonName(field)
+	_, tagged, included := jsonName(field)
 	embeddedStruct := field.Anonymous && embeddedType.Kind() == reflect.Struct
 	switch {
-	case field.Tag.Get("json") == "-":
+	case !included:
 		return jsonFieldSkipped
 	case embeddedStruct && !tagged:
 		return jsonFieldFlattens
@@ -330,15 +330,50 @@ func dominantJSONField(candidates []jsonFieldCandidate) (reflect.StructField, bo
 	}
 }
 
-// jsonName is the field's JSON name and whether the tag names it; a tag with options only
-// (`json:",omitempty"`) does not name the field.
-func jsonName(field reflect.StructField) (name string, tagged bool) {
-	tag := field.Tag.Get("json")
-	name, _, _ = strings.Cut(tag, ",")
-	if name == "" {
-		return field.Name, false
+// jsonName is the field's JSON name, whether the tag names it and whether encoding/json
+// marshals the field at all (`json:"-"` does not). A tag with options only
+// (`json:",omitempty"`) does not name the field. The name is read back from encoding/json
+// itself (a one-field struct with the field's tag is marshaled), so it follows the
+// toolchain's own tag rules: which names it accepts, where it cuts an odd one, when it falls
+// back to the Go name.
+func jsonName(field reflect.StructField) (name string, tagged, included bool) {
+	tagName, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+	if tagName == "" {
+		return field.Name, false, true
 	}
-	return name, true
+	key, included := probeJSONKey(field.Tag)
+	switch {
+	case !included:
+		return "", false, false
+	case key == jsonProbeField:
+		return field.Name, false, true // encoding/json fell back to the Go name: the tag names nothing
+	default:
+		return key, true, true
+	}
+}
+
+const jsonProbeField = "Probe"
+
+var stringType = reflect.TypeFor[string]()
+
+// probeJSONKey marshals a one-field struct carrying tag and returns the key encoding/json
+// wrote, or false when it wrote none.
+func probeJSONKey(tag reflect.StructTag) (string, bool) {
+	probeType := reflect.StructOf([]reflect.StructField{{Name: jsonProbeField, Type: stringType, Tag: tag}})
+	probe := reflect.New(probeType).Elem()
+	probe.Field(0).SetString("x")
+	marshaled, err := json.Marshal(probe.Interface())
+	if err != nil {
+		return "", false
+	}
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(marshaled, &keys) != nil {
+		return "", false
+	}
+	for key := range keys {
+		return key, true
+	}
+	return "", false
 }
 
 func unwrapPointer(fieldType reflect.Type) reflect.Type {
