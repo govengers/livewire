@@ -51,6 +51,8 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D41 | No change log, no consumers in livewire (cut after Q26-Q31): business reactions to data changes go through the app's Postgres job queue (JOB-001..006, e.g. river) enqueued inside the transaction of D31; an `AfterCommit` observer outcome per mutation (name, params, actor, status) serves at-most-once reactions like cache invalidation on the replica that ran it. A workflow engine is a worker, not a livewire feature. |
 | D42 | Tenant as a first-class engine concept (MaPa, 31.10.2026): `RegistryOptions.Tenant func(ctx, parameters any) (string, error)` resolves the tenant once per request or subscription after the static check (path parameter, header or identity; nil parameters for filterable resource reads); the engine puts it in the context (`livewire.TenantFrom(ctx)`), uses it as the default partition (D25), passes it to `Scope`, and sets `SET LOCAL livewire.tenant` in every engine transaction, reads included, so an app may enforce isolation with Row Level Security policies (`USING (tenant_id = current_setting('livewire.tenant')::uuid)`). Filters, presence, audit and idempotency rows carry the tenant; a stored filter is scoped to owner and tenant. `livewiretest.TenantIsolation` runs every filterable resource as two tenants and fails when rows cross (DAT-017). `Tenant` nil is single-tenant and changes nothing. |
 | D43 | Declarations are values: `NewResource`, `NewList`, `NewObject`, `NewMutation`, `NewUpload` return the declaration only and never panic; a declaration mistake surfaces as the error of `Registry.Add`, which `main` checks, so the registry stays one expression (section 3). Filed as a DES-001 exception in `.govengers.yml`. |
+| D44 | Request bodies are validated in the core decoder with go-playground/validator on the `validate` tag (not gin's `binding` tag: the core is transport-neutral and the socket never passes gin); a tag the validator cannot parse is a declaration error surfaced by `Add`. Field errors are reported by JSON path. Section 3's "binding/validator tags" wording is superseded. |
+| D45 | The transaction in the context is a query handle, never the commit handle: `livewire.TransactionFrom(ctx)` returns the adapter's query-only value (`postgresadapter.TransactionFrom(ctx)` types it as sqlc's `DBTX`), only the engine holds Commit and Rollback. Every engine unit of work gets a transaction, reads included (so `livewire.tenant` is set for RLS on reads, D42); outside an engine unit of work the handle is nil and a repository falls back to its pool. Section 7's snippet reads `queries := r.queries.WithTx(postgresadapter.TransactionFrom(ctx))`. |
 
 ## 2. Packages
 
@@ -104,7 +106,7 @@ registry.Add(
 - Params structs use `path:"id"` and `query:"status"` tags, embedded structs flattened; unsupported fields fail at `Add`.
 - `NewResource` is the filterable kind: list, item, distinct routes, `filter`/`filterId`/`sort`/`limit`/`offset` parameters, stored filters. `NewList` and `NewObject` are typed-params reads. All three are live when `Tables` is set.
 - `Check` is static (role, permission); the loader sees the identity in `ctx` and applies ownership. `Scope` narrows a filterable resource's rows and runs before filter and count on every read and re-run.
-- Mutations: `Handle func(ctx, *P, *Req) (*Resp, error)`, body validated with `binding`/validator tags, `Idempotency-Key` read into `livewire.IdempotencyKeyFrom(ctx)`.
+- Mutations: `Handle func(ctx, *P, *Req) (*Resp, error)`, body validated with `validate` tags (D44), `Idempotency-Key` read into `livewire.IdempotencyKeyFrom(ctx)`.
 - Errors: a handler returns `*auth.Error` kinds or `livewire.NotFound`, `livewire.Conflict`, `livewire.InProgress`, `livewire.Invalid(fields)`, `livewire.ForbiddenField(name)`; `livewire.ResponseFor` maps `*query.Error` to 400 with its code and everything unknown to 500 without leaking text. One body `{code, message, fields?}`; closed code set: invalid_request, invalid_filter, invalid_sort, invalid_page, invalid_cursor, forbidden_field, unauthenticated, forbidden, not_found, conflict, in_progress, internal.
 
 ## 4. Wire protocol (socket)
@@ -151,13 +153,13 @@ Repositories:
 
 ```go
 func (r *Repository) CreatePart(ctx context.Context, p CreatePartParameters) (*part.Item, error) {
-    queries := r.queries.WithTx(livewire.TransactionFrom(ctx)) // the engine's transaction; nil outside a mutation
+    queries := r.queries.WithTx(postgresadapter.TransactionFrom(ctx)) // the engine's transaction, reads included; nil outside an engine unit of work (D45)
     row, err := queries.InsertPart(ctx, toInsert(p))
     return toItem(row), mapError(err)
 }
 ```
 
-`postgresadapter.Transactor` hands out `pgx.Tx`; `livewire.TransactionFrom` returns it typed through a small interface so the core does not import pgx. A service that needs a reaction (send mail, start a workflow) enqueues a job on the same transaction.
+`postgresadapter.Transactor` begins the transaction and keeps the commit handle for the engine; the context carries a query-only handle (D45). A service that needs a reaction (send mail, start a workflow) enqueues a job on the same transaction.
 
 ## 8. Filterable reads in the app
 
