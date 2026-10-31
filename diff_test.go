@@ -1,0 +1,109 @@
+package livewire_test
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/govengers/livewire"
+)
+
+func TestNewListStateRefusesItemsWithoutID(t *testing.T) {
+	testCases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "not an array", raw: `{"id":"a"}`},
+		{name: "item without id", raw: `[{"name":"bolt"}]`},
+		{name: "null id", raw: `[{"id":null}]`},
+		{name: "item not an object", raw: `["a"]`},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := livewire.NewListState(json.RawMessage(testCase.raw), 0)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestListStateSnapshotKeepsOrderAndNumericIDs(t *testing.T) {
+	state, err := livewire.NewListState(json.RawMessage(`[{"id":2,"name":"nut"},{"id":"a","name":"bolt"}]`), 2)
+	require.NoError(t, err)
+	require.JSONEq(t, `[{"id":2,"name":"nut"},{"id":"a","name":"bolt"}]`, string(state.Snapshot()))
+
+	empty, err := livewire.NewListState(json.RawMessage(`[]`), 0)
+	require.NoError(t, err)
+	require.Equal(t, `[]`, string(empty.Snapshot()))
+}
+
+func TestListStateDiff(t *testing.T) {
+	testCases := []struct {
+		name          string
+		previous      string
+		previousTotal int
+		next          string
+		nextTotal     int
+		want          string
+	}{
+		{
+			name:     "nothing changed",
+			previous: `[{"id":"a","v":1},{"id":"b","v":1}]`, previousTotal: 2,
+			next: `[{"id":"a","v":1},{"id":"b","v":1}]`, nextTotal: 2,
+			want: "",
+		},
+		{
+			name:     "changed item",
+			previous: `[{"id":"a","v":1},{"id":"b","v":1}]`, previousTotal: 2,
+			next: `[{"id":"a","v":2},{"id":"b","v":1}]`, nextTotal: 2,
+			want: `{"upserts":[{"id":"a","v":2}],"removes":[]}`,
+		},
+		{
+			name:     "new item at the end",
+			previous: `[{"id":"a","v":1}]`, previousTotal: 1,
+			next: `[{"id":"a","v":1},{"id":"b","v":1}]`, nextTotal: 2,
+			want: `{"upserts":[{"id":"b","v":1}],"removes":[],"order":["a","b"],"total":2}`,
+		},
+		{
+			name:     "removed item",
+			previous: `[{"id":"a","v":1},{"id":"b","v":1}]`, previousTotal: 2,
+			next: `[{"id":"b","v":1}]`, nextTotal: 1,
+			want: `{"upserts":[],"removes":["a"],"order":["b"],"total":1}`,
+		},
+		{
+			name:     "reordered",
+			previous: `[{"id":"a","v":1},{"id":"b","v":1}]`, previousTotal: 2,
+			next: `[{"id":"b","v":1},{"id":"a","v":1}]`, nextTotal: 2,
+			want: `{"upserts":[],"removes":[],"order":["b","a"]}`,
+		},
+		{
+			name:     "total changed beyond the page",
+			previous: `[{"id":"a","v":1}]`, previousTotal: 10,
+			next: `[{"id":"a","v":1}]`, nextTotal: 11,
+			want: `{"upserts":[],"removes":[],"total":11}`,
+		},
+		{
+			name:     "from empty",
+			previous: `[]`, previousTotal: 0,
+			next: `[{"id":1}]`, nextTotal: 1,
+			want: `{"upserts":[{"id":1}],"removes":[],"order":["1"],"total":1}`,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			previous, err := livewire.NewListState(json.RawMessage(testCase.previous), testCase.previousTotal)
+			require.NoError(t, err)
+			next, err := livewire.NewListState(json.RawMessage(testCase.next), testCase.nextTotal)
+			require.NoError(t, err)
+
+			changes := next.Diff(previous)
+			if testCase.want == "" {
+				require.Nil(t, changes)
+				return
+			}
+			raw, err := json.Marshal(changes)
+			require.NoError(t, err)
+			require.JSONEq(t, testCase.want, string(raw))
+		})
+	}
+}
