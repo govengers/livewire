@@ -49,6 +49,7 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D39 | Column authorization: `query.Field` has `Read` and `Write` checks (`Write` defaults to `Read`, nil inherits the resource). A refused `Read` strips the field from every item on REST, socket, export and history and refuses filter, sort, search and distinct on it with 403 `forbidden_field`; re-evaluated on every identity re-validation. A mutation with `Resource` set applies the resource's `Write` checks to its body by JSON name; `FieldChecks` adds checks to any mutation. Generated types mark guarded fields optional, OpenAPI tags them `x-livewire-guarded`. Typed-params lists name `Guarded []GuardedField{Name, Read}` for the same effect. |
 | D40 | Every mutation body is decoded with unknown JSON fields rejected (400 `invalid_request` naming the field). |
 | D41 | No change log, no consumers in livewire (cut after Q26-Q31): business reactions to data changes go through the app's Postgres job queue (JOB-001..006, e.g. river) enqueued inside the transaction of D31; an `AfterCommit` observer outcome per mutation (name, params, actor, status) serves at-most-once reactions like cache invalidation on the replica that ran it. A workflow engine is a worker, not a livewire feature. |
+| D42 | Tenant as a first-class engine concept (MaPa, 31.10.2026): `RegistryOptions.Tenant func(ctx, parameters any) (string, error)` resolves the tenant once per request or subscription after the static check (path parameter, header or identity; nil parameters for filterable resource reads); the engine puts it in the context (`livewire.TenantFrom(ctx)`), uses it as the default partition (D25), passes it to `Scope`, and sets `SET LOCAL livewire.tenant` in every engine transaction, reads included, so an app may enforce isolation with Row Level Security policies (`USING (tenant_id = current_setting('livewire.tenant')::uuid)`). Filters, presence, audit and idempotency rows carry the tenant; a stored filter is scoped to owner and tenant. `livewiretest.TenantIsolation` runs every filterable resource as two tenants and fails when rows cross (DAT-017). `Tenant` nil is single-tenant and changes nothing. |
 
 ## 2. Packages
 
@@ -69,7 +70,7 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 ```go
 registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: "/api/v1"})
 registry.Add(
-    livewire.NewResource[part.Item]("parts", "/parts", &livewire.ResourceOptions{
+    livewire.NewResource[part.Item]("parts", "/parts", &livewire.ResourceOptions[part.Item]{
         Tables: []string{"parts"},
         Read:   authorization.IsUser(),
         Fields: []query.Field{
@@ -103,7 +104,7 @@ registry.Add(
 - `NewResource` is the filterable kind: list, item, distinct routes, `filter`/`filterId`/`sort`/`limit`/`offset` parameters, stored filters. `NewList` and `NewObject` are typed-params reads. All three are live when `Tables` is set.
 - `Check` is static (role, permission); the loader sees the identity in `ctx` and applies ownership. `Scope` narrows a filterable resource's rows and runs before filter and count on every read and re-run.
 - Mutations: `Handle func(ctx, *P, *Req) (*Resp, error)`, body validated with `binding`/validator tags, `Idempotency-Key` read into `livewire.IdempotencyKeyFrom(ctx)`.
-- Errors: a handler returns `*auth.Error` kinds or `livewire.NotFound`, `livewire.Conflict`, `livewire.Invalid(fields)`; `auth.ResponseFor` maps everything else to 500 without leaking text. One body: `{code, message, fields?}`.
+- Errors: a handler returns `*auth.Error` kinds or `livewire.NotFound`, `livewire.Conflict`, `livewire.InProgress`, `livewire.Invalid(fields)`, `livewire.ForbiddenField(name)`; `livewire.ResponseFor` maps `*query.Error` to 400 with its code and everything unknown to 500 without leaking text. One body `{code, message, fields?}`; closed code set: invalid_request, invalid_filter, invalid_sort, invalid_page, invalid_cursor, forbidden_field, unauthenticated, forbidden, not_found, conflict, in_progress, internal.
 
 ## 4. Wire protocol (socket)
 
