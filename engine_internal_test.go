@@ -2,9 +2,11 @@ package livewire
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -95,6 +97,16 @@ func (stubTransaction) Commit(context.Context) error   { return nil }
 func (stubTransaction) Rollback(context.Context) error { return nil }
 func (stubTransaction) Handle() any                    { return nil }
 
+type stubPresences struct{}
+
+func (stubPresences) Join(context.Context, *Presence) error                       { return nil }
+func (stubPresences) Leave(context.Context, string, string, string, string) error { return nil }
+func (stubPresences) Heartbeat(context.Context, string) error                     { return nil }
+func (stubPresences) List(context.Context, string, string, string) ([]Presence, error) {
+	return []Presence{{Socket: "elsewhere", Display: "Eve"}}, nil
+}
+func (stubPresences) Sweep(context.Context, time.Duration) (int, error) { return 0, nil }
+
 type stubItem struct {
 	ID string `json:"id"`
 }
@@ -109,8 +121,17 @@ func stubEngine(t *testing.T) (*Engine, *socket) {
 		Load: func(context.Context, *NoParameters) ([]stubItem, error) {
 			return nil, errors.New("the database is down")
 		},
+	}), NewObject("board", "/board", &ObjectOptions[stubItem, NoParameters]{
+		Tables: []string{"boards"},
+		Read:   authorization.IsAuthenticated(),
+		Load: func(ctx context.Context, _ *NoParameters) (*stubItem, error) {
+			if auth.IdentityFrom(ctx).Subject != "ada" {
+				return nil, NotFound() // the board is ada's only
+			}
+			return &stubItem{ID: "board"}, nil
+		},
 	})))
-	engine, err := NewEngine(&EngineOptions{Registry: registry, IdentitySource: stubIdentities{}, Transactor: stubTransactor{}, SameHostOnly: true})
+	engine, err := NewEngine(&EngineOptions{Registry: registry, IdentitySource: stubIdentities{}, Transactor: stubTransactor{}, PresenceStore: stubPresences{}, SameHostOnly: true})
 	require.NoError(t, err)
 	identity := &auth.Identity{Provider: "test", Subject: "ada", Active: true}
 	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/live", nil)
@@ -182,4 +203,68 @@ func TestNormalizeOriginsDropsDefaultPortsOnly(t *testing.T) {
 	normalized, err := normalizeOrigins([]string{"https://[::1]:443", "http://[::1]:8080", "HTTPS://App.Example:443", "http://app.example:80", "https://app.example:8443"})
 	require.NoError(t, err)
 	require.Equal(t, []string{"https://[::1]", "http://[::1]:8080", "https://app.example", "http://app.example", "https://app.example:8443"}, normalized)
+}
+
+func TestPresenceReadUnderANewIdentityRunsTheRecordRead(t *testing.T) {
+	engine, clientSocket := stubEngine(t)
+	ctx := auth.WithIdentity(t.Context(), clientSocket.lastIdentity())
+	resolved, err := engine.resolve(ctx, ReadRequest{Target: "board", Kind: ReadPresence, Source: MapSource{"key": "k"}})
+	require.NoError(t, err)
+	watching, err := clientSocket.newSubscription(ctx, resolved)
+	require.NoError(t, err)
+	require.NoError(t, clientSocket.addSubscription(watching))
+	engine.index(watching)
+	result, err := engine.load(ctx, resolved)
+	require.NoError(t, err)
+	_, err = watching.firstPush(result, auth.IdentityFrom(ctx))
+	require.NoError(t, err)
+
+	marks := watching.takeMarks() // a presence-only re-run took its marks
+	clientSocket.adopt(&auth.Identity{Provider: "test", Subject: "bob", Active: true}, 1)
+	watching.rerunWith(marks) // and then reads under the identity the adopt brought
+	require.True(t, watching.isEnded(), "the record read ran under the new identity and refused it")
+	frames, _ := clientSocket.outbox.take()
+	require.Len(t, frames, 1)
+	require.Contains(t, string(frames[0]), `"kind":"error"`, "no presence push went out under the new identity first")
+}
+
+// TestErrorPushIsTheLastSequence overlaps endWithError with a writer that keeps computing
+// pushes of a changing subscription: no push may carry a sequence after the error's. The
+// overlap is a race, so the test repeats it; the old split of sequence and end failed it.
+func TestErrorPushIsTheLastSequence(t *testing.T) {
+	_, clientSocket := stubEngine(t)
+	for attempt := range 200 {
+		ending := &subscription{
+			socket: clientSocket, id: strconv.Itoa(attempt), dirty: make(chan struct{}, 1), sequence: 1,
+			current: &view{payload: []byte(`{"n":0}`)}, delivered: &view{payload: []byte(`{"n":0}`)},
+		}
+		started := make(chan struct{})
+		var pushed []int64
+		pushing := make(chan struct{})
+		go func() {
+			defer close(pushing)
+			close(started)
+			for change := 1; !ending.isEnded(); change++ {
+				ending.mutex.Lock()
+				ending.current = &view{payload: []byte(`{"n":` + strconv.Itoa(change) + `}`)}
+				ending.mutex.Unlock()
+				if push := ending.nextPush(); push != nil {
+					var frame PushFrame
+					_ = json.Unmarshal(push, &frame) // the engine encoded it
+					pushed = append(pushed, frame.Sequence)
+				}
+			}
+		}()
+		<-started
+		ending.endWithError(NotFound())
+		<-pushing
+		frames, _ := clientSocket.outbox.take()
+		require.Len(t, frames, 1)
+		var terminal PushFrame
+		require.NoError(t, json.Unmarshal(frames[0], &terminal))
+		require.Equal(t, PushError, terminal.Kind)
+		for _, sequence := range pushed {
+			require.Less(t, sequence, terminal.Sequence, "attempt %d: a push after the error", attempt)
+		}
+	}
 }

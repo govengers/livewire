@@ -138,6 +138,8 @@ func TestCloseGivesUpCloseFramesAtItsDeadline(t *testing.T) {
 	started := time.Now()
 	_ = bed.engine.Close(short) // the client takes neither the answers nor the close frame
 	require.Less(t, time.Since(started), 500*time.Millisecond, "Close keeps its deadline, not the one-second close-frame wait")
+	require.Eventually(t, func() bool { return len(bed.outcomes.of(livewire.OutcomeClose)) == 1 }, 400*time.Millisecond, time.Millisecond,
+		"the close frame was given up at Close's deadline, not after the one-second wait")
 }
 
 func TestFailedJoinFreesItsPlace(t *testing.T) {

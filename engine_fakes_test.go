@@ -485,6 +485,9 @@ type fakePresences struct {
 	heartbeats atomic.Int64
 	failLeave  atomic.Bool
 	failJoin   atomic.Bool
+	// blockSweep makes a Sweep wait for its context; sweepBlocked reports one waiting.
+	blockSweep   atomic.Bool
+	sweepBlocked chan struct{}
 	// holdJoin, when set, holds the next Join before it stores, until it is closed; joinHeld
 	// reports that one is held.
 	holdJoin atomic.Pointer[chan struct{}]
@@ -493,7 +496,7 @@ type fakePresences struct {
 }
 
 func newFakePresences(feed *fakeFeed) *fakePresences {
-	return &fakePresences{presences: map[string]livewire.Presence{}, feed: feed, joinHeld: make(chan struct{}, 1)}
+	return &fakePresences{presences: map[string]livewire.Presence{}, feed: feed, joinHeld: make(chan struct{}, 1), sweepBlocked: make(chan struct{}, 1)}
 }
 
 func presenceID(tenant, socket, target, key string) string {
@@ -554,8 +557,13 @@ func (f *fakePresences) List(_ context.Context, tenant, target, key string) ([]l
 	return presences, nil
 }
 
-func (f *fakePresences) Sweep(_ context.Context, maximumAge time.Duration) (int, error) {
+func (f *fakePresences) Sweep(ctx context.Context, maximumAge time.Duration) (int, error) {
 	f.sweeps.Add(1)
+	if f.blockSweep.Load() { // a cooperative store: it waits for its context only
+		f.sweepBlocked <- struct{}{}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
 	f.mutex.Lock()
 	swept := 0
 	for id, presence := range f.presences {

@@ -260,6 +260,9 @@ func (b *testbed) team() *livewire.Object {
 	return livewire.NewObject("team", "/teams/{team}", &livewire.ObjectOptions[teamItem, teamParameters]{
 		Tables: []string{"teams"},
 		Read:   authorization.HasRole(roleReader),
+		// the teams table is partitioned by board, so the presence table's partition (the
+		// tenant) differs from the declaration's
+		Partition: func(_ context.Context, parameters any) string { return "board-" + parameters.(*teamParameters).Team },
 		Load: func(_ context.Context, parameters *teamParameters) (*teamItem, error) {
 			return &teamItem{Team: parameters.Team}, nil
 		},
