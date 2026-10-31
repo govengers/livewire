@@ -13,6 +13,12 @@ const (
 	CodeInvalidCursor Code = "invalid_cursor"
 )
 
+// Message is the fixed, client-safe text of the code; "" for a code this package does not
+// define.
+func (c Code) Message() string {
+	return messages[c]
+}
+
 // Error is a client mistake in a filter document, a sort, a page or a cursor. Fields maps
 // the path of the offending part (`where.and[1].field`, `sort[0]`, `limit`, `after`) to
 // what is wrong with it; one error names one fault. Match it with errors.As; the root

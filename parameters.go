@@ -1,0 +1,377 @@
+package livewire
+
+import (
+	"fmt"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ParameterSource hands the decoder the raw values of a request: path values by name and
+// query values by name, where a query key may repeat. The REST adapter builds one from the
+// route, the engine from a RequestFrame's Parameters (MapSource).
+type ParameterSource interface {
+	Path(name string) (string, bool)
+	Query(name string) ([]string, bool)
+}
+
+// MapSource is a ParameterSource over one value per name, as a socket frame carries them:
+// path and query parameters read the same map, a list parameter is one comma-separated
+// value.
+type MapSource map[string]string
+
+// Path returns the value under name.
+func (s MapSource) Path(name string) (string, bool) {
+	value, ok := s[name]
+	return value, ok
+}
+
+// Query returns the value under name as a one-element list.
+func (s MapSource) Query(name string) ([]string, bool) {
+	value, ok := s[name]
+	if !ok {
+		return nil, false
+	}
+	return []string{value}, true
+}
+
+// ParameterIn is where a parameter travels.
+type ParameterIn string
+
+// The parameter locations; they are the struct tags of a parameters struct.
+const (
+	InPath  ParameterIn = "path"
+	InQuery ParameterIn = "query"
+)
+
+// Parameter describes one parameter of a declaration for the generators: its name on the
+// wire, where it travels, the Go type of its struct field (pointer and slice types as
+// declared), the enum values of an `enum:"a,b"` tag, and whether the wire carries a list.
+// A path parameter is required, a query parameter optional.
+type Parameter struct {
+	Name string
+	In   ParameterIn
+	Type reflect.Type
+	Enum []string
+	List bool
+}
+
+// Required reports whether a request must carry the parameter.
+func (p Parameter) Required() bool {
+	return p.In == InPath
+}
+
+// NoParameters is the parameters type of a declaration without parameters.
+type NoParameters struct{}
+
+var (
+	uuidType = reflect.TypeFor[uuid.UUID]()
+	timeType = reflect.TypeFor[time.Time]()
+)
+
+type parameterField struct {
+	Parameter
+	index []int
+}
+
+// parameterSpecification is a compiled parameters struct: decode fills a new value of its type.
+type parameterSpecification struct {
+	parametersType reflect.Type
+	fields         []parameterField
+}
+
+// compileParameters validates a parameters struct and the path it serves: every tagged
+// field has a supported type, every `{name}` of the path has a path field and the other way
+// round. The error is a declaration mistake.
+func compileParameters(parametersType reflect.Type, path string) (*parameterSpecification, error) {
+	if parametersType.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("parameters type %s is not a struct", parametersType)
+	}
+	specification := &parameterSpecification{parametersType: parametersType}
+	if err := specification.collect(parametersType, nil); err != nil {
+		return nil, err
+	}
+	placeholders, err := pathPlaceholders(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, field := range specification.fields {
+		if field.In == InPath && !slices.Contains(placeholders, field.Name) {
+			return nil, fmt.Errorf("path parameter %q is not in the path %q", field.Name, path)
+		}
+	}
+	for _, placeholder := range placeholders {
+		if !specification.hasPath(placeholder) {
+			return nil, fmt.Errorf("the path %q has no field tagged path:%q", path, placeholder)
+		}
+	}
+	return specification, nil
+}
+
+// decode fills a new parameters value from source. A missing or empty path parameter, a
+// repeated scalar parameter and a value of the wrong form answer Invalid naming the
+// parameter; a missing query parameter leaves its field zero.
+func (s *parameterSpecification) decode(source ParameterSource) (any, error) {
+	parameters := reflect.New(s.parametersType)
+	for _, field := range s.fields {
+		values, err := readValues(source, field.Parameter)
+		if err != nil {
+			return nil, err
+		}
+		if values == nil {
+			continue
+		}
+		target := parameters.Elem().FieldByIndex(field.index)
+		if field.List {
+			err = setList(target, field.Parameter, values)
+		} else {
+			err = setScalar(target, field.Parameter, values[0])
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return parameters.Interface(), nil
+}
+
+func (s *parameterSpecification) parameters() []Parameter {
+	parameters := make([]Parameter, 0, len(s.fields))
+	for _, field := range s.fields {
+		parameter := field.Parameter
+		parameter.Enum = slices.Clone(parameter.Enum)
+		parameters = append(parameters, parameter)
+	}
+	return parameters
+}
+
+func (s *parameterSpecification) collect(structType reflect.Type, prefix []int) error {
+	for position := range structType.NumField() {
+		field := structType.Field(position)
+		index := append(slices.Clone(prefix), position)
+		location, name := parameterTag(field)
+		if name == "" {
+			if err := s.collectEmbedded(field, index); err != nil {
+				return err
+			}
+			continue
+		}
+		parameter, err := describeParameter(field, location, name)
+		if err != nil {
+			return err
+		}
+		if s.lookup(name) != nil {
+			return fmt.Errorf("parameter %q is declared twice", name)
+		}
+		s.fields = append(s.fields, parameterField{Parameter: parameter, index: index})
+	}
+	return nil
+}
+
+// collectEmbedded flattens an embedded struct by value; an embedded pointer is refused
+// because its fields could not be decoded into a nil pointer.
+func (s *parameterSpecification) collectEmbedded(field reflect.StructField, index []int) error {
+	if !field.Anonymous {
+		return nil
+	}
+	switch field.Type.Kind() {
+	case reflect.Struct:
+		return s.collect(field.Type, index)
+	case reflect.Pointer:
+		return fmt.Errorf("embedded %s: embed parameters structs by value", field.Type)
+	default:
+		return nil
+	}
+}
+
+func (s *parameterSpecification) lookup(name string) *parameterField {
+	for position := range s.fields {
+		if s.fields[position].Name == name {
+			return &s.fields[position]
+		}
+	}
+	return nil
+}
+
+func (s *parameterSpecification) hasPath(name string) bool {
+	field := s.lookup(name)
+	return field != nil && field.In == InPath
+}
+
+func parameterTag(field reflect.StructField) (ParameterIn, string) {
+	if name := field.Tag.Get(string(InPath)); name != "" {
+		return InPath, name
+	}
+	if name := field.Tag.Get(string(InQuery)); name != "" {
+		return InQuery, name
+	}
+	return "", ""
+}
+
+func describeParameter(field reflect.StructField, location ParameterIn, name string) (Parameter, error) {
+	parameter := Parameter{Name: name, In: location, Type: field.Type}
+	taggedTwice := field.Tag.Get(string(InPath)) != "" && field.Tag.Get(string(InQuery)) != ""
+	switch {
+	case !field.IsExported():
+		return parameter, fmt.Errorf("parameter %q is the unexported field %s", name, field.Name)
+	case taggedTwice:
+		return parameter, fmt.Errorf("parameter %q is tagged path and query", name)
+	}
+	if enum, ok := field.Tag.Lookup("enum"); ok {
+		parameter.Enum = strings.Split(enum, ",")
+	}
+	scalar := field.Type
+	if scalar.Kind() == reflect.Slice {
+		stringList := location == InQuery && scalar.Elem().Kind() == reflect.String
+		if !stringList {
+			return parameter, fmt.Errorf("parameter %q: a list parameter is a query parameter of string elements, not %s", name, field.Type)
+		}
+		parameter.List = true
+		scalar = scalar.Elem()
+	}
+	if scalar.Kind() == reflect.Pointer {
+		scalar = scalar.Elem()
+	}
+	switch {
+	case scalar.Kind() == reflect.Pointer:
+		return parameter, fmt.Errorf("parameter %q has the type %s; one pointer level is supported", name, field.Type)
+	case !supportedParameterType(scalar):
+		return parameter, fmt.Errorf("parameter %q has the unsupported type %s", name, field.Type)
+	case parameter.Enum != nil && scalar.Kind() != reflect.String:
+		return parameter, fmt.Errorf("parameter %q has enum values but is %s, not a string", name, field.Type)
+	}
+	return parameter, nil
+}
+
+func supportedParameterType(scalar reflect.Type) bool {
+	if scalar == uuidType || scalar == timeType {
+		return true
+	}
+	switch scalar.Kind() {
+	case reflect.String, reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return true
+	default:
+		return false
+	}
+}
+
+// pathPlaceholders returns the `{name}` segments of a route path, which must start with a
+// slash and have no empty segment; a placeholder fills a whole segment.
+func pathPlaceholders(path string) ([]string, error) {
+	if !strings.HasPrefix(path, "/") {
+		return nil, fmt.Errorf("the path %q does not start with a slash", path)
+	}
+	var placeholders []string
+	for _, segment := range strings.Split(path[1:], "/") {
+		switch {
+		case segment == "":
+			return nil, fmt.Errorf("the path %q has an empty segment", path)
+		case isPlaceholder(segment):
+			name := segment[1 : len(segment)-1]
+			malformed := strings.ContainsAny(name, "{}") || slices.Contains(placeholders, name)
+			if malformed {
+				return nil, fmt.Errorf("the path %q has a malformed or repeated placeholder %q", path, segment)
+			}
+			placeholders = append(placeholders, name)
+		case strings.ContainsAny(segment, "{}"):
+			return nil, fmt.Errorf("the path %q has a malformed placeholder %q", path, segment)
+		}
+	}
+	return placeholders, nil
+}
+
+func isPlaceholder(segment string) bool {
+	return len(segment) > 2 && strings.HasPrefix(segment, "{") && strings.HasSuffix(segment, "}")
+}
+
+// readValues returns the raw values of a parameter, nil when it is absent.
+func readValues(source ParameterSource, parameter Parameter) ([]string, error) {
+	if parameter.In == InPath {
+		value, ok := source.Path(parameter.Name)
+		if !ok || value == "" {
+			return nil, invalidParameter(parameter.Name, "required")
+		}
+		return []string{value}, nil
+	}
+	return readQueryValues(source, parameter.Name, parameter.List)
+}
+
+// readQueryValues returns the values of a query key: nil when the key is absent or its one
+// value is empty, an error when a scalar key repeats.
+func readQueryValues(source ParameterSource, name string, list bool) ([]string, error) {
+	values, ok := source.Query(name)
+	absent := !ok || len(values) == 0 || (len(values) == 1 && values[0] == "")
+	switch {
+	case absent:
+		return nil, nil
+	case !list && len(values) > 1:
+		return nil, invalidParameter(name, "must not repeat")
+	}
+	return values, nil
+}
+
+func setList(target reflect.Value, parameter Parameter, values []string) error {
+	list := reflect.MakeSlice(target.Type(), 0, len(values))
+	for _, value := range values {
+		for item := range strings.SplitSeq(value, ",") {
+			if item == "" {
+				continue
+			}
+			if err := checkEnum(parameter, item); err != nil {
+				return err
+			}
+			list = reflect.Append(list, reflect.ValueOf(item).Convert(target.Type().Elem()))
+		}
+	}
+	target.Set(list)
+	return nil
+}
+
+func setScalar(target reflect.Value, parameter Parameter, raw string) error {
+	if target.Kind() == reflect.Pointer {
+		target.Set(reflect.New(target.Type().Elem()))
+		target = target.Elem()
+	}
+	switch {
+	case target.Type() == uuidType:
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return invalidParameter(parameter.Name, "must be a uuid")
+		}
+		target.Set(reflect.ValueOf(id))
+	case target.Type() == timeType:
+		instant, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return invalidParameter(parameter.Name, "must be an RFC 3339 time")
+		}
+		target.Set(reflect.ValueOf(instant.UTC()))
+	case target.Kind() == reflect.String:
+		if err := checkEnum(parameter, raw); err != nil {
+			return err
+		}
+		target.SetString(raw)
+	case target.Kind() == reflect.Bool:
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			return invalidParameter(parameter.Name, "must be a boolean")
+		}
+		target.SetBool(value)
+	default:
+		value, err := strconv.ParseInt(raw, 10, target.Type().Bits())
+		if err != nil {
+			return invalidParameter(parameter.Name, "must be an integer")
+		}
+		target.SetInt(value)
+	}
+	return nil
+}
+
+func checkEnum(parameter Parameter, value string) error {
+	if parameter.Enum == nil || slices.Contains(parameter.Enum, value) {
+		return nil
+	}
+	return invalidParameter(parameter.Name, "must be one of "+strings.Join(parameter.Enum, ", "))
+}
