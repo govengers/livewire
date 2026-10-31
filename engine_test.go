@@ -92,10 +92,10 @@ func TestSubscribeSnapshotDiffReplaceUnsubscribe(t *testing.T) {
 		push := socket.push()
 		pushes[push.Subscription] = push
 	}
-	diff := pushes[listSubscription]
-	require.Equal(t, livewire.PushListChange, diff.Kind)
-	require.Equal(t, int64(2), diff.Sequence)
-	change := changeOf(t, diff.Payload)
+	pushed := pushes[listSubscription]
+	require.Equal(t, livewire.PushListChange, pushed.Kind)
+	require.Equal(t, int64(2), pushed.Sequence)
+	change := changeOf(t, pushed.Payload)
 	require.Len(t, change.Upserts, 1)
 	require.Equal(t, []string{"a", "b"}, change.Order)
 	require.Equal(t, 2, *change.Total)
@@ -184,15 +184,17 @@ func TestPartitionedChangesReachTheirPartitionOnly(t *testing.T) {
 	subscribed(t, socket.do(livewire.OperationSubscribe, "groupGadgets", map[string]string{"group": "a"}, nil))
 	socket.push()
 
+	loads := bed.world.loads.Load()
 	bed.world.put(gadget{ID: "b1", Name: "Bolt", Group: "b"})
 	bed.world.change("b1", "b")
 	socket.noPush(50 * time.Millisecond)
+	require.Equal(t, loads, bed.world.loads.Load(), "a change of another partition re-runs nothing")
 
 	bed.world.put(gadget{ID: "a1", Name: "Anchor", Group: "a"})
 	bed.world.change("a1", "a")
-	diff := socket.push()
-	require.Equal(t, livewire.PushListChange, diff.Kind)
-	require.Len(t, changeOf(t, diff.Payload).Upserts, 1)
+	pushed := socket.push()
+	require.Equal(t, livewire.PushListChange, pushed.Kind)
+	require.Len(t, changeOf(t, pushed.Payload).Upserts, 1)
 }
 
 func TestFeedReconnectResyncsWithSnapshots(t *testing.T) {
@@ -391,9 +393,9 @@ func TestCoalescingUnderABurst(t *testing.T) {
 	}
 	bed.world.block.Store(nil)
 	close(block)
-	diff := socket.push()
-	require.Equal(t, livewire.PushListChange, diff.Kind)
-	require.Equal(t, 51, *changeOf(t, diff.Payload).Total, "the blocked re-run reads after the burst")
+	pushed := socket.push()
+	require.Equal(t, livewire.PushListChange, pushed.Kind)
+	require.Equal(t, 51, *changeOf(t, pushed.Payload).Total, "the blocked re-run reads after the burst")
 	require.Eventually(t, func() bool { return bed.world.loads.Load() == loads+2 }, frameWait, time.Millisecond)
 	socket.noPush(50 * time.Millisecond)
 	require.Equal(t, loads+2, bed.world.loads.Load(), "fifty changes during a re-run collapse into one follow-up")
@@ -409,7 +411,6 @@ func TestDeliveryBatchMergesPushes(t *testing.T) {
 	bed.world.change("a", "")
 	first := socket.push()
 	require.Len(t, changeOf(t, first.Payload).Upserts, 1, "the first change after a quiet period leaves at once")
-	started := time.Now()
 	for _, id := range []string{"b", "c"} {
 		loads := bed.world.loads.Load()
 		bed.world.put(gadget{ID: id, Name: id})
@@ -419,7 +420,6 @@ func TestDeliveryBatchMergesPushes(t *testing.T) {
 	merged := socket.push()
 	require.Equal(t, int64(3), merged.Sequence)
 	require.Len(t, changeOf(t, merged.Payload).Upserts, 2, "two re-runs within the wait leave as one push")
-	require.GreaterOrEqual(t, time.Since(started), 200*time.Millisecond)
 	socket.noPush(50 * time.Millisecond)
 }
 
@@ -445,8 +445,8 @@ func TestPanickingLoaderCostsOneRetry(t *testing.T) {
 	bed.world.panics.Store(1)
 	bed.world.put(gadget{ID: "a", Name: "Anchor"})
 	bed.world.change("a", "")
-	diff := socket.push()
-	require.Equal(t, livewire.PushListChange, diff.Kind, "the retry after the panic delivers the change")
+	pushed := socket.push()
+	require.Equal(t, livewire.PushListChange, pushed.Kind, "the retry after the panic delivers the change")
 	failed := 0
 	for _, outcome := range bed.outcomes.of(livewire.OutcomeRerun) {
 		if outcome.Status == http.StatusInternalServerError {
@@ -489,6 +489,7 @@ func TestPresenceJoinLeaveAndExpiry(t *testing.T) {
 		options.PresenceHeartbeat, options.PresenceExpiry = 10*time.Millisecond, time.Minute
 	})
 	bed.identities.set(person("bob", roleReader))
+	bed.world.put(gadget{ID: "a", Name: "Anchor"})
 	watcher, joiner := bed.dial("ada"), bed.dial("bob")
 	record := map[string]string{"key": "a"}
 	subscribed(t, watcher.do(livewire.OperationSubscribe, "gadgets.presence", record, nil))

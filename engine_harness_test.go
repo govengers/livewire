@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,16 +67,25 @@ type testbed struct {
 	server      *httptest.Server
 	// release unblocks the mutation "blockGadget".
 	release chan struct{}
+	// anonymousRuns counts the handler runs of "anonymousGadget".
+	anonymousRuns   atomic.Int64
+	registryOptions livewire.RegistryOptions
 }
 
 // newTestbed starts an engine; adjust changes the options before NewEngine.
 func newTestbed(t *testing.T, adjust func(options *livewire.EngineOptions)) *testbed {
 	t.Helper()
+	return newTestbedWith(t, livewire.RegistryOptions{}, adjust)
+}
+
+// newTestbedWith is newTestbed with registry options (the Observer is the testbed's).
+func newTestbedWith(t *testing.T, registryOptions livewire.RegistryOptions, adjust func(options *livewire.EngineOptions)) *testbed {
+	t.Helper()
 	feed := newFakeFeed()
 	bed := &testbed{
 		t: t, world: newWorld(feed), feed: feed, identities: newFakeIdentities(),
 		filters: newFakeFilters(), idempotency: newFakeIdempotency(), presences: newFakePresences(feed),
-		outcomes: &outcomes{}, release: make(chan struct{}),
+		outcomes: &outcomes{}, release: make(chan struct{}), registryOptions: registryOptions,
 	}
 	bed.transactor = &fakeTransactor{world: bed.world}
 	bed.identities.set(person("ada", roleReader, roleWriter))
@@ -122,9 +132,12 @@ func person(subject string, roles ...string) *auth.Identity {
 }
 
 func (b *testbed) registry() *livewire.Registry {
-	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{Observer: b.outcomes.observe})
+	options := b.registryOptions
+	options.Observer = b.outcomes.observe
+	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
-	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.createGadget(), b.failGadget(), b.blockGadget(), b.panicGadget(), b.removeGadget(), b.upload()))
+	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload()))
 	return registry
 }
 
@@ -151,20 +164,7 @@ func (b *testbed) gadgets() *livewire.Resource {
 			items := b.world.sorted("")
 			return items, len(items), nil
 		},
-		Get: func(ctx context.Context, listQuery *query.ListQuery) (*gadget, error) {
-			if err := b.world.load(ctx); err != nil {
-				return nil, err
-			}
-			_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "gadgets", IDColumn: "gadgets.id"})
-			for _, argument := range arguments {
-				if id, ok := argument.(string); ok {
-					if item, found := b.world.lookup(id); found {
-						return &item, nil
-					}
-				}
-			}
-			return nil, livewire.NotFound()
-		},
+		Get: b.getGadget,
 		Distinct: func(ctx context.Context, field string, _ *query.ListQuery) ([]livewire.DistinctValue, error) {
 			counts := map[string]int{}
 			for _, item := range b.world.sorted("") {
@@ -224,6 +224,68 @@ func (b *testbed) createGadget() *livewire.Mutation {
 	})
 }
 
+// getGadget is the item read: the item key travels as the page query's string argument.
+func (b *testbed) getGadget(ctx context.Context, listQuery *query.ListQuery) (*gadget, error) {
+	if err := b.world.load(ctx); err != nil {
+		return nil, err
+	}
+	_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "gadgets", IDColumn: "gadgets.id"})
+	for _, argument := range arguments {
+		id, isText := argument.(string)
+		if item, found := b.world.lookup(id); isText && found && ownedBy(ctx, item) {
+			return &item, nil
+		}
+	}
+	return nil, livewire.NotFound()
+}
+
+// ownedBy is the ownership rule of the item read: a gadget of the group "owned-<subject>" is
+// that subject's only.
+func ownedBy(ctx context.Context, item gadget) bool {
+	owner, owned := strings.CutPrefix(item.Group, "owned-")
+	return !owned || owner == auth.IdentityFrom(ctx).Subject
+}
+
+type teamParameters struct {
+	Team string `path:"team"`
+}
+
+type teamItem struct {
+	Team string `json:"team"`
+}
+
+// team is an object whose path names the tenant (the registry's Tenant of the tenant tests).
+func (b *testbed) team() *livewire.Object {
+	return livewire.NewObject("team", "/teams/{team}", &livewire.ObjectOptions[teamItem, teamParameters]{
+		Tables: []string{"teams"},
+		Read:   authorization.HasRole(roleReader),
+		Load: func(_ context.Context, parameters *teamParameters) (*teamItem, error) {
+			return &teamItem{Team: parameters.Team}, nil
+		},
+	})
+}
+
+// revealGadget is bound to the resource gadgets, so its response passes its field guards.
+func (b *testbed) revealGadget() *livewire.Mutation {
+	return livewire.NewMutation("revealGadget", http.MethodPost, "/gadgets/reveal", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, gadget]{
+		Check:    authorization.HasRole(roleWriter),
+		Resource: "gadgets",
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*gadget, error) {
+			return &gadget{ID: "r", Name: "Revealed", Secret: "s3cret"}, nil
+		},
+	})
+}
+
+// anonymousGadget lets anyone call and counts its runs.
+func (b *testbed) anonymousGadget() *livewire.Mutation {
+	return livewire.NewMutation("anonymousGadget", http.MethodPost, "/gadgets/anonymous", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, countItem]{
+		Check: func(context.Context) error { return nil },
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*countItem, error) {
+			return &countItem{Count: int(b.anonymousRuns.Add(1))}, nil
+		},
+	})
+}
+
 type idParameters struct {
 	ID string `path:"id"`
 }
@@ -251,7 +313,11 @@ func (b *testbed) failGadget() *livewire.Mutation {
 func (b *testbed) blockGadget() *livewire.Mutation {
 	return livewire.NewMutation("blockGadget", http.MethodPost, "/gadgets/block", &livewire.MutationOptions[blockParameters, livewire.NoBody, countItem]{
 		Check: authorization.HasRole(roleWriter),
-		Handle: func(ctx context.Context, _ *blockParameters, _ *livewire.NoBody) (*countItem, error) {
+		Handle: func(ctx context.Context, parameters *blockParameters, _ *livewire.NoBody) (*countItem, error) {
+			if parameters.Wait == "stubborn" { // a handler that ignores its context, as a slow external call does
+				<-b.release
+				return &countItem{Count: 1}, nil
+			}
 			select {
 			case <-b.release:
 			case <-ctx.Done():

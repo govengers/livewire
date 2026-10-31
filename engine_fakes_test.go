@@ -113,18 +113,23 @@ func (w *world) change(id, group string) {
 }
 
 // fakeFeed is a ChangeFeed whose connects the test drives: failFirst refuses that many
-// connects, drop ends the current connection with an error.
+// connects, drop ends the current connection with an error, cleanup (when set) holds Run
+// after its context ended until it is closed. publish routes a change synchronously while
+// the feed is connected, so a test knows every dirty mark landed when it returns; a change
+// published while disconnected is lost, like a NOTIFY without a listener.
 type fakeFeed struct {
 	failFirst atomic.Int64
 	runs      atomic.Int64
 	connects  atomic.Int64
-	changes   chan livewire.Change
 	drop      chan error
 	connected chan struct{}
+	cleanup   atomic.Pointer[chan struct{}]
+	mutex     sync.Mutex
+	onChange  func(livewire.Change)
 }
 
 func newFakeFeed() *fakeFeed {
-	return &fakeFeed{changes: make(chan livewire.Change, 1024), drop: make(chan error, 1), connected: make(chan struct{}, 16)}
+	return &fakeFeed{drop: make(chan error, 1), connected: make(chan struct{}, 16)}
 }
 
 func (f *fakeFeed) Run(ctx context.Context, onChange func(livewire.Change), onResync func()) error {
@@ -134,25 +139,37 @@ func (f *fakeFeed) Run(ctx context.Context, onChange func(livewire.Change), onRe
 	}
 	f.failFirst.Store(0)
 	f.connects.Add(1)
+	f.mutex.Lock()
+	f.onChange = onChange
+	f.mutex.Unlock()
+	defer func() {
+		f.mutex.Lock()
+		f.onChange = nil
+		f.mutex.Unlock()
+	}()
 	onResync()
 	select {
 	case f.connected <- struct{}{}:
 	default:
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case change := <-f.changes:
-			onChange(change)
-		case err := <-f.drop:
-			return err
+	select {
+	case <-ctx.Done():
+		if cleanup := f.cleanup.Load(); cleanup != nil {
+			<-*cleanup
 		}
+		return ctx.Err()
+	case err := <-f.drop:
+		return err
 	}
 }
 
 func (f *fakeFeed) publish(change livewire.Change) {
-	f.changes <- change
+	f.mutex.Lock()
+	onChange := f.onChange
+	f.mutex.Unlock()
+	if onChange != nil {
+		onChange(change)
+	}
 }
 
 // fakeIdentities is the IdentitySource: the identity of a socket is the one registered for
@@ -161,16 +178,28 @@ type fakeIdentities struct {
 	mutex      sync.Mutex
 	identities map[string]*auth.Identity
 	failure    error
+	panics     atomic.Bool
 	calls      atomic.Int64
+	// hold, when set, holds the next Identify after it read its answer, until it is closed;
+	// held reports that one is held.
+	hold atomic.Pointer[chan struct{}]
+	held chan struct{}
 }
 
 func newFakeIdentities() *fakeIdentities {
-	return &fakeIdentities{identities: map[string]*auth.Identity{}}
+	return &fakeIdentities{identities: map[string]*auth.Identity{}, held: make(chan struct{}, 1)}
 }
 
 func (f *fakeIdentities) set(identity *auth.Identity) {
 	f.mutex.Lock()
 	f.identities[identity.Subject] = identity
+	f.mutex.Unlock()
+}
+
+// setFor makes the identity the answer for the X-Subject subject, whoever the identity is.
+func (f *fakeIdentities) setFor(subject string, identity *auth.Identity) {
+	f.mutex.Lock()
+	f.identities[subject] = identity
 	f.mutex.Unlock()
 }
 
@@ -194,12 +223,24 @@ func (f *fakeIdentities) get(subject string) *auth.Identity {
 
 func (f *fakeIdentities) Identify(_ context.Context, request *http.Request) (*auth.Identity, error) {
 	f.calls.Add(1)
+	if f.panics.Load() {
+		panic("the identity source panicked")
+	}
+	identity, err := f.answer(request.Header.Get(subjectHeader))
+	if hold := f.hold.Swap(nil); hold != nil {
+		f.held <- struct{}{}
+		<-*hold
+	}
+	return identity, err
+}
+
+func (f *fakeIdentities) answer(subject string) (*auth.Identity, error) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	if f.failure != nil {
 		return nil, f.failure
 	}
-	identity, ok := f.identities[request.Header.Get(subjectHeader)]
+	identity, ok := f.identities[subject]
 	if !ok {
 		return nil, &auth.Error{Kind: auth.ErrUnauthenticated, Reason: "session revoked"}
 	}
@@ -426,6 +467,7 @@ type fakePresences struct {
 	presences  map[string]livewire.Presence
 	feed       *fakeFeed
 	heartbeats atomic.Int64
+	failLeave  atomic.Bool
 	sweeps     atomic.Int64
 }
 
@@ -446,6 +488,9 @@ func (f *fakePresences) Join(_ context.Context, presence *livewire.Presence) err
 }
 
 func (f *fakePresences) Leave(_ context.Context, tenant, socket, target, key string) error {
+	if f.failLeave.Load() {
+		return errTestConnectionLost
+	}
 	f.mutex.Lock()
 	delete(f.presences, presenceID(tenant, socket, target, key))
 	f.mutex.Unlock()
@@ -523,12 +568,17 @@ func compareText(left, right string) int {
 type outcomes struct {
 	mutex    sync.Mutex
 	received []livewire.Outcome
+	// panics makes the Observer panic after it recorded the outcome.
+	panics atomic.Bool
 }
 
 func (o *outcomes) observe(_ context.Context, outcome livewire.Outcome) {
 	o.mutex.Lock()
 	o.received = append(o.received, outcome)
 	o.mutex.Unlock()
+	if o.panics.Load() {
+		panic("the observer panicked")
+	}
 }
 
 func (o *outcomes) of(kind livewire.OutcomeKind) []livewire.Outcome {
