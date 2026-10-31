@@ -385,6 +385,10 @@ func TestMutationValidationPathsOfKeysWithBrackets(t *testing.T) {
 	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "values[a[]x]")
 	require.Equal(t, map[string]string{"values[a[]x]": "required"}, fields, "a key text that does not end at a segment is no candidate")
 
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"values":{"a[":"ok","a[][b]":""}}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "values[a[][b]]")
+	require.Equal(t, map[string]string{"values[a[][b]]": "required"}, fields, "a key whose rest cannot resolve is no reading")
+
 	_, err = mutation.DecodeBody(userContext(), []byte(`{"nested":{"a[":{"b]":""},"a[][b]":{}}}`))
 	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
 	require.Equal(t, map[string]string{"body": "min"}, fields, "a namespace two entries explain names neither")
@@ -398,6 +402,9 @@ func TestMutationValidationPathsOfKeysSharingOneText(t *testing.T) {
 	_, err := mutation.DecodeBody(userContext(), []byte(`{"labels":{"A":"x","a":"y"}}`))
 	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
 	require.Equal(t, map[string]string{"body": "min"}, fields, "a text two keys share names neither")
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"labels":{"A[":"xx","a[":"xx","a[]":"x"}}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "labels[a[]]")
+	require.Equal(t, map[string]string{"labels[a[]]": "min"}, fields, "keys sharing a text are no reading when their rest does not resolve")
 	_, err = mutation.DecodeBody(userContext(), []byte(`{"labels":{"B":"x"}}`))
 	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "labels[B]")
 	require.Equal(t, map[string]string{"labels[B]": "min"}, fields, "the key as the body carries it")
@@ -511,24 +518,29 @@ type deep struct {
 	Leaf  int   `json:"leaf,omitempty"`
 }
 
-func TestMutationDeepBodyAllocatesInProportion(t *testing.T) {
-	mutation := newBody[deep](t)
-	const depth = 5000
+// deepBodyAllocation is what decoding a body of depth nested objects allocates.
+func deepBodyAllocation(t *testing.T, mutation *livewire.Mutation, depth int) uint64 {
+	t.Helper()
 	body := []byte(strings.Repeat(`{"child":`, depth) + `{"leaf":1}` + strings.Repeat(`}`, depth))
-
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
 	_, err := mutation.DecodeBody(userContext(), body)
 	runtime.ReadMemStats(&after)
 	require.NoError(t, err)
-	allocated := after.TotalAlloc - before.TotalAlloc
-	// About 38x (40x under race), most of it encoding/json's own state and the segment stack;
-	// a path written eagerly on every push allocates in proportion to the depth squared,
-	// over 1000x here.
-	require.Less(t, allocated, uint64(len(body))*48, "the walk and the decode together allocate a small multiple of the body (%d bytes for %d)", allocated, len(body))
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+func TestMutationDeepBodyAllocatesInProportion(t *testing.T) {
+	mutation := newBody[deep](t)
+	const depth = 5000
+	half, full := deepBodyAllocation(t, mutation, depth/2), deepBodyAllocation(t, mutation, depth)
+	// The absolute multiple depends on the toolchain's encoding/json; the growth does not: in
+	// proportion to the depth it about doubles, a path written eagerly on every push grows
+	// with the depth squared and quadruples.
+	require.Less(t, float64(full), 2.5*float64(half), "twice the depth allocates about twice as much (%d bytes, then %d)", half, full)
 
 	unknown := strings.Repeat(`{"child":`, depth) + `{"nope":1}` + strings.Repeat(`}`, depth)
-	_, err = mutation.DecodeBody(userContext(), []byte(unknown))
+	_, err := mutation.DecodeBody(userContext(), []byte(unknown))
 	requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, strings.Repeat("child.", depth)+"nope")
 }

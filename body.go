@@ -28,13 +28,16 @@ func inspectBody(raw []byte, requestType reflect.Type, fields fieldIndex) (map[s
 
 // pathOfTypeError re-walks a body that passed inspectBody to the innermost value of the
 // request type that holds the error's offset and returns its path, or "body". The value found
-// must be the one encoding/json names in the error's dotted Field: an error from inside a
-// type's own unmarshaler carries an offset into that value, not into raw.
+// must be the one encoding/json names in the error's Field: an error from inside a type's
+// own unmarshaler carries an offset into that value, not into raw. Field is dotted and, since
+// Go 1.27, carries map keys and positions too ("lines.1.sku"; before: "lines.sku"), so both
+// spellings are compared.
 func pathOfTypeError(raw []byte, requestType reflect.Type, fields fieldIndex, typeError *json.UnmarshalTypeError) string {
 	walker := newBodyWalker(raw, fields)
 	walker.target = typeError.Offset
 	reached := errors.Is(walker.walkBody(requestType), errTargetReached)
-	if reached && dottedPath(walker.located) == typeError.Field {
+	named := typeError.Field == dottedPath(walker.located, true) || typeError.Field == dottedPath(walker.located, false)
+	if reached && named {
 		return writePath(walker.located)
 	}
 	return "body"
@@ -87,11 +90,14 @@ type pathSegment struct {
 	index bool
 }
 
-// dottedPath writes the segments as encoding/json names a field in its errors: "lines.1.sku".
-func dottedPath(segments []pathSegment) string {
-	texts := make([]string, len(segments))
-	for position, segment := range segments {
-		texts[position] = segment.text
+// dottedPath writes the segments as encoding/json names a field in its errors, with the keys
+// and positions ("lines.1.sku") or without them ("lines.sku").
+func dottedPath(segments []pathSegment, withIndexes bool) string {
+	texts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if withIndexes || !segment.index {
+			texts = append(texts, segment.text)
+		}
 	}
 	return strings.Join(texts, ".")
 }
@@ -187,7 +193,7 @@ func (w *bodyWalker) walkObject(structType reflect.Type, top bool) error {
 			return w.refuse("unknown field")
 		}
 		start := w.decoder.InputOffset()
-		if err := w.walkValue(field.Type); err != nil {
+		if err := w.walkValue(field.Type, start); err != nil {
 			return err
 		}
 		if top {
@@ -198,10 +204,9 @@ func (w *bodyWalker) walkObject(structType reflect.Type, top bool) error {
 }
 
 // walkValue consumes one value of the type; a walk that locates a target offset ends at the
-// first innermost value that holds it, from the end of the token before it (where a map
-// key's error points) to its own end.
-func (w *bodyWalker) walkValue(fieldType reflect.Type) error {
-	start := w.decoder.InputOffset()
+// first innermost value that holds it, from start (the end of the token before the value, or
+// before the key of a map entry, whose key errors point into the key) to its own end.
+func (w *bodyWalker) walkValue(fieldType reflect.Type, start int64) error {
 	if err := w.consumeValue(fieldType); err != nil {
 		return err
 	}
@@ -240,11 +245,12 @@ func (w *bodyWalker) consumeValue(fieldType reflect.Type) error {
 func (w *bodyWalker) walkEntries(valueType reflect.Type) error {
 	seen := map[string]bool{}
 	for {
+		start := w.decoder.InputOffset()
 		_, done, err := w.nextMember(seen, true)
 		if err != nil || done {
 			return err
 		}
-		if err := w.walkValue(valueType); err != nil {
+		if err := w.walkValue(valueType, start); err != nil {
 			return err
 		}
 		w.pop()
@@ -254,7 +260,7 @@ func (w *bodyWalker) walkEntries(valueType reflect.Type) error {
 func (w *bodyWalker) walkElements(elementType reflect.Type) error {
 	for position := 0; w.decoder.More(); position++ {
 		w.push(pathSegment{text: strconv.Itoa(position), index: true})
-		if err := w.walkValue(elementType); err != nil {
+		if err := w.walkValue(elementType, w.decoder.InputOffset()); err != nil {
 			return err
 		}
 		w.pop()
