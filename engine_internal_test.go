@@ -125,7 +125,7 @@ func stubEngine(t *testing.T) (*Engine, *socket) {
 
 func TestIndexLeavesOutAnEndedSubscription(t *testing.T) {
 	engine, clientSocket := stubEngine(t)
-	ended := &subscription{socket: clientSocket, tables: []string{"items"}}
+	ended := &subscription{socket: clientSocket, partitions: map[string]string{"items": ""}}
 	ended.end() // an unsubscribe that ran before the installation indexed it
 	engine.index(ended)
 	require.Empty(t, engine.byTable)
@@ -145,4 +145,41 @@ func TestFailedInstallationEndsItsSubscription(t *testing.T) {
 	refused := &installation{socket: clientSocket, frameID: "2", request: ReadRequest{Target: "failing"}}
 	require.Error(t, refused.install(ctx))
 	require.Nil(t, refused.subscription, "a subscription past the limit never gets a lifetime")
+}
+
+func TestOwnerMigrationKeepsTheNewestAdopt(t *testing.T) {
+	engine, clientSocket := stubEngine(t)
+	engine.migrateOwner(clientSocket, "test:newer", 2)
+	engine.migrateOwner(clientSocket, "test:older", 1) // the older adopt's migration ran last
+	require.Equal(t, "test:newer", clientSocket.ownerKey)
+	require.Equal(t, map[string]int{"test:newer": 1}, engine.perOwner)
+}
+
+func TestRetryOwnsOneTimerAndASuccessEndsIt(t *testing.T) {
+	engine, clientSocket := stubEngine(t)
+	clock := &manualClock{now: time.Unix(1000, 0)}
+	engine.clock = clock
+	failing := &subscription{socket: clientSocket, dirty: make(chan struct{}, 1), delivered: &view{payload: []byte(`{}`)}}
+
+	failing.signal() // a mark that landed during the failed re-run
+	failing.retryLater(rerunMarks{})
+	require.Empty(t, failing.dirty, "the retry drains the mark: it covers it")
+	failing.markDirty()
+	require.Empty(t, failing.dirty, "a mark during the backoff waits for the retry")
+
+	failing.retryLater(rerunMarks{record: true})
+	require.Len(t, clock.timers, 2)
+	require.True(t, clock.timers[0].stopped, "a second failure stops the first timer")
+	require.True(t, failing.recordDue, "a record read it owed stays owed")
+
+	failing.settle(&view{payload: []byte(`{}`)}, false)
+	require.True(t, clock.timers[1].stopped, "a success ends the pending retry")
+	failing.markDirty()
+	require.Len(t, failing.dirty, 1, "and marks signal again")
+}
+
+func TestNormalizeOriginsDropsDefaultPortsOnly(t *testing.T) {
+	normalized, err := normalizeOrigins([]string{"https://[::1]:443", "http://[::1]:8080", "HTTPS://App.Example:443", "http://app.example:80", "https://app.example:8443"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"https://[::1]", "http://[::1]:8080", "https://app.example", "http://app.example", "https://app.example:8443"}, normalized)
 }

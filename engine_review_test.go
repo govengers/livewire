@@ -243,6 +243,7 @@ func TestUnsubscribeBeforeTheFirstPushIsFenced(t *testing.T) {
 	socket := bed.dial("ada")
 	block := make(chan struct{})
 	bed.world.block.Store(&block)
+	bed.world.stubborn.Store(true) // the first load finishes despite the cancellation: only the publish fence holds
 	loads := bed.world.loads.Load()
 	id := socket.send(livewire.OperationSubscribe, "gadgets", nil, nil)
 	require.Eventually(t, func() bool { return bed.world.loads.Load() == loads+1 }, frameWait, time.Millisecond)
@@ -448,12 +449,19 @@ func TestLeaveFailuresAreReported(t *testing.T) {
 	require.True(t, socket.do(livewire.OperationJoin, "gadgets", map[string]string{"key": "a"}, nil).OK)
 	bed.presences.failLeave.Store(true)
 	require.Equal(t, http.StatusInternalServerError, socket.do(livewire.OperationLeave, "gadgets", map[string]string{"key": "a"}, nil).Status)
+	failedLeaves := func() int {
+		count := 0
+		for _, outcome := range bed.outcomes.of(livewire.OutcomeRequest) {
+			if outcome.Operation == livewire.OperationLeave && errors.Is(outcome.Err, errTestConnectionLost) && outcome.Status == http.StatusInternalServerError {
+				count++
+			}
+		}
+		return count
+	}
+	require.Equal(t, 1, failedLeaves(), "the refused leave op")
 	require.NoError(t, socket.connection.Close())
-	require.Eventually(t, func() bool {
-		return outcomeWith(bed, livewire.OutcomeRequest, func(outcome livewire.Outcome) bool {
-			return outcome.Operation == livewire.OperationLeave && errors.Is(outcome.Err, errTestConnectionLost) && outcome.Status == http.StatusInternalServerError
-		}) && len(bed.outcomes.of(livewire.OutcomeClose)) == 1
-	}, frameWait, time.Millisecond, "the leave of a closed socket that failed is reported")
+	require.Eventually(t, func() bool { return failedLeaves() == 2 && len(bed.outcomes.of(livewire.OutcomeClose)) == 1 },
+		frameWait, time.Millisecond, "the leave of a closed socket that failed is reported too")
 }
 
 func TestAllowedOriginsDropDefaultPorts(t *testing.T) {

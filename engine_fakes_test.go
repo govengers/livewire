@@ -39,6 +39,8 @@ type world struct {
 	loads    atomic.Int64
 	// block, when set, holds every list load until it is closed.
 	block atomic.Pointer[chan struct{}]
+	// stubborn makes a blocked load ignore its context, like a query that is not cancelled.
+	stubborn atomic.Bool
 }
 
 func newWorld(feed *fakeFeed) *world {
@@ -97,6 +99,10 @@ func (w *world) load(ctx context.Context) error {
 		return errors.New("the database is down")
 	}
 	w.failures.Store(0)
+	if block := w.block.Load(); block != nil && w.stubborn.Load() {
+		<-*block
+		return nil
+	}
 	if block := w.block.Load(); block != nil {
 		select {
 		case <-*block:
@@ -268,11 +274,16 @@ type fakeTransactor struct {
 	commits   atomic.Int64
 	rollbacks atomic.Int64
 	failBegin atomic.Bool
+	// panicBegin makes the next Begin panic.
+	panicBegin atomic.Bool
 }
 
 func (f *fakeTransactor) Begin(_ context.Context, details livewire.TransactionDetails) (livewire.Transaction, error) {
 	if f.failBegin.Load() {
 		return nil, errors.New("the pool is exhausted")
+	}
+	if f.panicBegin.Swap(false) {
+		panic("the transactor panicked")
 	}
 	f.mutex.Lock()
 	f.details = append(f.details, details)
@@ -354,6 +365,8 @@ type fakeFilters struct {
 	mutex   sync.Mutex
 	filters map[string]livewire.StoredFilter
 	gets    atomic.Int64
+	// panicGet makes the next Get panic.
+	panicGet atomic.Bool
 }
 
 func newFakeFilters() *fakeFilters {
@@ -376,6 +389,9 @@ func (f *fakeFilters) Save(_ context.Context, filter *livewire.StoredFilter) (*l
 
 func (f *fakeFilters) Get(_ context.Context, owner livewire.Owner, id string) (*livewire.StoredFilter, error) {
 	f.gets.Add(1)
+	if f.panicGet.Swap(false) {
+		panic("the filter store panicked")
+	}
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	stored, ok := f.filters[id]
@@ -468,11 +484,16 @@ type fakePresences struct {
 	feed       *fakeFeed
 	heartbeats atomic.Int64
 	failLeave  atomic.Bool
-	sweeps     atomic.Int64
+	failJoin   atomic.Bool
+	// holdJoin, when set, holds the next Join before it stores, until it is closed; joinHeld
+	// reports that one is held.
+	holdJoin atomic.Pointer[chan struct{}]
+	joinHeld chan struct{}
+	sweeps   atomic.Int64
 }
 
 func newFakePresences(feed *fakeFeed) *fakePresences {
-	return &fakePresences{presences: map[string]livewire.Presence{}, feed: feed}
+	return &fakePresences{presences: map[string]livewire.Presence{}, feed: feed, joinHeld: make(chan struct{}, 1)}
 }
 
 func presenceID(tenant, socket, target, key string) string {
@@ -480,6 +501,13 @@ func presenceID(tenant, socket, target, key string) string {
 }
 
 func (f *fakePresences) Join(_ context.Context, presence *livewire.Presence) error {
+	if f.failJoin.Load() {
+		return errTestConnectionLost
+	}
+	if hold := f.holdJoin.Swap(nil); hold != nil {
+		f.joinHeld <- struct{}{}
+		<-*hold
+	}
 	f.mutex.Lock()
 	f.presences[presenceID(presence.Owner.Tenant, presence.Socket, presence.Target, presence.Key)] = *presence
 	f.mutex.Unlock()

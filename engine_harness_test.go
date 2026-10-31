@@ -137,7 +137,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal()))
 	return registry
 }
 
@@ -187,6 +187,7 @@ func (b *testbed) groupList() *livewire.List {
 		Tables:    []string{"gadgets"},
 		Read:      authorization.HasRole(roleReader),
 		Partition: func(_ context.Context, parameters any) string { return parameters.(*groupParameters).Group },
+		Guarded:   []livewire.GuardedField{{Name: "secret", Read: authorization.IsAdmin()}},
 		Load: func(ctx context.Context, parameters *groupParameters) ([]gadget, error) {
 			if err := b.world.load(ctx); err != nil {
 				return nil, err
@@ -270,8 +271,37 @@ func (b *testbed) revealGadget() *livewire.Mutation {
 	return livewire.NewMutation("revealGadget", http.MethodPost, "/gadgets/reveal", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, gadget]{
 		Check:    authorization.HasRole(roleWriter),
 		Resource: "gadgets",
+		Effect:   livewire.Upserts("openGadgets"), // declares the secret unguarded: the strictest guard still wins
 		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*gadget, error) {
 			return &gadget{ID: "r", Name: "Revealed", Secret: "s3cret"}, nil
+		},
+	})
+}
+
+// openGadgets lists the gadgets with the secret declared unguarded.
+func (b *testbed) openGadgets() *livewire.Resource {
+	fields := gadgetFields()
+	for position := range fields {
+		fields[position].Read = nil
+	}
+	return livewire.NewResource("openGadgets", "/open-gadgets", &livewire.ResourceOptions[gadget]{
+		Tables: []string{"gadgets"},
+		Read:   authorization.HasRole(roleReader),
+		Fields: fields,
+		List: func(context.Context, *query.ListQuery) ([]gadget, int, error) {
+			items := b.world.sorted("")
+			return items, len(items), nil
+		},
+	})
+}
+
+// groupReveal has no Resource; its Effect lands in groupGadgets, whose secret is guarded.
+func (b *testbed) groupReveal() *livewire.Mutation {
+	return livewire.NewMutation("groupReveal", http.MethodPost, "/groups/reveal", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, gadget]{
+		Check:  authorization.HasRole(roleWriter),
+		Effect: livewire.Upserts("groupGadgets"),
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*gadget, error) {
+			return &gadget{ID: "g", Name: "Grouped", Secret: "s3cret"}, nil
 		},
 	})
 }
