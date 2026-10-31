@@ -182,7 +182,11 @@ func (s *socket) join(ctx context.Context, frame *RequestFrame) {
 	s.respond(frame.ID, http.StatusOK, nil)
 }
 
+// joinRecord counts and stores the join under the socket's presenceMutex, so a leave of the
+// same record waits until the store answered and the accounting matches it.
 func (s *socket) joinRecord(ctx context.Context, record presenceRecord, state json.RawMessage) error {
+	s.presenceMutex.Lock()
+	defer s.presenceMutex.Unlock()
 	fresh, err := s.reservePresence(record)
 	if err != nil {
 		return err
@@ -229,29 +233,31 @@ func (s *socket) forgetPresence(record presenceRecord) {
 	s.mutex.Unlock()
 }
 
-// leave removes the socket's own presences on a record it joined, found by the
-// declaration's name and the key among its joins; it needs no read of the record, so a
-// caller who lost access to the record still leaves it. A record the socket did not join is
-// 404.
+// leave removes the socket's own presence on a record it joined: the record is named like a
+// join (the declaration, its parameters, the tenant they resolve, the key), but no check or
+// record read runs, so a caller who lost access to the record still leaves it. A record the
+// socket did not join is 404.
 func (s *socket) leave(ctx context.Context, frame *RequestFrame) {
 	unit := startUnit(OutcomeRequest, OperationLeave, frame.Target)
+	var resolved *resolvedRead
 	err := s.engine.inSlot(ctx, func() error {
-		key, err := presenceKeyFrom(MapSource(frame.Parameters))
+		request := ReadRequest{Target: frame.Target, Kind: ReadPresence, Source: MapSource(frame.Parameters)}
+		plan, err := s.engine.planRead(request)
 		if err != nil {
 			return err
 		}
-		records := s.joinedRecords(frame.Target, key)
-		if len(records) == 0 || s.engine.options.PresenceStore == nil {
+		if resolved, err = s.engine.decodeRead(ctx, plan, request); err != nil {
+			return err
+		}
+		record := presenceRecord{tenant: resolved.tenant, target: resolved.request.Target, key: resolved.presenceKey}
+		s.presenceMutex.Lock()
+		defer s.presenceMutex.Unlock()
+		if !s.hasJoined(record) {
 			return NotFound()
 		}
-		for _, record := range records {
-			if err := s.leaveRecord(ctx, record); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.leaveRecord(WithTenant(ctx, record.tenant), record)
 	})
-	s.engine.observe(ctx, unit.outcome(ctx, err))
+	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
 	if err != nil {
 		s.respondError(frame.ID, err)
 		return
@@ -259,18 +265,15 @@ func (s *socket) leave(ctx context.Context, frame *RequestFrame) {
 	s.respond(frame.ID, http.StatusOK, nil)
 }
 
-func (s *socket) joinedRecords(target, key string) []presenceRecord {
+func (s *socket) hasJoined(record presenceRecord) bool {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	var records []presenceRecord
-	for record := range s.presences {
-		if record.target == target && record.key == key {
-			records = append(records, record)
-		}
-	}
-	return records
+	_, joined := s.presences[record]
+	return joined
 }
 
+// leaveRecord removes one joined record from the store and the accounting; the caller holds
+// presenceMutex.
 func (s *socket) leaveRecord(ctx context.Context, record presenceRecord) error {
 	err := recovering(func() error {
 		return s.engine.options.PresenceStore.Leave(ctx, record.tenant, s.id, record.target, record.key)
@@ -285,6 +288,8 @@ func (s *socket) leaveRecord(ctx context.Context, record presenceRecord) error {
 // leavePresences removes the presences of an ended socket; a failed leave is reported and
 // the sweep removes the row after PresenceExpiry.
 func (s *socket) leavePresences() {
+	s.presenceMutex.Lock()
+	defer s.presenceMutex.Unlock()
 	s.mutex.Lock()
 	records := make([]presenceRecord, 0, len(s.presences))
 	for record := range s.presences {

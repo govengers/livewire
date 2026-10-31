@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/govengers/auth"
@@ -109,7 +110,7 @@ type preparedCall struct {
 	parameters any
 	body       any
 	tenant     string
-	guards     query.Fields
+	guards     []query.Fields
 }
 
 // prepareCall runs everything before the transaction, in the order of D8: the static check
@@ -145,17 +146,18 @@ func (e *Engine) prepareCall(ctx context.Context, target string, source Paramete
 	return prepared, nil
 }
 
-// responseGuards are the field guards a mutation's response passes (D39): those of the
-// resource its body is bound to (Resource) and of the live list its Effect lands in (D36).
-func (e *Engine) responseGuards(mutation *Mutation) query.Fields {
-	var guards query.Fields
+// responseGuards are the field guards a mutation's response passes (D39), one set per
+// declaration: the resource its body is bound to (Resource) and the live list its Effect
+// lands in (D36). Each set strips on its own, so the strictest guard of a field wins.
+func (e *Engine) responseGuards(mutation *Mutation) []query.Fields {
+	var guards []query.Fields
 	for _, name := range []string{mutation.Resource(), mutation.Effect().Target} {
 		declaration, _ := e.registry.Lookup(name)
 		switch bound := declaration.(type) {
 		case *Resource:
-			guards = append(guards, bound.Fields()...)
+			guards = append(guards, bound.Fields())
 		case *List:
-			guards = append(guards, bound.Fields()...)
+			guards = append(guards, bound.Fields())
 		}
 	}
 	return guards
@@ -176,17 +178,27 @@ func (p *preparedCall) handle(ctx context.Context) (int, json.RawMessage, error)
 	return status, payload, err
 }
 
-// redactResponse strips the guarded fields the identity in ctx may not read from a
-// response: an object, or every object of an array; other JSON is left as it is.
-func redactResponse(ctx context.Context, guards query.Fields, payload json.RawMessage) (json.RawMessage, error) {
+// redactResponse strips, set by set, the guarded fields the identity in ctx may not read
+// from a response: an object, or every object of an array; other JSON is left as it is.
+func redactResponse(ctx context.Context, guards []query.Fields, payload json.RawMessage) (json.RawMessage, error) {
+	for _, fields := range guards {
+		var err error
+		if payload, err = redactWith(ctx, fields, payload); err != nil {
+			return nil, err
+		}
+	}
+	return payload, nil
+}
+
+func redactWith(ctx context.Context, fields query.Fields, payload json.RawMessage) (json.RawMessage, error) {
 	trimmed := bytes.TrimSpace(payload)
 	switch {
-	case len(guards) == 0 || len(trimmed) == 0:
+	case len(trimmed) == 0:
 		return payload, nil
 	case trimmed[0] == '[':
-		return RedactItems(ctx, guards, payload)
+		return RedactItems(ctx, fields, payload)
 	case trimmed[0] == '{':
-		return RedactItem(ctx, guards, payload)
+		return RedactItem(ctx, fields, payload)
 	default:
 		return payload, nil
 	}
@@ -223,7 +235,7 @@ func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRe
 		return nil, err
 	}
 	ctx = WithTenant(ctx, prepared[0].tenant)
-	plan := writePlan{mutation: batchMutation, idempotencyKey: request.IdempotencyKey, requestID: request.RequestID}
+	plan := writePlan{mutation: batchReservation(prepared), idempotencyKey: request.IdempotencyKey, requestID: request.RequestID}
 	answer, err := e.write(ctx, plan, func(ctx context.Context) (int, json.RawMessage, error) {
 		return e.runBatch(ctx, operation, prepared)
 	})
@@ -240,8 +252,20 @@ func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRe
 	return answer.payload, nil
 }
 
-// redactBatch passes every result of a replayed batch through its call's guards again: the
-// identity's rights may have changed since the batch ran.
+// batchReservation is the name a batch's Idempotency-Key is reserved under: "batch" and its
+// ordered targets, so a replay names the very calls that were recorded and a key sent again
+// with other calls, or another number of them, answers 409 like a key of another mutation
+// (D16). Declaration names are identifiers, so the name is no declaration's.
+func batchReservation(prepared []*preparedCall) string {
+	targets := make([]string, 0, len(prepared))
+	for _, call := range prepared {
+		targets = append(targets, call.mutation.Name())
+	}
+	return batchMutation + "(" + strings.Join(targets, ",") + ")"
+}
+
+// redactBatch passes every result of a replayed batch through the guards of its recorded
+// call, under the identity that asks now: its rights may have changed since the batch ran.
 func redactBatch(ctx context.Context, prepared []*preparedCall, payload json.RawMessage) (json.RawMessage, error) {
 	var results []BatchResult
 	if err := json.Unmarshal(payload, &results); err != nil || len(results) != len(prepared) {

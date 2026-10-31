@@ -16,9 +16,11 @@ import (
 	"github.com/govengers/livewire/query"
 )
 
-// subscription is one live read of one socket (section 5). It is indexed by its tables and
-// partition before its first load, so a change committed during that load at least marks it
-// dirty. Its goroutine waits on dirty, a one-slot channel: the changes that arrive while a
+// subscription is one live read of one socket (section 5). It is indexed by its tables, each
+// in its partition, before its first load, so a change committed during that load at least
+// marks it dirty. A presence subscription is indexed by the presence table and by its
+// declaration's tables: a presence change re-lists the presences only, a change of the
+// record's tables, an identity change and a resync also run the record read again. Its goroutine waits on dirty, a one-slot channel: the changes that arrive while a
 // re-run is in flight collapse into one follow-up, and an idle subscription re-runs at once
 // (the leading edge). current is what the last re-run read, delivered what the client was
 // last sent; the socket's writer turns the difference into the next push.
@@ -30,8 +32,8 @@ type subscription struct {
 	request       ReadRequest
 	tenant        string // resolved at subscribe; a re-run under another tenant ends it
 	list          bool
-	tables        []string
-	partition     string
+	presence      bool
+	partitions    map[string]string // the partition of each table (D25)
 	timeDependent bool
 	//nolint:containedctx // the CON-002 exception of the repository: the subscription's lifetime, cancelled by end
 	ctx    context.Context
@@ -48,6 +50,14 @@ type subscription struct {
 	failures      int
 	backingOff    bool        // a retry is pending: dirty marks wait for it
 	stopRetry     func() bool // the pending retry's timer
+	recordDue     bool        // a presence re-run runs the record read again
+	filterHash    string      // the inline filter this subscription counts against FiltersPerSocket
+}
+
+// rerunMarks are what a re-run owes beyond reading again: a snapshot push, a record read.
+type rerunMarks struct {
+	snapshot bool
+	record   bool
 }
 
 // view is one read as a subscription keeps it: the REST body and, for a list, its state.
@@ -85,8 +95,9 @@ type installation struct {
 	subscription *subscription
 }
 
-func (i *installation) install(ctx context.Context) error {
-	var err error
+// install registers, indexes, loads and publishes the subscription; on any exit that did
+// not publish, a panic included, it takes the subscription off the socket and the index.
+func (i *installation) install(ctx context.Context) (err error) {
 	if i.resolved, err = i.socket.engine.resolve(ctx, i.request); err != nil {
 		return err
 	}
@@ -98,19 +109,27 @@ func (i *installation) install(ctx context.Context) error {
 		return err
 	}
 	i.subscription = liveSubscription
-	i.socket.engine.index(liveSubscription)
-	frames, err := i.firstFrames(ctx)
-	if err == nil {
-		err = i.publish(frames)
-	}
-	if err != nil {
-		if liveSubscription.isEnded() {
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		if err != nil && liveSubscription.isEnded() {
 			err = NotFound() // unsubscribed before it started
 		}
 		i.socket.removeSubscription(liveSubscription.id)
 		liveSubscription.end()
+	}()
+	i.socket.engine.index(liveSubscription)
+	frames, err := i.firstFrames(ctx)
+	if err != nil {
+		return err
 	}
-	return err
+	if err := i.publish(frames); err != nil {
+		return err
+	}
+	published = true
+	return nil
 }
 
 // firstFrames loads the first read under the subscription's lifetime, registers an inline
@@ -123,7 +142,7 @@ func (i *installation) firstFrames(ctx context.Context) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	filterID, err := i.socket.registerFilter(ctx, i.resolved)
+	filterID, err := i.socket.registerFilter(ctx, i.resolved, i.subscription)
 	if err != nil {
 		return nil, err
 	}
@@ -169,15 +188,12 @@ type partitioned interface {
 }
 
 // newSubscription builds the subscription of a resolved read: only a live declaration (one
-// with Tables) or a presence read can be subscribed. Its partition is the declaration's
-// resolver's, or the tenant (D25).
+// with Tables) or a presence read can be subscribed. The declaration's tables are in the
+// partition of its resolver, or the tenant (D25); the presence table in the tenant.
 func (s *socket) newSubscription(ctx context.Context, resolved *resolvedRead) (*subscription, error) {
 	plan := resolved.plan
-	tables := plan.declaration.Tables()
-	if plan.kind == ReadPresence {
-		tables = []string{PresenceTable}
-	}
-	if len(tables) == 0 {
+	presence := plan.kind == ReadPresence
+	if len(plan.declaration.Tables()) == 0 && !presence {
 		return nil, invalidParameter("target", "is not live")
 	}
 	timeDependent, err := isTimeDependent(resolved)
@@ -185,13 +201,20 @@ func (s *socket) newSubscription(ctx context.Context, resolved *resolvedRead) (*
 		return nil, err
 	}
 	partition := resolved.tenant
-	if declaration, ok := plan.declaration.(partitioned); ok && declaration.Partition() != nil && plan.kind != ReadPresence {
+	if declaration, ok := plan.declaration.(partitioned); ok && declaration.Partition() != nil {
 		partition = declaration.Partition()(WithTenant(ctx, resolved.tenant), resolved.parameters)
+	}
+	partitions := map[string]string{}
+	for _, table := range plan.declaration.Tables() {
+		partitions[table] = partition
+	}
+	if presence {
+		partitions[PresenceTable] = resolved.tenant
 	}
 	request := resolved.request
 	request.Source = rerunSource(resolved)
 	return &subscription{
-		socket: s, request: request, tenant: resolved.tenant, tables: tables, partition: partition,
+		socket: s, request: request, tenant: resolved.tenant, partitions: partitions, presence: presence,
 		timeDependent: timeDependent, list: plan.answersList, dirty: make(chan struct{}, 1),
 	}, nil
 }
@@ -226,8 +249,9 @@ func isTimeDependent(resolved *resolvedRead) (bool, error) {
 
 // registerFilter stores the inline filter of a subscribed resource read for its owner and
 // returns its id (D13); without a FilterStore, an owner or an inline filter there is none.
-// A socket registers at most FiltersPerSocket distinct filters; one more is 429.
-func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead) (string, error) {
+// The live subscriptions of a socket hold at most FiltersPerSocket distinct inline filters;
+// one more is 429, and a subscription's end releases its filter.
+func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead, liveSubscription *subscription) (string, error) {
 	parameters := resolved.readParameters
 	inline := parameters != nil && parameters.FilterID == "" && len(parameters.Filter) > 0
 	ctx = WithTenant(ctx, resolved.tenant)
@@ -251,6 +275,9 @@ func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead) (st
 	if err := s.reserveFilter(hash); err != nil {
 		return "", err
 	}
+	liveSubscription.mutex.Lock()
+	liveSubscription.filterHash = hash // released by end, whatever happens next
+	liveSubscription.mutex.Unlock()
 	var stored *StoredFilter
 	err = recovering(func() error {
 		var saveError error
@@ -263,17 +290,25 @@ func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead) (st
 	return stored.ID, nil
 }
 
-// reserveFilter counts a filter hash against FiltersPerSocket; a hash the socket registered
-// before is free.
+// reserveFilter counts a filter hash for one more live subscription; a hash a live
+// subscription holds already is free.
 func (s *socket) reserveFilter(hash string) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	limit := s.engine.options.FiltersPerSocket
-	if _, registered := s.filterHashes[hash]; !registered && len(s.filterHashes) >= limit {
-		return limitExceeded("filters", "at most "+strconv.Itoa(limit)+" inline filters per socket")
+	if s.filterHashes[hash] == 0 && len(s.filterHashes) >= limit {
+		return limitExceeded("filters", "at most "+strconv.Itoa(limit)+" inline filters per socket at once")
 	}
-	s.filterHashes[hash] = struct{}{}
+	s.filterHashes[hash]++
 	return nil
+}
+
+func (s *socket) releaseFilter(hash string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.filterHashes[hash]--; s.filterHashes[hash] <= 0 {
+		delete(s.filterHashes, hash)
+	}
 }
 
 // addSubscription registers a subscription with the socket, refusing one past
@@ -347,14 +382,34 @@ func (s *subscription) isEnded() bool {
 }
 
 // markDirty asks for a re-run; it never blocks. While a retry is pending the mark waits for
-// it: the retry reads every change since (RetryInterval is enforced).
+// it: the retry reads every change since (RetryInterval is enforced). The signal is sent
+// under the lock, so it cannot land after retryLater drained the channel.
 func (s *subscription) markDirty() {
 	s.mutex.Lock()
-	backingOff := s.backingOff
-	s.mutex.Unlock()
-	if !backingOff {
+	defer s.mutex.Unlock()
+	if !s.backingOff {
 		s.signal()
 	}
+}
+
+// markChanged is markDirty for a change of table; for a presence subscription a change of
+// the record's tables also runs the record read again.
+func (s *subscription) markChanged(table string) {
+	if s.presence && table != PresenceTable {
+		s.mutex.Lock()
+		s.recordDue = true
+		s.mutex.Unlock()
+	}
+	s.markDirty()
+}
+
+// markIdentityChanged re-runs the subscription under a new identity, its record read
+// included.
+func (s *subscription) markIdentityChanged() {
+	s.mutex.Lock()
+	s.recordDue = true
+	s.mutex.Unlock()
+	s.markDirty()
 }
 
 func (s *subscription) signal() {
@@ -367,7 +422,7 @@ func (s *subscription) signal() {
 // markResynchronize asks for a re-run whose push is a snapshot.
 func (s *subscription) markResynchronize() {
 	s.mutex.Lock()
-	s.resynchronize = true
+	s.resynchronize, s.recordDue = true, true
 	s.mutex.Unlock()
 	s.markDirty()
 }
@@ -390,7 +445,7 @@ func (s *subscription) run() {
 func (s *subscription) rerun() {
 	unit := startUnit(OutcomeRerun, "", s.request.Target)
 	unit.subscription = s.id
-	snapshot := s.takeResynchronize()
+	marks := s.takeMarks()
 	ctx := s.ctx
 	identity, err := s.socket.rerunIdentity(ctx)
 	if errors.Is(err, errIdentityGone) {
@@ -400,23 +455,25 @@ func (s *subscription) rerun() {
 	var next *view
 	if err == nil {
 		ctx = auth.WithIdentity(ctx, identity)
-		resolved, next, err = s.read(ctx)
+		resolved, next, err = s.read(ctx, marks.record)
 	}
 	if s.ctx.Err() != nil {
 		return
 	}
 	switch {
 	case err == nil:
-		s.settle(next, snapshot)
+		s.settle(next, marks.snapshot)
 	case statusOf(err) < http.StatusInternalServerError:
 		s.endWithError(err)
 	default:
-		s.retryLater(snapshot)
+		s.retryLater(marks)
 	}
 	s.socket.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
 }
 
-func (s *subscription) read(ctx context.Context) (*resolvedRead, *view, error) {
+// read resolves and loads the subscription's read; a presence re-run without a record mark
+// lists the presences without the record read.
+func (s *subscription) read(ctx context.Context, recordDue bool) (*resolvedRead, *view, error) {
 	var resolved *resolvedRead
 	var next *view
 	err := s.socket.engine.inSlot(ctx, func() error {
@@ -427,7 +484,11 @@ func (s *subscription) read(ctx context.Context) (*resolvedRead, *view, error) {
 		if resolved.tenant != s.tenant {
 			return errTenantChanged
 		}
-		result, err := s.socket.engine.load(ctx, resolved)
+		load := s.socket.engine.load
+		if s.presence && !recordDue {
+			load = s.socket.engine.loadPresenceOnly
+		}
+		result, err := load(ctx, resolved)
 		if err != nil {
 			return err
 		}
@@ -437,23 +498,27 @@ func (s *subscription) read(ctx context.Context) (*resolvedRead, *view, error) {
 	return resolved, next, err
 }
 
-func (s *subscription) takeResynchronize() bool {
+func (s *subscription) takeMarks() rerunMarks {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	resynchronize := s.resynchronize
-	s.resynchronize = false
-	return resynchronize
+	marks := rerunMarks{snapshot: s.resynchronize, record: s.recordDue}
+	s.resynchronize, s.recordDue = false, false
+	return marks
 }
 
 // settle takes a re-run's read as current and asks the writer for a push when it differs
-// from what was delivered.
+// from what was delivered; a success ends any pending retry.
 func (s *subscription) settle(next *view, snapshot bool) {
 	s.mutex.Lock()
 	if s.ended {
 		s.mutex.Unlock()
 		return
 	}
-	s.failures = 0
+	s.failures, s.backingOff = 0, false
+	if s.stopRetry != nil {
+		s.stopRetry()
+		s.stopRetry = nil
+	}
 	s.current = next
 	s.snapshotDue = s.snapshotDue || snapshot
 	changed := s.snapshotDue || !bytes.Equal(next.payload, s.delivered.payload)
@@ -527,14 +592,15 @@ func (s *subscription) endWithError(err error) {
 }
 
 // retryLater re-runs a failed subscription after a backoff with its one timer; a snapshot
-// it owed stays owed, and dirty marks wait for the retry.
-func (s *subscription) retryLater(snapshot bool) {
+// or record read it owed stays owed, and dirty marks wait for the retry.
+func (s *subscription) retryLater(marks rerunMarks) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if s.ended {
 		return
 	}
-	s.resynchronize = s.resynchronize || snapshot
+	s.resynchronize = s.resynchronize || marks.snapshot
+	s.recordDue = s.recordDue || marks.record
 	if s.stopRetry != nil {
 		s.stopRetry()
 	}
@@ -550,22 +616,31 @@ func (s *subscription) retryLater(snapshot bool) {
 
 func (s *subscription) retryNow() {
 	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	s.backingOff, s.stopRetry = false, nil
-	s.mutex.Unlock()
 	s.signal()
 }
 
-// end stops the subscription for good: no change reaches it, its goroutine returns.
+// end stops the subscription for good, once: no change reaches it, its goroutine returns,
+// its inline filter is released.
 func (s *subscription) end() {
 	s.mutex.Lock()
+	if s.ended {
+		s.mutex.Unlock()
+		return
+	}
 	s.ended = true
 	if s.stopRetry != nil {
 		s.stopRetry()
 		s.stopRetry = nil
 	}
+	filterHash := s.filterHash
 	s.mutex.Unlock()
 	if s.cancel != nil {
 		s.cancel()
 	}
 	s.socket.engine.unindex(s)
+	if filterHash != "" {
+		s.socket.releaseFilter(filterHash)
+	}
 }

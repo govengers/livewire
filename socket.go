@@ -118,12 +118,18 @@ func (e *Engine) release(clientSocket *socket) {
 	e.lifetimes.Done()
 }
 
-// migrateOwner moves a socket's SocketsPerOwner count to the owner its identity now has; the
-// socket counts there from now on, past the limit too, and stays open.
-func (e *Engine) migrateOwner(clientSocket *socket, ownerKey string) {
+// migrateOwner moves a socket's SocketsPerOwner count to the owner the identity of Identify
+// call sequence has, unless a later call moved it already; the socket counts there from now
+// on, past the limit too, and stays open.
+func (e *Engine) migrateOwner(clientSocket *socket, ownerKey string, sequence uint64) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
-	if _, ok := e.sockets[clientSocket]; !ok || clientSocket.ownerKey == ownerKey {
+	_, open := e.sockets[clientSocket]
+	if !open || sequence < clientSocket.ownerSequence {
+		return
+	}
+	clientSocket.ownerSequence = sequence
+	if clientSocket.ownerKey == ownerKey {
 		return
 	}
 	e.uncountOwner(clientSocket.ownerKey)
@@ -143,11 +149,14 @@ func (e *Engine) uncountOwner(ownerKey string) {
 // with the socket. One writer writes every frame, so the order frames are queued in is the
 // order on the wire.
 type socket struct {
-	engine     *Engine
-	id         string
-	request    *http.Request // the upgrade request the IdentitySource re-validates
-	ownerKey   string        // guarded by engine.mutex: admit, migrateOwner, release
-	connection *websocket.Conn
+	engine   *Engine
+	id       string
+	request  *http.Request // the upgrade request the IdentitySource re-validates
+	ownerKey string        // guarded by engine.mutex: admit, migrateOwner, release
+	// ownerSequence is the Identify call ownerKey came from, guarded by engine.mutex: an
+	// older adopt never moves the count back.
+	ownerSequence uint64
+	connection    *websocket.Conn
 	//nolint:containedctx // the CON-002 exception of the repository: the socket's lifetime, cancelled by close
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -156,6 +165,9 @@ type socket struct {
 	closeOnce  sync.Once
 	// revalidation has one slot: a tick or Revalidate call asked for a fresh identity.
 	revalidation chan struct{}
+	// presenceMutex serializes the joins and leaves of the socket, store calls and
+	// accounting included, so a leave never overtakes the join it undoes.
+	presenceMutex sync.Mutex
 
 	mutex            sync.Mutex
 	closed           bool
@@ -167,8 +179,8 @@ type socket struct {
 	lastSubscription int
 	inFlight         int
 	presences        map[presenceRecord]struct{}
-	filterHashes     map[string]struct{} // the inline filters this socket registered (FiltersPerSocket)
-	failure          error               // the panic that closed the socket 1011, for its OutcomeClose
+	filterHashes     map[string]int // live subscriptions per inline filter hash (FiltersPerSocket)
+	failure          error          // the panic that closed the socket 1011, for its OutcomeClose
 }
 
 func newSocket(engine *Engine, request *http.Request, identity *auth.Identity, ownerKey string) *socket {
@@ -179,7 +191,7 @@ func newSocket(engine *Engine, request *http.Request, identity *auth.Identity, o
 		outbox:       newOutbox(engine.options.QueuedBytesPerSocket, engine.options.DeliveryBatchWait, engine.clock),
 		revalidation: make(chan struct{}, 1),
 		identity:     identity, identifiedAt: time.Now(),
-		subscriptions: map[string]*subscription{}, presences: map[presenceRecord]struct{}{}, filterHashes: map[string]struct{}{},
+		subscriptions: map[string]*subscription{}, presences: map[presenceRecord]struct{}{}, filterHashes: map[string]int{},
 	}
 }
 
@@ -194,7 +206,7 @@ func (s *socket) serve(connection *websocket.Conn) {
 	closed := s.closed
 	s.mutex.Unlock()
 	if closed { // Close ran between the admission and here and found no connection to end
-		s.writeClose(CloseGoingAway, "the server is shutting down")
+		s.writeClose(CloseGoingAway, "the server is shutting down", time.Now().Add(closeFrameTimeout))
 		return
 	}
 	s.observe(startUnit(OutcomeOpen, "", ""), nil)
@@ -328,6 +340,11 @@ func (s *socket) enqueue(frames ...[]byte) {
 // cancelled, the close frame is sent when the connection still takes one, and an
 // OutcomeClose reports the code.
 func (s *socket) close(code int, reason string) {
+	s.closeWithin(code, reason, time.Now().Add(closeFrameTimeout))
+}
+
+// closeWithin is close with the close frame given up at deadline.
+func (s *socket) closeWithin(code int, reason string, deadline time.Time) {
 	s.closeOnce.Do(func() {
 		s.mutex.Lock()
 		s.closed = true
@@ -344,7 +361,7 @@ func (s *socket) close(code int, reason string) {
 			liveSubscription.end()
 		}
 		if connection != nil {
-			s.writeClose(code, reason)
+			s.writeClose(code, reason, deadline)
 		}
 		outcome := startUnit(OutcomeClose, "", "").outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), failure)
 		outcome.Status = code
@@ -354,9 +371,9 @@ func (s *socket) close(code int, reason string) {
 
 // writeClose sends the close frame and closes the connection; 1006 is a code no frame may
 // carry (the connection broke), so then it only closes.
-func (s *socket) writeClose(code int, reason string) {
+func (s *socket) writeClose(code int, reason string, deadline time.Time) {
 	if code != websocket.CloseAbnormalClosure {
-		_ = s.connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(closeFrameTimeout)) // a peer that does not take it is gone
+		_ = s.connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), deadline) // a peer that does not take it is gone
 	}
 	_ = s.connection.Close() // the close of a hijacked connection reports nothing to act on
 }
@@ -445,10 +462,10 @@ func (s *socket) adopt(identity *auth.Identity, sequence uint64) *auth.Identity 
 	}
 	s.mutex.Unlock()
 	if changed {
-		s.engine.migrateOwner(s, OwnerKey(identity))
+		s.engine.migrateOwner(s, OwnerKey(identity), sequence)
 	}
 	for _, liveSubscription := range subscriptions {
-		liveSubscription.markDirty()
+		liveSubscription.markIdentityChanged()
 	}
 	return identity
 }

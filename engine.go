@@ -204,7 +204,7 @@ func normalizeOrigins(origins []string) ([]string, error) {
 		}
 		host := parsed.Host
 		if parsed.Port() == defaultPorts[parsed.Scheme] {
-			host = parsed.Hostname()
+			host = strings.TrimSuffix(host, ":"+parsed.Port()) // an IPv6 host keeps its brackets
 		}
 		normalized = append(normalized, strings.ToLower(parsed.Scheme+"://"+host))
 	}
@@ -321,7 +321,8 @@ func recovering(work func() error) (err error) {
 }
 
 // Close ends every socket with CloseGoingAway, stops Run, refuses new sockets with 503 and
-// waits until every socket's goroutines and Run ended or ctx is done, which it returns then.
+// waits until every socket's goroutines and Run ended or ctx is done, which it returns then;
+// a close frame a client does not take is given up at ctx's deadline at the latest.
 // Close may be called more than once.
 func (e *Engine) Close(ctx context.Context) error {
 	e.closeOnce.Do(func() { close(e.done) })
@@ -329,18 +330,22 @@ func (e *Engine) Close(ctx context.Context) error {
 	e.closing = true
 	open := e.openSockets()
 	e.mutex.Unlock()
+	closeFrameDeadline := time.Now().Add(closeFrameTimeout)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(closeFrameDeadline) {
+		closeFrameDeadline = deadline
+	}
 	var closing sync.WaitGroup
 	for _, clientSocket := range open {
 		closing.Go(func() {
 			_ = recovering(func() error { // a panic here is already contained; the socket is closed or closing
-				clientSocket.close(CloseGoingAway, "the server is shutting down")
+				clientSocket.closeWithin(CloseGoingAway, "the server is shutting down", closeFrameDeadline)
 				return nil
 			})
 		})
 	}
-	closing.Wait()
 	ended := make(chan struct{})
 	go func() { // only waits; nothing in it can panic
+		closing.Wait()
 		e.lifetimes.Wait()
 		close(ended)
 	}()
@@ -398,7 +403,8 @@ func (e *Engine) inSlot(ctx context.Context, work func() error) error {
 	return work()
 }
 
-// index makes a subscription reachable by the changes of its tables in its partition (D25)
+// index makes a subscription reachable by the changes of each of its tables in that
+// table's partition (D25)
 // and by the safety tick when it is time-dependent. An ended subscription is left out: its
 // unindex may have run already.
 func (e *Engine) index(liveSubscription *subscription) {
@@ -407,16 +413,16 @@ func (e *Engine) index(liveSubscription *subscription) {
 	if liveSubscription.isEnded() {
 		return
 	}
-	for _, table := range liveSubscription.tables {
+	for table, partition := range liveSubscription.partitions {
 		partitions := e.byTable[table]
 		if partitions == nil {
 			partitions = map[string]map[*subscription]struct{}{}
 			e.byTable[table] = partitions
 		}
-		if partitions[liveSubscription.partition] == nil {
-			partitions[liveSubscription.partition] = map[*subscription]struct{}{}
+		if partitions[partition] == nil {
+			partitions[partition] = map[*subscription]struct{}{}
 		}
-		partitions[liveSubscription.partition][liveSubscription] = struct{}{}
+		partitions[partition][liveSubscription] = struct{}{}
 	}
 	if liveSubscription.timeDependent {
 		e.timeDependent[liveSubscription] = struct{}{}
@@ -427,11 +433,11 @@ func (e *Engine) index(liveSubscription *subscription) {
 func (e *Engine) unindex(liveSubscription *subscription) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
-	for _, table := range liveSubscription.tables {
+	for table, partition := range liveSubscription.partitions {
 		partitions := e.byTable[table]
-		delete(partitions[liveSubscription.partition], liveSubscription)
-		if len(partitions[liveSubscription.partition]) == 0 {
-			delete(partitions, liveSubscription.partition)
+		delete(partitions[partition], liveSubscription)
+		if len(partitions[partition]) == 0 {
+			delete(partitions, partition)
 		}
 		if len(partitions) == 0 {
 			delete(e.byTable, table)
@@ -457,7 +463,7 @@ func (e *Engine) route(change Change) {
 	}
 	e.mutex.Unlock()
 	for _, liveSubscription := range reached {
-		liveSubscription.markDirty()
+		liveSubscription.markChanged(change.Table)
 	}
 }
 

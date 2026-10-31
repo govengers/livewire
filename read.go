@@ -67,7 +67,9 @@ func (e *Engine) Read(ctx context.Context, request ReadRequest) (json.RawMessage
 	return result.payload, nil
 }
 
-// readPlan is what a declaration and a read kind make of a read, decided in one place.
+// readPlan records, for one declaration and read kind, the declaration, whether the read
+// answers a list, and which parameters it decodes; planRead fills it and the rest of the
+// pipeline only reads it.
 type readPlan struct {
 	declaration Declaration
 	kind        ReadKind
@@ -160,15 +162,26 @@ func (e *Engine) resolve(ctx context.Context, request ReadRequest) (*resolvedRea
 	if err := plan.declaration.Check()(ctx); err != nil {
 		return nil, err
 	}
+	resolved, err := e.decodeRead(ctx, plan, request)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.resolveStoredFilter(WithTenant(ctx, resolved.tenant), resolved); err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
+// decodeRead decodes a planned read's parameters and resolves its tenant; it runs no check,
+// so a leave reaches the tenant of its record without one.
+func (e *Engine) decodeRead(ctx context.Context, plan *readPlan, request ReadRequest) (*resolvedRead, error) {
 	request.Source = sourceOrEmpty(request.Source)
 	resolved := &resolvedRead{request: request, plan: plan}
 	if err := resolved.decode(); err != nil {
 		return nil, err
 	}
+	var err error
 	if resolved.tenant, err = e.registry.Tenant(ctx, resolved.parameters); err != nil {
-		return nil, err
-	}
-	if err := e.resolveStoredFilter(WithTenant(ctx, resolved.tenant), resolved); err != nil {
 		return nil, err
 	}
 	return resolved, nil
@@ -230,7 +243,12 @@ func (e *Engine) resolveStoredFilter(ctx context.Context, resolved *resolvedRead
 	if !ok || e.options.FilterStore == nil {
 		return NotFound()
 	}
-	stored, err := e.options.FilterStore.Get(ctx, owner, parameters.FilterID)
+	var stored *StoredFilter
+	err := recovering(func() error {
+		var getError error
+		stored, getError = e.options.FilterStore.Get(ctx, owner, parameters.FilterID)
+		return getError
+	})
 	if err != nil {
 		return fmt.Errorf("livewire: the stored filter %q of %s: %w", parameters.FilterID, resolved.request.Target, err)
 	}
@@ -250,6 +268,12 @@ func (e *Engine) load(ctx context.Context, resolved *resolvedRead) (*readResult,
 		return result, err
 	}
 	return e.loadPresence(ctx, resolved)
+}
+
+// loadPresenceOnly lists the presences of a presence read whose record read is known to
+// pass: a presence subscription's re-run after a presence change only.
+func (e *Engine) loadPresenceOnly(ctx context.Context, resolved *resolvedRead) (*readResult, error) {
+	return e.loadPresence(WithTenant(ctx, resolved.tenant), resolved)
 }
 
 // checkRecord runs the record read of a presence operation under the caller: a record the
