@@ -2,4 +2,3 @@ sandbox/
 node_modules/
 *.test
 *.out
-.claude/
