@@ -230,3 +230,19 @@ func TestPartitionFollowingTheIdentityMovesTheSubscription(t *testing.T) {
 	socket.noPush(50 * time.Millisecond)
 	require.Equal(t, loads, bed.world.loads.Load(), "a red change no longer does")
 }
+
+func TestPanickingResolverOnARerunCostsARetry(t *testing.T) {
+	bed := newTestbed(t, nil)
+	socket := bed.dial("ada")
+	subscribed(t, socket.do(livewire.OperationSubscribe, "myGadgets", nil, nil))
+	socket.push()
+	boom := person("ada", roleReader, roleWriter)
+	boom.Data = map[string]any{"boom": true}
+	bed.identities.set(boom)
+	bed.engine.RevalidateAll()
+	require.Eventually(t, func() bool {
+		return outcomeWith(bed, livewire.OutcomeRerun, func(outcome livewire.Outcome) bool { return outcome.Status == http.StatusInternalServerError })
+	}, frameWait, time.Millisecond, "the panicking Partition resolver is a failed re-run")
+	require.True(t, socket.do(livewire.OperationPing, "", nil, nil).OK, "the socket stays open")
+	require.Empty(t, bed.outcomes.of(livewire.OutcomeClose))
+}

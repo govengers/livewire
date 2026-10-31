@@ -266,3 +266,28 @@ func TestEqualIdentitiesKeepTheRecordReadGeneration(t *testing.T) {
 	join("second")
 	require.Equal(t, loads+1, bed.world.loads.Load(), "and is the generation from then on")
 }
+
+func TestPresenceTableStaysInTheTenantWhenThePartitionMoves(t *testing.T) {
+	tenant := func(context.Context, any) (string, error) { return "acme", nil }
+	bed := newTestbedWith(t, livewire.RegistryOptions{Tenant: tenant}, nil)
+	red := person("ada", roleReader, roleWriter)
+	red.Data = map[string]any{"group": "red"}
+	bed.identities.set(red)
+	socket := bed.dial("ada")
+	record := map[string]string{"key": "k"}
+	subscribed(t, socket.do(livewire.OperationSubscribe, "myBoard.presence", record, nil))
+	socket.push()
+	join := func(id string) {
+		require.NoError(t, bed.presences.Join(t.Context(), &livewire.Presence{Socket: id, Owner: livewire.Owner{Tenant: "acme"}, Display: id, Target: "myBoard", Key: "k", UpdatedAt: time.Now()}))
+		require.Len(t, changeOf(t, socket.push().Payload).Upserts, 1)
+	}
+	join("before")
+
+	reruns := len(bed.outcomes.of(livewire.OutcomeRerun))
+	blue := person("ada", roleReader, roleWriter)
+	blue.Data = map[string]any{"group": "blue"}
+	bed.identities.set(blue)
+	bed.engine.RevalidateAll()
+	require.Eventually(t, func() bool { return len(bed.outcomes.of(livewire.OutcomeRerun)) > reruns }, frameWait, time.Millisecond)
+	join("after") // the declaration's partition moved to blue; the presence table stays in the tenant
+}

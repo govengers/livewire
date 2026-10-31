@@ -137,7 +137,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard()))
 	return registry
 }
 
@@ -198,8 +198,25 @@ func (b *testbed) myGadgets() *livewire.List {
 }
 
 func groupOf(ctx context.Context) string {
-	group, _ := auth.IdentityFrom(ctx).Data["group"].(string)
+	identity := auth.IdentityFrom(ctx)
+	if boom, _ := identity.Data["boom"].(bool); boom {
+		panic("the partition resolver panicked")
+	}
+	group, _ := identity.Data["group"].(string)
 	return group
+}
+
+// myBoard is an object whose Tables list the presence table too, partitioned by the caller's
+// group: its presence subscription keeps the presence table in the tenant.
+func (b *testbed) myBoard() *livewire.Object {
+	return livewire.NewObject("myBoard", "/my-board", &livewire.ObjectOptions[teamItem, livewire.NoParameters]{
+		Tables:    []string{"gadgets", livewire.PresenceTable},
+		Read:      authorization.HasRole(roleReader),
+		Partition: func(ctx context.Context, _ any) string { return groupOf(ctx) },
+		Load: func(ctx context.Context, _ *livewire.NoParameters) (*teamItem, error) {
+			return &teamItem{Team: groupOf(ctx)}, nil
+		},
+	})
 }
 
 // groupList is the typed-parameters list of one group, partitioned by it (D25).

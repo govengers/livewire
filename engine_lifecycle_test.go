@@ -183,4 +183,7 @@ func TestEndedSubscriptionsRunNothingForPendingMarks(t *testing.T) {
 	bed.world.change("a", "") // every subscription now has a pending mark
 	require.NoError(t, bed.engine.Close(t.Context()))
 	require.Equal(t, loads+32, bed.world.loads.Load(), "no ended subscription loads for a pending mark or a slot freed by the close")
+	require.False(t, outcomeWith(bed, livewire.OutcomeRerun, func(outcome livewire.Outcome) bool {
+		return outcome.Status == http.StatusInternalServerError
+	}), "a closing socket's re-runs report no failures")
 }
