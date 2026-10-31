@@ -99,8 +99,8 @@ func TestMutationValidationPaths(t *testing.T) {
 func TestMutationUnknownFieldInsideMapValuesAndDuplicateMembers(t *testing.T) {
 	mutation := newCreatePart(t, createOptions())
 	_, err := mutation.DecodeBody(userContext(), []byte(`{"attributes":{"color":{"note":"n","nope":1}}}`))
-	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "attributes.color.nope")
-	require.Equal(t, "unknown field", fields["attributes.color.nope"])
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "attributes[color].nope")
+	require.Equal(t, "unknown field", fields["attributes[color].nope"])
 
 	_, err = mutation.DecodeBody(userContext(), []byte(`{"name":"first","name":"last"}`))
 	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "name")

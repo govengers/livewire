@@ -63,6 +63,8 @@ func TestResponseFor(t *testing.T) {
 		{name: "hand-built query error with a code outside the set", err: &query.Error{Code: "bogus", Message: "secret text"}, status: http.StatusInternalServerError, code: livewire.CodeInternal},
 		{name: "wrapper whose Is matches a refusal", err: &matchingError{kind: auth.ErrForbidden, cause: errors.New("pq: connection refused to 10.0.0.1")}, status: http.StatusForbidden, code: livewire.CodeForbidden},
 		{name: "wrapper whose Is matches nothing known", err: &matchingError{kind: errors.New("odd"), cause: livewire.NotFound()}, status: http.StatusNotFound, code: livewire.CodeNotFound},
+		{name: "typed nil wrapper whose Is dereferences itself", err: (*matchingError)(nil), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "wrapped typed nil wrapper", err: fmt.Errorf("x: %w", (*matchingError)(nil)), status: http.StatusInternalServerError, code: livewire.CodeInternal},
 		{name: "nil", err: nil, status: http.StatusInternalServerError, code: livewire.CodeInternal},
 	}
 	for _, testCase := range testCases {
@@ -88,6 +90,18 @@ type matchingError struct {
 func (w *matchingError) Error() string        { return w.cause.Error() }
 func (w *matchingError) Unwrap() error        { return w.cause }
 func (w *matchingError) Is(target error) bool { return target == w.kind }
+
+func TestResponseForCopiesQueryFields(t *testing.T) {
+	source := &query.Error{Code: query.CodeInvalidFilter, Fields: map[string]string{"where": "x"}}
+	_, body := livewire.ResponseFor(source)
+	body.Fields["where"] = "changed"
+	body.Fields["added"] = "y"
+	require.Equal(t, map[string]string{"where": "x"}, source.Fields, "the body's fields are a copy")
+
+	_, again := livewire.ResponseFor(source)
+	source.Fields["where"] = "mutated afterwards"
+	require.Equal(t, map[string]string{"where": "x"}, again.Fields, "a later change to the source does not reach the body")
+}
 
 func TestErrorText(t *testing.T) {
 	err := livewire.Invalid(map[string]string{"name": "required", "age": "must be an integer"})

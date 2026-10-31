@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
@@ -271,7 +272,8 @@ func (m *Mutation) preflightStruct(structType reflect.Type) (err error) {
 		}
 	}()
 	var failures validator.ValidationErrors
-	if err := m.validate.Struct(reflect.New(structType).Interface()); err != nil && !errors.As(err, &failures) {
+	var notValidatable *validator.InvalidValidationError // time.Time and the like: nothing to parse
+	if err := m.validate.Struct(reflect.New(structType).Interface()); err != nil && !errors.As(err, &failures) && !errors.As(err, &notValidatable) {
 		return fmt.Errorf("the validate tags of %s cannot be used: %w", structType, err)
 	}
 	return nil
@@ -387,9 +389,105 @@ func (m *Mutation) validationError(err error) error {
 	}
 	fields := make(map[string]string, len(failures))
 	for _, failure := range failures {
-		fields[jsonPathOf(m.requestType, failure.StructNamespace())] = failure.Tag()
+		fields[m.jsonPathOf(failure.StructNamespace())] = failure.Tag()
 	}
 	return Invalid(fields)
+}
+
+// jsonPathOf translates the validator's Go namespace ("createPart.Nested.Note",
+// "audited.createPart.Secret", "order.Lines[1].SKU", "settings.Values[a.b]") to the body's
+// JSON path with the field index: the root type is dropped, untagged embedded structs
+// contribute no segment, every other field its JSON name, and index or key suffixes stay. A
+// namespace the type cannot explain (an unbalanced key, a segment that is no field) is
+// reported as "body", never as it is.
+func (m *Mutation) jsonPathOf(structNamespace string) string {
+	rootType := unwrapPointer(m.requestType)
+	remainder, found := strings.CutPrefix(structNamespace, rootType.Name())
+	if !found {
+		return "body"
+	}
+	segments, balanced := splitNamespace(strings.TrimPrefix(remainder, "."))
+	if !balanced {
+		return "body"
+	}
+	var path []string
+	currentType := rootType
+	for _, segment := range segments {
+		goName, suffix := splitIndexSuffix(segment)
+		if currentType.Kind() != reflect.Struct {
+			return "body"
+		}
+		field, ok := currentType.FieldByName(goName)
+		if !ok {
+			return "body"
+		}
+		if name, named := m.fields.jsonNameOf(currentType, goName); named {
+			path = append(path, name+suffix)
+		} else if !field.Anonymous {
+			return "body"
+		}
+		currentType = elementTypeOf(field.Type)
+	}
+	return strings.Join(path, ".")
+}
+
+// splitNamespace splits a namespace at the dots outside bracket suffixes, so a map key with
+// a dot ("Values[a.b]") stays one segment. A segment is a name, optionally followed by
+// bracket suffixes that close at its end; anything else (an unbalanced key) is not
+// balanced.
+func splitNamespace(namespace string) (segments []string, balanced bool) {
+	var current strings.Builder
+	depth := 0
+	for _, character := range namespace {
+		switch {
+		case character == '[':
+			depth++
+		case character == ']':
+			if depth == 0 {
+				return nil, false
+			}
+			depth--
+		case character == '.' && depth == 0:
+			segments = append(segments, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteRune(character)
+	}
+	if depth != 0 {
+		return nil, false
+	}
+	segments = append(segments, current.String())
+	for _, segment := range segments {
+		if !isNamespaceSegment(segment) {
+			return nil, false
+		}
+	}
+	return segments, true
+}
+
+// isNamespaceSegment accepts "Name" and "Name[...]...[...]" where the brackets end the
+// segment; "Name[a]b" is not a segment.
+func isNamespaceSegment(segment string) bool {
+	name, suffix := splitIndexSuffix(segment)
+	return name != "" && (suffix == "" || strings.HasSuffix(suffix, "]"))
+}
+
+// splitIndexSuffix separates "Lines[1]" into "Lines" and "[1]".
+func splitIndexSuffix(segment string) (name, suffix string) {
+	if open := strings.IndexByte(segment, '['); open >= 0 {
+		return segment[:open], segment[open:]
+	}
+	return segment, ""
+}
+
+// elementTypeOf unwraps pointers, collections and maps down to the type a path continues in.
+func elementTypeOf(fieldType reflect.Type) reflect.Type {
+	fieldType = unwrapPointer(fieldType)
+	for isCollection(fieldType.Kind()) || fieldType.Kind() == reflect.Map {
+		fieldType = unwrapPointer(fieldType.Elem())
+	}
+	return fieldType
 }
 
 func sortedKeys[Value any](values map[string]Value) []string {

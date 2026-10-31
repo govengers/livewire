@@ -5,7 +5,6 @@ import (
 	"encoding"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"reflect"
 	"strconv"
@@ -14,13 +13,16 @@ import (
 
 // inspectBody reads raw once as a token stream alongside the request type and returns the
 // body's top-level members by name with their raw text. An unknown member at any depth
-// (struct fields, array elements, map values), a member that repeats within one object and
-// a body that is not one JSON object are refused with fixed texts naming the member's path.
+// (struct fields, array elements, map values), a member that repeats within one object
+// (skipped subtrees included) and a body that is not one JSON object are refused with fixed
+// texts naming the member's path. The path is kept as a stack of segments and written only
+// for the refusal, so a deep body costs memory in proportion to its size.
 func inspectBody(raw []byte, requestType reflect.Type, fields fieldIndex) (map[string]json.RawMessage, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, invalidParameter("body", "required")
 	}
 	walker := &bodyWalker{decoder: json.NewDecoder(bytes.NewReader(raw)), raw: raw, fields: fields, topLevel: map[string]json.RawMessage{}}
+	walker.decoder.UseNumber()
 	token, err := walker.decoder.Token()
 	switch {
 	case err != nil:
@@ -28,7 +30,7 @@ func inspectBody(raw []byte, requestType reflect.Type, fields fieldIndex) (map[s
 	case token != json.Delim('{'):
 		return nil, invalidParameter("body", "must be an object")
 	}
-	if err := walker.walkObject(requestType, "", true); err != nil {
+	if err := walker.walkObject(requestType, true); err != nil {
 		return nil, err
 	}
 	if _, err := walker.decoder.Token(); !errors.Is(err, io.EOF) {
@@ -41,11 +43,13 @@ type bodyWalker struct {
 	decoder  *json.Decoder
 	raw      []byte
 	fields   fieldIndex
+	segments []string
 	topLevel map[string]json.RawMessage
 }
 
 // fieldIndex is the JSON field model of every struct type a request reaches, computed once
-// at construction (indexFields) so a request never probes encoding/json.
+// at construction (indexFields), so the walk and the validation paths never probe
+// encoding/json at request time.
 type fieldIndex map[reflect.Type]map[string]reflect.StructField
 
 func indexFields(requestType reflect.Type) fieldIndex {
@@ -63,9 +67,39 @@ func (i fieldIndex) of(structType reflect.Type) map[string]reflect.StructField {
 	return jsonFieldsOf(structType)
 }
 
+// jsonNameOf returns the JSON name of the struct's field with the Go name, from the index.
+func (i fieldIndex) jsonNameOf(structType reflect.Type, goName string) (string, bool) {
+	for name, field := range i.of(structType) {
+		if field.Name == goName {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// path writes the segments as the client reads them: "lines[1].sku", "values[a.b].note".
+func (w *bodyWalker) path() string {
+	var path strings.Builder
+	for position, segment := range w.segments {
+		if position > 0 && !strings.HasPrefix(segment, "[") {
+			path.WriteByte('.')
+		}
+		path.WriteString(segment)
+	}
+	return path.String()
+}
+
+func (w *bodyWalker) refuse(message string) error {
+	return invalidParameter(w.path(), message)
+}
+
+func (w *bodyWalker) push(segment string) { w.segments = append(w.segments, segment) }
+
+func (w *bodyWalker) pop() { w.segments = w.segments[:len(w.segments)-1] }
+
 // walkObject consumes the members of an object whose opening brace was read; the members
 // are the JSON fields of structType.
-func (w *bodyWalker) walkObject(structType reflect.Type, prefix string, top bool) error {
+func (w *bodyWalker) walkObject(structType reflect.Type, top bool) error {
 	known := w.fields.of(structType)
 	seen := map[string]bool{}
 	for {
@@ -77,29 +111,31 @@ func (w *bodyWalker) walkObject(structType reflect.Type, prefix string, top bool
 			return nil
 		}
 		key, _ := token.(string)
-		path := prefix + key
+		w.push(key)
 		field, ok := known[key]
 		switch {
 		case seen[key]:
-			return invalidParameter(path, "duplicate member")
+			return w.refuse("duplicate member")
 		case !ok:
-			return invalidParameter(path, "unknown field")
+			return w.refuse("unknown field")
 		}
 		seen[key] = true
 		start := w.decoder.InputOffset()
-		if err := w.walkValue(field.Type, path); err != nil {
+		if err := w.walkValue(field.Type); err != nil {
 			return err
 		}
 		if top {
 			w.topLevel[key] = bytes.TrimLeft(w.raw[start:w.decoder.InputOffset()], " \t\r\n:")
 		}
+		w.pop()
 	}
 }
 
 // walkValue consumes one value of the type: objects of struct types are walked, elements of
-// collections and values of maps descend with their path, everything else is skipped. A
-// value of another shape than the type expects is left to the decoder, which names it.
-func (w *bodyWalker) walkValue(fieldType reflect.Type, path string) error {
+// collections and values of maps descend with their segment, everything else is skipped
+// (duplicate members are still refused there). A value of another shape than the type
+// expects is left to the decoder, which names it.
+func (w *bodyWalker) walkValue(fieldType reflect.Type) error {
 	fieldType = unwrapPointer(fieldType)
 	token, err := w.decoder.Token()
 	if err != nil {
@@ -109,17 +145,17 @@ func (w *bodyWalker) walkValue(fieldType reflect.Type, path string) error {
 	case hasOwnUnmarshaler(fieldType):
 		return w.skipAfter(token)
 	case token == json.Delim('{') && fieldType.Kind() == reflect.Struct:
-		return w.walkObject(fieldType, path+".", false)
+		return w.walkObject(fieldType, false)
 	case token == json.Delim('{') && fieldType.Kind() == reflect.Map:
-		return w.walkEntries(fieldType.Elem(), path)
+		return w.walkEntries(fieldType.Elem())
 	case token == json.Delim('[') && isCollection(fieldType.Kind()):
-		return w.walkElements(fieldType.Elem(), path)
+		return w.walkElements(fieldType.Elem())
 	default:
 		return w.skipAfter(token)
 	}
 }
 
-func (w *bodyWalker) walkEntries(valueType reflect.Type, path string) error {
+func (w *bodyWalker) walkEntries(valueType reflect.Type) error {
 	seen := map[string]bool{}
 	for {
 		token, err := w.decoder.Token()
@@ -130,21 +166,25 @@ func (w *bodyWalker) walkEntries(valueType reflect.Type, path string) error {
 			return nil
 		}
 		key, _ := token.(string)
+		w.push("[" + key + "]")
 		if seen[key] {
-			return invalidParameter(path+"."+key, "duplicate member")
+			return w.refuse("duplicate member")
 		}
 		seen[key] = true
-		if err := w.walkValue(valueType, path+"."+key); err != nil {
+		if err := w.walkValue(valueType); err != nil {
 			return err
 		}
+		w.pop()
 	}
 }
 
-func (w *bodyWalker) walkElements(elementType reflect.Type, path string) error {
+func (w *bodyWalker) walkElements(elementType reflect.Type) error {
 	for position := 0; w.decoder.More(); position++ {
-		if err := w.walkValue(elementType, fmt.Sprintf("%s[%d]", path, position)); err != nil {
+		w.push("[" + strconv.Itoa(position) + "]")
+		if err := w.walkValue(elementType); err != nil {
 			return err
 		}
+		w.pop()
 	}
 	if _, err := w.decoder.Token(); err != nil {
 		return invalidParameter("body", "must be valid JSON")
@@ -152,26 +192,63 @@ func (w *bodyWalker) walkElements(elementType reflect.Type, path string) error {
 	return nil
 }
 
-// skipAfter consumes the rest of the value whose first token was read: nothing for a scalar,
-// everything up to the matching close for an object or array.
+// skipAfter consumes the rest of a value the type does not model, whose first token was read:
+// nothing for a scalar, every member of an object (repeated members refused) or element of
+// an array.
 func (w *bodyWalker) skipAfter(token json.Token) error {
-	delimiter, ok := token.(json.Delim)
-	if !ok || (delimiter != '{' && delimiter != '[') {
+	switch {
+	case token == json.Delim('{'):
+		return w.skipObject()
+	case token == json.Delim('['):
+		return w.skipArray()
+	default:
 		return nil
 	}
-	for depth := 1; depth > 0; {
-		next, err := w.decoder.Token()
+}
+
+func (w *bodyWalker) skipObject() error {
+	seen := map[string]bool{}
+	for {
+		token, err := w.decoder.Token()
 		if err != nil {
 			return invalidParameter("body", "must be valid JSON")
 		}
-		switch next {
-		case json.Delim('{'), json.Delim('['):
-			depth++
-		case json.Delim('}'), json.Delim(']'):
-			depth--
+		if token == json.Delim('}') {
+			return nil
 		}
+		key, _ := token.(string)
+		w.push(key)
+		if seen[key] {
+			return w.refuse("duplicate member")
+		}
+		seen[key] = true
+		if err := w.skipValue(); err != nil {
+			return err
+		}
+		w.pop()
+	}
+}
+
+func (w *bodyWalker) skipArray() error {
+	for position := 0; w.decoder.More(); position++ {
+		w.push("[" + strconv.Itoa(position) + "]")
+		if err := w.skipValue(); err != nil {
+			return err
+		}
+		w.pop()
+	}
+	if _, err := w.decoder.Token(); err != nil {
+		return invalidParameter("body", "must be valid JSON")
 	}
 	return nil
+}
+
+func (w *bodyWalker) skipValue() error {
+	token, err := w.decoder.Token()
+	if err != nil {
+		return invalidParameter("body", "must be valid JSON")
+	}
+	return w.skipAfter(token)
 }
 
 var (
@@ -190,117 +267,28 @@ func isCollection(kind reflect.Kind) bool {
 
 // reachableStructs lists every struct type the request type reaches through fields,
 // pointers, collections and map values, each once, types with their own unmarshaler
-// excluded; the validator parses the tags of each on first use.
+// included (the validator descends into them, the body walk does not). Every type is marked
+// before its elements are followed, so a recursive collection (`type Tree map[string]Tree`)
+// ends the walk.
 func reachableStructs(requestType reflect.Type) []reflect.Type {
 	var structs []reflect.Type
 	visited := map[reflect.Type]bool{}
 	var visit func(current reflect.Type)
 	visit = func(current reflect.Type) {
-		current = unwrapPointer(current)
-		for isCollection(current.Kind()) || current.Kind() == reflect.Map {
-			current = unwrapPointer(current.Elem())
-		}
-		if current.Kind() != reflect.Struct || visited[current] || hasOwnUnmarshaler(current) {
+		if visited[current] {
 			return
 		}
 		visited[current] = true
-		structs = append(structs, current)
-		for position := range current.NumField() {
-			visit(current.Field(position).Type)
+		switch {
+		case current.Kind() == reflect.Pointer, isCollection(current.Kind()), current.Kind() == reflect.Map:
+			visit(current.Elem())
+		case current.Kind() == reflect.Struct:
+			structs = append(structs, current)
+			for position := range current.NumField() {
+				visit(current.Field(position).Type)
+			}
 		}
 	}
 	visit(requestType)
 	return structs
-}
-
-// jsonPathOf translates the validator's Go namespace ("createPart.Nested.Note",
-// "audited.createPart.Secret", "order.Lines[1].SKU", "settings.Values[a.b]") to the body's
-// JSON path: the root type is dropped, untagged embedded structs contribute no segment, every
-// other field its JSON name, and index or key suffixes stay. A namespace the type cannot
-// explain is reported as "body", never as it is.
-func jsonPathOf(rootType reflect.Type, structNamespace string) string {
-	rootType = unwrapPointer(rootType)
-	remainder, found := strings.CutPrefix(structNamespace, rootType.Name())
-	if !found {
-		return "body"
-	}
-	var path []string
-	currentType := rootType
-	for _, segment := range splitNamespace(strings.TrimPrefix(remainder, ".")) {
-		goName, suffix := splitIndexSuffix(segment)
-		if currentType.Kind() != reflect.Struct {
-			return "body"
-		}
-		field, ok := currentType.FieldByName(goName)
-		if !ok {
-			return "body"
-		}
-		name, tagged, _ := jsonName(field)
-		if !field.Anonymous || tagged {
-			path = append(path, name+suffix)
-		}
-		currentType = elementTypeOf(field.Type)
-	}
-	return strings.Join(path, ".")
-}
-
-// splitNamespace splits a namespace at the dots outside bracket suffixes, so a map key with
-// a dot ("Values[a.b]") stays one segment.
-func splitNamespace(namespace string) []string {
-	var segments []string
-	var current strings.Builder
-	depth := 0
-	for _, character := range namespace {
-		switch {
-		case character == '[':
-			depth++
-		case character == ']' && depth > 0:
-			depth--
-		case character == '.' && depth == 0:
-			segments = append(segments, current.String())
-			current.Reset()
-			continue
-		}
-		current.WriteRune(character)
-	}
-	if current.Len() > 0 {
-		segments = append(segments, current.String())
-	}
-	return segments
-}
-
-// splitIndexSuffix separates "Lines[1]" into "Lines" and "[1]".
-func splitIndexSuffix(segment string) (name, suffix string) {
-	if open := strings.IndexByte(segment, '['); open >= 0 {
-		return segment[:open], segment[open:]
-	}
-	return segment, ""
-}
-
-// elementTypeOf unwraps pointers, collections and maps down to the type a path continues in.
-func elementTypeOf(fieldType reflect.Type) reflect.Type {
-	fieldType = unwrapPointer(fieldType)
-	for isCollection(fieldType.Kind()) || fieldType.Kind() == reflect.Map {
-		fieldType = unwrapPointer(fieldType.Elem())
-	}
-	return fieldType
-}
-
-// formatNumberID writes a number the way JavaScript's Number toString does, so a numeric id
-// keys the same on the server and in the browser: plain digits for 1e-6 <= |n| < 1e21,
-// exponent form outside, and -0 as 0.
-func formatNumberID(number float64) string {
-	if number == 0 {
-		return "0"
-	}
-	magnitude := number
-	if magnitude < 0 {
-		magnitude = -magnitude
-	}
-	if magnitude >= 1e-6 && magnitude < 1e21 {
-		return strconv.FormatFloat(number, 'f', -1, 64)
-	}
-	mantissa, exponent, _ := strings.Cut(strconv.FormatFloat(number, 'e', -1, 64), "e")
-	sign, digits := exponent[:1], strings.TrimLeft(exponent[1:], "0")
-	return mantissa + "e" + sign + digits
 }

@@ -397,6 +397,41 @@ func TestOddJSONTagNamesFollowEncodingJSON(t *testing.T) {
 	require.JSONEq(t, `[{"id":"a"}]`, string(redacted), "the guard under the marshaled name strips the value")
 }
 
+type probeNamed struct {
+	ID    string `json:"id"`
+	Token string `json:"Probe"` // the name the field model probes under
+}
+
+func TestFieldTaggedLikeTheProbeKeepsItsTagName(t *testing.T) {
+	marshaled, err := json.Marshal(probeNamed{ID: "a", Token: "t"})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"id":"a","Probe":"t"}`, string(marshaled))
+
+	load := func(context.Context, *livewire.NoParameters) ([]probeNamed, error) { return nil, nil }
+	require.ErrorContains(t, addError(t, livewire.NewList("s", "/s", &livewire.ListOptions[probeNamed, livewire.NoParameters]{
+		Read: authorization.IsUser(), Guarded: []livewire.GuardedField{{Name: "Token", Read: authorization.IsAdmin()}}, Load: load,
+	})), `no JSON field "Token"`, "the Go name is not the JSON name")
+
+	list := livewire.NewList("s", "/s", &livewire.ListOptions[probeNamed, livewire.NoParameters]{
+		Read: authorization.IsUser(), Guarded: []livewire.GuardedField{{Name: "Probe", Read: authorization.IsAdmin()}}, Load: load,
+	})
+	require.NoError(t, addError(t, list))
+	redacted, err := livewire.RedactItems(userContext(), list.Fields(), json.RawMessage(`[`+string(marshaled)+`]`))
+	require.NoError(t, err)
+	require.JSONEq(t, `[{"id":"a"}]`, string(redacted))
+
+	mutation := livewire.NewMutation("m", http.MethodPost, "/m", &livewire.MutationOptions[livewire.NoParameters, probeNamed, livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *probeNamed) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})
+	require.NoError(t, addError(t, mutation))
+	body, err := mutation.DecodeBody(userContext(), []byte(`{"Probe":"t"}`))
+	require.NoError(t, err, "a valid body under the tag name decodes")
+	require.Equal(t, "t", body.(*probeNamed).Token)
+}
+
 func TestLivePointerItemsWithID(t *testing.T) {
 	type keyed struct {
 		ID string `json:"id"`

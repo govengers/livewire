@@ -63,12 +63,12 @@ type recursive struct {
 
 type mutualA struct {
 	*mutualB
-	A string `json:"a"`
+	Left string `json:"a"`
 }
 
 type mutualB struct {
 	*mutualA
-	B string `json:"b"`
+	Right string `json:"b"`
 }
 
 type diamondBase struct {
@@ -114,7 +114,7 @@ func TestJSONFieldsOfMatchesEncodingJSON(t *testing.T) {
 		{name: "same-depth conflict is dropped", value: ambiguous{Keep: "k"}},
 		{name: "a tagged field beats an untagged one at the same depth", value: taggedBeatsUntagged{}},
 		{name: "recursive embedding ends", value: recursive{ID: "r"}},
-		{name: "mutually recursive embedding ends", value: mutualA{A: "a", mutualB: &mutualB{B: "b"}}},
+		{name: "mutually recursive embedding ends", value: mutualA{Left: "a", mutualB: &mutualB{Right: "b"}}},
 		{name: "skipped and unexported fields", value: skipped{Exported: "e"}},
 		{name: "diamond cancels the shared field", value: diamond{diamondLeft: diamondLeft{Left: "l"}, diamondRight: diamondRight{Right: "r"}}},
 		{name: "shallow occurrence wins the diamond", value: shallowDiamond{diamondBase: diamondBase{Shared: "s"}}},

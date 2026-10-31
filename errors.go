@@ -114,42 +114,31 @@ func ResponseFor(err error) (int, ErrorBody) {
 }
 
 func responseForOne(err error) (int, ErrorBody, bool) {
+	if isNilPointer(err) {
+		return 0, ErrorBody{}, false // a typed nil answers nothing; its methods may dereference it
+	}
 	switch typed := err.(type) { //nolint:errorlint // one node of the chain, not the chain: errors.As would look past it
 	case *Error:
-		if typed == nil || typed.status == 0 {
-			return 0, ErrorBody{}, false // a nil or zero value was never built by a constructor
+		if typed.status == 0 {
+			return 0, ErrorBody{}, false // a zero value was never built by a constructor
 		}
 		return typed.status, typed.Body(), true
 	case *query.Error:
 		return queryResponse(typed)
 	case *auth.Error:
-		if typed == nil {
-			return 0, ErrorBody{}, false
-		}
 		return authResponse(typed.Kind, true)
 	}
 	return authResponse(err, isLeaf(err))
 }
 
-// queryMessages are the fixed texts of the query codes; a *query.Error built by hand keeps
-// only a code from the set and its fields.
-var queryMessages = map[Code]string{
-	CodeInvalidFilter: "the filter is not valid for this resource",
-	CodeInvalidSort:   "the sort is not valid for this resource",
-	CodeInvalidPage:   "the page is not valid",
-	CodeInvalidCursor: "the cursor is not valid for this sort",
-}
-
+// queryResponse answers a *query.Error with its code's fixed message (query.Code.Message); a
+// hand-built one keeps only a code the query package defines and its fields, copied.
 func queryResponse(queryError *query.Error) (int, ErrorBody, bool) {
-	if queryError == nil {
+	message := queryError.Code.Message()
+	if message == "" {
 		return 0, ErrorBody{}, false
 	}
-	code := Code(queryError.Code)
-	message, known := queryMessages[code]
-	if !known {
-		return 0, ErrorBody{}, false
-	}
-	return http.StatusBadRequest, ErrorBody{Code: code, Message: message, Fields: maps.Clone(queryError.Fields)}, true
+	return http.StatusBadRequest, ErrorBody{Code: Code(queryError.Code), Message: message, Fields: maps.Clone(queryError.Fields)}, true
 }
 
 var authCodes = []struct {

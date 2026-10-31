@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
+	"strconv"
+	"strings"
 )
 
 // ListState is what a list subscription last pushed (the engine keeps one per list
@@ -103,4 +106,20 @@ func itemID(item json.RawMessage) (string, error) {
 		return formatNumberID(number), nil
 	}
 	return "", fmt.Errorf("livewire: a list item's id is neither a string nor a number: %s", rawID)
+}
+
+// formatNumberID writes a number the way JavaScript's Number toString does, so a numeric id
+// keys the same on the server and in the browser: plain digits for 1e-6 <= |n| < 1e21,
+// exponent form outside, and -0 as 0.
+func formatNumberID(number float64) string {
+	if number == 0 {
+		return "0"
+	}
+	magnitude := math.Abs(number)
+	if magnitude >= 1e-6 && magnitude < 1e21 {
+		return strconv.FormatFloat(number, 'f', -1, 64)
+	}
+	mantissa, exponent, _ := strings.Cut(strconv.FormatFloat(number, 'e', -1, 64), "e")
+	sign, digits := exponent[:1], strings.TrimLeft(exponent[1:], "0")
+	return mantissa + "e" + sign + digits
 }

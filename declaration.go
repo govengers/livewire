@@ -341,25 +341,31 @@ func jsonName(field reflect.StructField) (name string, tagged, included bool) {
 	if tagName == "" {
 		return field.Name, false, true
 	}
-	key, included := probeJSONKey(field.Tag)
-	switch {
-	case !included:
+	key, included := probeJSONKey(field.Tag, jsonProbeField)
+	if !included {
 		return "", false, false
-	case key == jsonProbeField:
-		return field.Name, false, true // encoding/json fell back to the Go name: the tag names nothing
-	default:
-		return key, true, true
 	}
+	if key == jsonProbeField {
+		// Either the tag names the field "Probe" or encoding/json fell back to the Go name: a
+		// second probe under another Go name tells them apart.
+		if other, _ := probeJSONKey(field.Tag, jsonOtherProbeField); other == jsonOtherProbeField {
+			return field.Name, false, true
+		}
+	}
+	return key, true, true
 }
 
-const jsonProbeField = "Probe"
+const (
+	jsonProbeField      = "Probe"
+	jsonOtherProbeField = "OtherProbe"
+)
 
 var stringType = reflect.TypeFor[string]()
 
-// probeJSONKey marshals a one-field struct carrying tag and returns the key encoding/json
-// wrote, or false when it wrote none.
-func probeJSONKey(tag reflect.StructTag) (string, bool) {
-	probeType := reflect.StructOf([]reflect.StructField{{Name: jsonProbeField, Type: stringType, Tag: tag}})
+// probeJSONKey marshals a one-field struct named goName carrying tag and returns the key
+// encoding/json wrote, or false when it wrote none.
+func probeJSONKey(tag reflect.StructTag, goName string) (string, bool) {
+	probeType := reflect.StructOf([]reflect.StructField{{Name: goName, Type: stringType, Tag: tag}})
 	probe := reflect.New(probeType).Elem()
 	probe.Field(0).SetString("x")
 	marshaled, err := json.Marshal(probe.Interface())
