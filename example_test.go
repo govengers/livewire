@@ -76,3 +76,33 @@ func ExampleRegistry_Add() {
 	// mutation createTodo POST /api/v1/todos
 	// /todos/{id}
 }
+
+// ExampleNewEngine wires the engine in main: the registry, the IdentitySource that
+// re-validates every socket (session.Guard), the Transactor and the change feed of
+// postgresadapter, the browser origins that may open a socket. Handler serves the socket
+// behind the same authentication as the REST routes; Run consumes the change feed until the
+// context ends; Close ends every socket with 1001.
+func ExampleNewEngine() {
+	var (
+		ctx            context.Context
+		registry       *livewire.Registry      // built with NewRegistry and Add
+		identitySource livewire.IdentitySource // session.Guard
+		transactor     livewire.Transactor     // postgresadapter
+		changeFeed     livewire.ChangeFeed     // postgresadapter's LISTEN feed
+		authenticate   func(http.Handler) http.Handler
+	)
+	engine, err := livewire.NewEngine(&livewire.EngineOptions{
+		Registry:       registry,
+		ChangeFeed:     changeFeed,
+		IdentitySource: identitySource,
+		Transactor:     transactor,
+		AllowedOrigins: []string{"https://app.example"},
+	})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	http.Handle("/api/v1/live", authenticate(engine.Handler()))
+	go func() { _ = engine.Run(ctx) }()
+	defer func() { _ = engine.Close(ctx) }()
+}
