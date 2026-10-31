@@ -58,6 +58,7 @@ func NewList[Item, Parameters any](name, path string, options *ListOptions[Item,
 		}
 	}
 	list.compileParameters(reflect.TypeFor[Parameters]())
+	list.failWith(refusePointerLoops(list.itemType))
 	list.failWith(list.validate(options.Guarded))
 	return list
 }
@@ -144,6 +145,7 @@ func NewObject[Item, Parameters any](name, path string, options *ObjectOptions[I
 		}
 	}
 	object.compileParameters(reflect.TypeFor[Parameters]())
+	object.failWith(refusePointerLoops(object.itemType))
 	if object.load == nil {
 		object.fail("Load is required")
 	}

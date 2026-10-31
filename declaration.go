@@ -202,8 +202,9 @@ func intOrDefault(value, fallback int) int {
 // encoding/json's typeFields: one embedding level at a time, a type visited once (the
 // shallowest occurrence), a type embedded twice at one level cancels its fields, embedded
 // structs (by value or pointer) flatten unless their tag names them, a tagged field beats
-// untagged ones at the same depth, and a name that stays ambiguous is dropped. A type that
-// is not a struct has no fields.
+// untagged ones at the same depth, and a name that stays ambiguous is dropped. Every field
+// carries its index path from itemType, as reflect's FieldByName reports it. A type that is
+// not a struct has no fields.
 func jsonFieldsOf(itemType reflect.Type) map[string]reflect.StructField {
 	itemType = unwrapPointer(itemType)
 	fields := map[string]reflect.StructField{}
@@ -225,9 +226,12 @@ type jsonFieldCandidate struct {
 	tagged bool
 }
 
+// embeddedLevel is a struct type on one embedding level with the index path that reaches
+// it from the outer type.
 type embeddedLevel struct {
 	structType reflect.Type
 	depth      int
+	index      []int
 }
 
 // collectJSONFields walks the embedding levels breadth first and returns every candidate by
@@ -260,13 +264,14 @@ func (c *jsonFieldCollector) collectLevel(current []embeddedLevel, count map[ref
 		c.visited[level.structType] = true
 		for position := range level.structType.NumField() {
 			field := level.structType.Field(position)
+			field.Index = append(slices.Clone(level.index), position)
 			embeddedType := unwrapPointer(field.Type)
 			switch classifyJSONField(field, embeddedType) {
 			case jsonFieldSkipped:
 			case jsonFieldFlattens:
 				nextCount[embeddedType]++
 				if nextCount[embeddedType] == 1 {
-					next = append(next, embeddedLevel{structType: embeddedType, depth: level.depth + 1})
+					next = append(next, embeddedLevel{structType: embeddedType, depth: level.depth + 1, index: field.Index})
 				}
 			case jsonFieldNamed:
 				c.record(field, level.depth, count[level.structType])
@@ -382,11 +387,41 @@ func probeJSONKey(tag reflect.StructTag, goName string) (string, bool) {
 	return "", false
 }
 
+// unwrapPointer follows pointers to the type they point to; a pointer chain that loops
+// (followPointers) is returned at the loop, a pointer type.
 func unwrapPointer(fieldType reflect.Type) reflect.Type {
+	pointed, _ := followPointers(fieldType)
+	return pointed
+}
+
+// followPointers follows pointers to the type they point to; ends is false for a chain that
+// returns into itself (`type Loop *Loop`), which points to no value. The chain is followed at
+// two speeds, so a loop is found without remembering the chain.
+func followPointers(fieldType reflect.Type) (pointed reflect.Type, ends bool) {
+	slow := fieldType
 	for fieldType.Kind() == reflect.Pointer {
 		fieldType = fieldType.Elem()
+		if fieldType.Kind() != reflect.Pointer {
+			return fieldType, true
+		}
+		fieldType = fieldType.Elem()
+		slow = slow.Elem()
+		if slow == fieldType {
+			return fieldType, false
+		}
 	}
-	return fieldType
+	return fieldType, true
+}
+
+// refusePointerLoops reports a pointer chain that loops anywhere the type reaches: no value
+// can be decoded into it (encoding/json would allocate forever) or marshaled from it.
+func refusePointerLoops(root reflect.Type) error {
+	for _, reached := range reachableTypes(root) {
+		if _, ends := followPointers(reached); !ends {
+			return fmt.Errorf("the type %s is a pointer that points to itself", reached)
+		}
+	}
+	return nil
 }
 
 // requireJSONField checks that a type (pointers unwrapped) marshals a field named name; why

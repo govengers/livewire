@@ -354,6 +354,17 @@ func TestMutationDecodeBody(t *testing.T) {
 	}
 }
 
+func TestMutationClientIDVersionFour(t *testing.T) {
+	options := createOptions()
+	options.ClientID = livewire.UUIDv4
+	mutation := newCreatePart(t, options)
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"id":"3f7b2c10-9e1d-4a6b-8c2f-1a2b3c4d5e6f","name":"bolt"}`))
+	require.NoError(t, err)
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"id":"0192f1a0-1b2c-7d3e-8f40-516273849506","name":"bolt"}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "id")
+	require.Equal(t, "must be a canonical UUID version 4", fields["id"])
+}
+
 func TestMutationRequiredValidation(t *testing.T) {
 	type address struct {
 		City string `json:"city" validate:"required"`

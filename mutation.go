@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/go-playground/validator/v10"
@@ -133,7 +134,10 @@ func NewMutation[Parameters, Request, Response any](name, method, path string, o
 	}
 	mutation.compileParameters(mutation.parametersType)
 	mutation.failWith(mutation.validateDeclaration(options.Status))
-	mutation.failWith(mutation.preflightValidateTags())
+	mutation.failWith(refusePointerLoops(mutation.requestType))
+	if mutation.err == nil {
+		mutation.failWith(mutation.preflightValidateTags())
+	}
 	return mutation
 }
 
@@ -174,10 +178,10 @@ func (m *Mutation) Effect() Effect { return m.effect }
 // member by its path (D40); a client id a create does not accept, or of the wrong form or
 // version, is 400 naming "id" (D18); a field whose write check refuses is 403
 // forbidden_field (D39); a body that fails its `validate` tags is 400 naming each field with
-// the failed tag (D44). Every text in the response is fixed; the cause of a decoding failure
-// stays on the server. A validator fault that only shows at run time (an argument behind
-// omitempty) is answered as an internal error, never as a panic. A mutation without a body
-// refuses a non-empty raw.
+// the failed tag (D44); a value of the wrong type is 400 naming it by the same path. Every
+// text in the response is fixed; the cause of a decoding failure stays on the server. A
+// validator fault the declaration's preflight cannot reach is answered as an internal
+// error, never as a panic. A mutation without a body refuses a non-empty raw.
 func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	body := reflect.New(m.requestType).Interface()
 	if !m.HasBody() {
@@ -196,7 +200,7 @@ func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(body); err != nil {
-		return nil, bodyError(err)
+		return nil, m.bodyError(raw, err)
 	}
 	if err := m.checkWrites(ctx, present); err != nil {
 		return nil, err
@@ -249,38 +253,119 @@ func (m *Mutation) validateDeclaration(status int) error {
 	return m.validateFieldChecks()
 }
 
-// preflightValidateTags runs the validator over a zero value of every struct type reachable
-// from the request type (through pointers, slices, arrays and maps): the validator parses
-// tags lazily and panics on a tag it cannot parse, which must be an Add error (D44), never a
-// request-time panic. The zero values' own validation failures are not the question here.
+// preflightValidateTags makes a validate tag the validator cannot use, on any struct type
+// reachable from the request type (through pointers, slices, arrays and maps), an Add error
+// (D44), never a request-time panic. The validator parses a tag when it first meets the
+// struct and a rule's arguments only when the rule runs, so two passes run the tags: over a
+// zero value of every struct (the tags as written), then every rule on its own
+// (preflightRules), so a rule behind a short-circuit (`required,min=abc` or
+// `omitempty,min=abc` on a zero value) runs too. The samples' own validation failures are
+// not the question here.
 func (m *Mutation) preflightValidateTags() error {
 	if m.validate == nil || m.requestType.Kind() != reflect.Struct {
 		return nil
 	}
-	for _, structType := range reachableStructs(m.requestType) {
-		if err := m.preflightStruct(structType); err != nil {
+	structs := reachableStructs(m.requestType)
+	for _, structType := range structs {
+		if err := m.preflight(reflect.New(structType), structType.String()); err != nil {
 			return err
 		}
 	}
-	return nil
-}
-
-func (m *Mutation) preflightStruct(structType reflect.Type) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("the validate tags of %s cannot be parsed: %v", structType, recovered)
+	for _, structType := range structs {
+		for position := range structType.NumField() {
+			field := structType.Field(position)
+			tag := field.Tag.Get("validate")
+			validated := tag != "" && tag != "-" && field.IsExported()
+			if !validated {
+				continue
+			}
+			if err := m.preflightRules(structType, field, field.Type, strings.Split(tag, ",")); err != nil {
+				return err
+			}
 		}
-	}()
-	var failures validator.ValidationErrors
-	var notValidatable *validator.InvalidValidationError // time.Time and the like: nothing to parse
-	if err := m.validate.Struct(reflect.New(structType).Interface()); err != nil && !errors.As(err, &failures) && !errors.As(err, &notValidatable) {
-		return fmt.Errorf("the validate tags of %s cannot be used: %w", structType, err)
 	}
 	return nil
 }
 
-// validateBody runs the validate tags; a fault the preflight could not see (an argument
-// behind omitempty, evaluated only on a value) is an internal error, not a panic.
+// preflightRules runs each rule of a field's tag, and each alternative of a rule, on its own
+// on a value of the type the rule applies to: the field's, after `dive` the element's, between
+// `keys` and `endkeys` the map key's.
+func (m *Mutation) preflightRules(owner reflect.Type, field reflect.StructField, target reflect.Type, rules []string) error {
+	for position, rule := range rules {
+		if rule == "dive" {
+			return m.preflightDive(owner, field, target, rules[position+1:])
+		}
+		for _, alternative := range strings.Split(rule, "|") {
+			if err := m.preflightRule(owner, field, target, alternative); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Mutation) preflightDive(owner reflect.Type, field reflect.StructField, target reflect.Type, rules []string) error {
+	container := unwrapPointer(target)
+	if !hasElements(container.Kind()) {
+		return fmt.Errorf("the validate tags of %s.%s cannot be used: dive on %s, which has no elements", owner, field.Name, target)
+	}
+	divesIntoKeys := container.Kind() == reflect.Map && len(rules) > 0 && rules[0] == "keys"
+	if divesIntoKeys {
+		keyRules := rules[1:]
+		rules = nil
+		if end := slices.Index(keyRules, "endkeys"); end >= 0 {
+			keyRules, rules = keyRules[:end], keyRules[end+1:]
+		}
+		if err := m.preflightRules(owner, field, container.Key(), keyRules); err != nil {
+			return err
+		}
+	}
+	return m.preflightRules(owner, field, container.Elem(), rules)
+}
+
+// preflightRule runs one rule on a holder struct whose field of the field's name and the
+// rule's type carries the rule alone, beside the owner's other exported fields, which the
+// rule's cross-field arguments name. Pointers are allocated, so the rule runs instead of
+// stopping at nil.
+func (m *Mutation) preflightRule(owner reflect.Type, field reflect.StructField, target reflect.Type, rule string) error {
+	holderFields := []reflect.StructField{{Name: field.Name, Type: target, Tag: reflect.StructTag("validate:" + strconv.Quote(rule))}}
+	for position := range owner.NumField() {
+		sibling := owner.Field(position)
+		if sibling.IsExported() && sibling.Name != field.Name {
+			holderFields = append(holderFields, reflect.StructField{Name: sibling.Name, Type: sibling.Type})
+		}
+	}
+	holder := reflect.New(reflect.StructOf(holderFields))
+	for value := holder.Elem().Field(0); value.Kind() == reflect.Pointer; value = value.Elem() {
+		value.Set(reflect.New(value.Type().Elem()))
+	}
+	return m.preflight(holder, owner.String()+"."+field.Name)
+}
+
+// preflight validates value (a pointer to a struct) and turns a panic of the validator, or an
+// error that is no validation failure, into the declaration error of what.
+func (m *Mutation) preflight(value reflect.Value, what string) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("the validate tags of %s cannot be parsed: %v", what, recovered)
+		}
+	}()
+	if err := m.validate.Struct(value.Interface()); isUnexpectedValidationError(err) {
+		return fmt.Errorf("the validate tags of %s cannot be used: %w", what, err)
+	}
+	return nil
+}
+
+// isUnexpectedValidationError reports an error of the validator that is neither a validation
+// failure nor a value it does not validate (time.Time and the like: nothing to parse).
+func isUnexpectedValidationError(err error) bool {
+	var failures validator.ValidationErrors
+	var notValidatable *validator.InvalidValidationError
+	return err != nil && !errors.As(err, &failures) && !errors.As(err, &notValidatable)
+}
+
+// validateBody runs the validate tags; a fault the preflight cannot reach (a rule on an
+// interface value, whose type shows only at run time) is an internal error, not a panic.
 func (m *Mutation) validateBody(ctx context.Context, body any) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -372,11 +457,12 @@ func (m *Mutation) checkWrites(ctx context.Context, present map[string]json.RawM
 }
 
 // bodyError maps a decoder failure to a fixed text; the decoder's own message, which may
-// repeat a custom unmarshaler's text, never reaches the client.
-func bodyError(err error) *Error {
+// repeat a custom unmarshaler's text, never reaches the client. A value of the wrong type is
+// named by the path the body walk writes (pathOfTypeError).
+func (m *Mutation) bodyError(raw []byte, err error) *Error {
 	var typeError *json.UnmarshalTypeError
-	if errors.As(err, &typeError) && typeError.Field != "" {
-		return invalidParameter(typeError.Field, "has the wrong type")
+	if errors.As(err, &typeError) {
+		return invalidParameter(pathOfTypeError(raw, m.requestType, m.fields, typeError), "has the wrong type")
 	}
 	return invalidParameter("body", "could not be decoded as the request type")
 }
@@ -397,97 +483,98 @@ func (m *Mutation) validationError(err error) error {
 // jsonPathOf translates the validator's Go namespace ("createPart.Nested.Note",
 // "audited.createPart.Secret", "order.Lines[1].SKU", "settings.Values[a.b]") to the body's
 // JSON path with the field index: the root type is dropped, untagged embedded structs
-// contribute no segment, every other field its JSON name, and index or key suffixes stay. A
-// namespace the type cannot explain (an unbalanced key, a segment that is no field) is
-// reported as "body", never as it is.
+// contribute no segment, every other field its JSON name, and every key or position in
+// brackets consumes one level of a collection or map of the type, so a recursive type
+// (`type Tree map[string]Tree`) is followed only as deep as the namespace goes. A namespace
+// the type cannot explain (an unbalanced key, a segment that is no field, a key where the
+// type has no elements) is reported as "body", never as it is.
 func (m *Mutation) jsonPathOf(structNamespace string) string {
 	rootType := unwrapPointer(m.requestType)
-	remainder, found := strings.CutPrefix(structNamespace, rootType.Name())
+	remainder, found := strings.CutPrefix(structNamespace, rootType.Name()+".")
 	if !found {
 		return "body"
 	}
-	segments, balanced := splitNamespace(strings.TrimPrefix(remainder, "."))
-	if !balanced {
+	segments, parsed := parseNamespace(remainder)
+	if !parsed {
 		return "body"
 	}
-	var path []string
+	path := make([]pathSegment, 0, len(segments))
 	currentType := rootType
 	for _, segment := range segments {
-		goName, suffix := splitIndexSuffix(segment)
+		currentType = unwrapPointer(currentType)
+		if segment.index {
+			if !hasElements(currentType.Kind()) {
+				return "body"
+			}
+			path = append(path, segment)
+			currentType = currentType.Elem()
+			continue
+		}
 		if currentType.Kind() != reflect.Struct {
 			return "body"
 		}
-		field, ok := currentType.FieldByName(goName)
+		field, ok := currentType.FieldByName(segment.text)
 		if !ok {
 			return "body"
 		}
-		if name, named := m.fields.jsonNameOf(currentType, goName); named {
-			path = append(path, name+suffix)
+		if name, named := m.fields.jsonNameOf(currentType, field); named {
+			path = append(path, pathSegment{text: name})
 		} else if !field.Anonymous {
 			return "body"
 		}
-		currentType = elementTypeOf(field.Type)
+		currentType = field.Type
 	}
-	return strings.Join(path, ".")
+	return writePath(path)
 }
 
-// splitNamespace splits a namespace at the dots outside bracket suffixes, so a map key with
-// a dot ("Values[a.b]") stays one segment. A segment is a name, optionally followed by
-// bracket suffixes that close at its end; anything else (an unbalanced key) is not
-// balanced.
-func splitNamespace(namespace string) (segments []string, balanced bool) {
-	var current strings.Builder
-	depth := 0
-	for _, character := range namespace {
-		switch {
-		case character == '[':
-			depth++
-		case character == ']':
-			if depth == 0 {
+// parseNamespace splits a namespace below the root ("Lines[1].SKU", "Values[a.b]",
+// "Grid[0][1]") into field names and the keys or positions in brackets. A key may hold
+// balanced brackets ("Values[c[d]]"); a namespace that does not read back as names, each
+// followed by bracketed keys and a dot or the end, is not parsed. An empty name is kept: it
+// is no field of any type.
+func parseNamespace(namespace string) ([]pathSegment, bool) {
+	var segments []pathSegment
+	for {
+		nameEnd := strings.IndexAny(namespace, ".[")
+		if nameEnd < 0 {
+			nameEnd = len(namespace)
+		}
+		segments = append(segments, pathSegment{text: namespace[:nameEnd]})
+		namespace = namespace[nameEnd:]
+		for strings.HasPrefix(namespace, "[") {
+			keyEnd, closed := closingBracket(namespace)
+			if !closed {
 				return nil, false
 			}
-			depth--
-		case character == '.' && depth == 0:
-			segments = append(segments, current.String())
-			current.Reset()
-			continue
+			segments = append(segments, pathSegment{text: namespace[1:keyEnd], index: true})
+			namespace = namespace[keyEnd+1:]
 		}
-		current.WriteRune(character)
-	}
-	if depth != 0 {
-		return nil, false
-	}
-	segments = append(segments, current.String())
-	for _, segment := range segments {
-		if !isNamespaceSegment(segment) {
+		if namespace == "" {
+			return segments, true
+		}
+		rest, dotted := strings.CutPrefix(namespace, ".")
+		if !dotted {
 			return nil, false
 		}
+		namespace = rest
 	}
-	return segments, true
 }
 
-// isNamespaceSegment accepts "Name" and "Name[...]...[...]" where the brackets end the
-// segment; "Name[a]b" is not a segment.
-func isNamespaceSegment(segment string) bool {
-	name, suffix := splitIndexSuffix(segment)
-	return name != "" && (suffix == "" || strings.HasSuffix(suffix, "]"))
-}
-
-// splitIndexSuffix separates "Lines[1]" into "Lines" and "[1]".
-func splitIndexSuffix(segment string) (name, suffix string) {
-	if open := strings.IndexByte(segment, '['); open >= 0 {
-		return segment[:open], segment[open:]
+// closingBracket returns the position of the bracket that closes the one text opens with.
+func closingBracket(text string) (int, bool) {
+	depth := 0
+	for position := range len(text) {
+		switch text[position] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return position, true
+			}
+		}
 	}
-	return segment, ""
-}
-
-// elementTypeOf unwraps pointers, collections and maps down to the type a path continues in.
-func elementTypeOf(fieldType reflect.Type) reflect.Type {
-	fieldType = unwrapPointer(fieldType)
-	for isCollection(fieldType.Kind()) || fieldType.Kind() == reflect.Map {
-		fieldType = unwrapPointer(fieldType.Elem())
-	}
-	return fieldType
+	return 0, false
 }
 
 func sortedKeys[Value any](values map[string]Value) []string {

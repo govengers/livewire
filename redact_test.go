@@ -14,11 +14,11 @@ import (
 func TestRedactItems(t *testing.T) {
 	fields := partFields()
 	fields = append(fields, query.Field{Name: "cost", Type: query.TypeFloat, SQL: "parts.cost", Read: authorization.IsAdmin()})
-	list := json.RawMessage(`[{"id":"a","name":"bolt","secret":"s","cost":1},{"id":"b","name":"nut"}]`)
+	list := json.RawMessage(`[{"id":"a","name":"bolt","secret":"s","cost":1},{"id":"b","name":"nut","secret":"t"},{"id":"c"}]`)
 
 	redacted, err := livewire.RedactItems(userContext(), fields, list)
 	require.NoError(t, err)
-	require.JSONEq(t, `[{"id":"a","name":"bolt"},{"id":"b","name":"nut"}]`, string(redacted))
+	require.JSONEq(t, `[{"id":"a","name":"bolt"},{"id":"b","name":"nut"},{"id":"c"}]`, string(redacted), "every item is redacted")
 
 	same, err := livewire.RedactItems(adminContext(), fields, list)
 	require.NoError(t, err)

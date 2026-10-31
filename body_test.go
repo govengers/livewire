@@ -8,11 +8,13 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/govengers/auth/authorization"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
+	"github.com/govengers/livewire/query"
 )
 
 func declareBody[Request any](t *testing.T) error {
@@ -55,6 +57,16 @@ func (m *money) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
+// boxed has its own unmarshaler, whose type errors carry offsets into its own value.
+type boxed struct {
+	Inner struct {
+		K string `json:"k"`
+		N int    `json:"n"`
+	}
+}
+
+func (b *boxed) UnmarshalJSON(raw []byte) error { return json.Unmarshal(raw, &b.Inner) }
+
 // lenient has its own unmarshaler and accepts any object.
 type lenient struct {
 	Seen int
@@ -81,6 +93,37 @@ func TestMutationRefusesUnparseableValidateTags(t *testing.T) {
 	type behindOmitempty struct {
 		Count int `json:"count" validate:"omitempty,min=abc"`
 	}
+	type behindRequired struct {
+		Count int `json:"count" validate:"required,min=abc"`
+	}
+	type afterAFailingRule struct {
+		Email string `json:"email" validate:"email,min=abc"`
+	}
+	type behindAPassingAlternative struct {
+		Count int `json:"count" validate:"max=3|min=abc"`
+	}
+	type crossFieldBehindOmitempty struct {
+		Kind  string `json:"kind" validate:"omitempty,required_if=Count abc"`
+		Count int    `json:"count"`
+	}
+	type diveTheZeroValueNeverReaches struct {
+		Name string `json:"name" validate:"required,dive"`
+	}
+	type behindDiveOnElements struct {
+		Counts []*int `json:"counts" validate:"omitempty,dive,required,min=abc"`
+	}
+	type behindDiveOnMapKeys struct {
+		Counts map[string]int `json:"counts" validate:"omitempty,dive,keys,required,max=abc,endkeys,required"`
+	}
+	type behindDiveOnMapValues struct {
+		Counts map[string]int `json:"counts" validate:"omitempty,dive,keys,required,endkeys,required,min=abc"`
+	}
+	type behindDiveOnKeysToTheEnd struct {
+		Counts map[string]int `json:"counts" validate:"omitempty,dive,keys,max=abc"`
+	}
+	type behindAPointer struct {
+		Count **int `json:"count" validate:"omitempty,min=abc"`
+	}
 	type moneyPointer struct {
 		Amount *money `json:"amount"`
 	}
@@ -91,29 +134,75 @@ func TestMutationRefusesUnparseableValidateTags(t *testing.T) {
 		Amounts map[string]money `json:"amounts" validate:"dive"`
 	}
 	for name, declare := range map[string]func() error{
-		"typo":                        func() error { return declareBody[typo](t) },
-		"bad argument":                func() error { return declareBody[badlyTagged](t) },
-		"misplaced dive":              func() error { return declareBody[misplacedDive](t) },
-		"behind a pointer":            func() error { return declareBody[behindPointer](t) },
-		"behind a slice":              func() error { return declareBody[behindSlice](t) },
-		"behind a map":                func() error { return declareBody[behindMap](t) },
-		"own unmarshaler by pointer":  func() error { return declareBody[moneyPointer](t) },
-		"own unmarshaler in a slice":  func() error { return declareBody[moneySlice](t) },
-		"own unmarshaler in a map":    func() error { return declareBody[moneyMap](t) },
-		"own unmarshaler at the root": func() error { return declareBody[money](t) },
+		"typo":                          func() error { return declareBody[typo](t) },
+		"bad argument":                  func() error { return declareBody[badlyTagged](t) },
+		"misplaced dive":                func() error { return declareBody[misplacedDive](t) },
+		"behind a pointer":              func() error { return declareBody[behindPointer](t) },
+		"behind a slice":                func() error { return declareBody[behindSlice](t) },
+		"behind a map":                  func() error { return declareBody[behindMap](t) },
+		"own unmarshaler by pointer":    func() error { return declareBody[moneyPointer](t) },
+		"own unmarshaler in a slice":    func() error { return declareBody[moneySlice](t) },
+		"own unmarshaler in a map":      func() error { return declareBody[moneyMap](t) },
+		"own unmarshaler at the root":   func() error { return declareBody[money](t) },
+		"behind omitempty":              func() error { return declareBody[behindOmitempty](t) },
+		"behind required":               func() error { return declareBody[behindRequired](t) },
+		"after a failing rule":          func() error { return declareBody[afterAFailingRule](t) },
+		"behind a passing alternative":  func() error { return declareBody[behindAPassingAlternative](t) },
+		"cross-field behind omitempty":  func() error { return declareBody[crossFieldBehindOmitempty](t) },
+		"dive the zero never reaches":   func() error { return declareBody[diveTheZeroValueNeverReaches](t) },
+		"behind a dive on elements":     func() error { return declareBody[behindDiveOnElements](t) },
+		"behind a dive on map keys":     func() error { return declareBody[behindDiveOnMapKeys](t) },
+		"behind a dive on map values":   func() error { return declareBody[behindDiveOnMapValues](t) },
+		"keys to the end of the tag":    func() error { return declareBody[behindDiveOnKeysToTheEnd](t) },
+		"behind a pointer to a pointer": func() error { return declareBody[behindAPointer](t) },
 	} {
 		require.ErrorContains(t, declare(), "validate tags", name)
 	}
+}
 
-	mutation := newBody[behindOmitempty](t)
-	_, err := mutation.DecodeBody(userContext(), []byte(`{"count":3}`))
-	require.ErrorContains(t, err, "failed at run time", "a fault the preflight cannot see is an error, not a panic")
+func TestMutationAcceptsUsableValidateTags(t *testing.T) {
+	type usable struct {
+		Kind    string            `json:"kind" validate:"omitempty,oneof=a b"`
+		Count   *int              `json:"count" validate:"required_if=Kind a,omitempty,min=1|eq=0"`
+		Other   int               `json:"other" validate:"omitempty,eqfield=Kind,gtfield=Count"`
+		ByName  map[string]*int   `json:"byName" validate:"omitempty,dive,keys,min=1,max=8,endkeys,required,min=2"`
+		Lines   []partLine        `json:"lines" validate:"omitempty,unique=SKU,dive"`
+		Grid    [][]int           `json:"grid" validate:"dive,dive,min=0"`
+		Created time.Time         `json:"created" validate:"omitempty,lt"`
+		Labels  map[string]string `json:"labels" validate:"dive,keys,alphanum,endkeys"`
+	}
+	require.NoError(t, declareBody[usable](t))
+}
+
+func TestMutationAnswersARunTimeValidatorFaultAsInternal(t *testing.T) {
+	type behindAnInterface struct {
+		Value any `json:"value" validate:"omitempty,min=abc"`
+	}
+	mutation := newBody[behindAnInterface](t)
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"value":3}`))
+	require.ErrorContains(t, err, "failed at run time", "a rule on an interface value shows its fault only at run time: an error, not a panic")
 	requireError(t, err, http.StatusInternalServerError, livewire.CodeInternal, "")
 }
 
 type tree map[string]tree
 
 type chain []chain
+
+// withinDeadline runs work and fails the test when it has not returned after five seconds,
+// so an endless loop fails the test instead of hanging the suite. work must not call require.
+func withinDeadline(t *testing.T, work func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		work()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not return within five seconds")
+	}
+}
 
 func TestMutationConstructionEndsOnRecursiveCollections(t *testing.T) {
 	type forest struct {
@@ -124,6 +213,56 @@ func TestMutationConstructionEndsOnRecursiveCollections(t *testing.T) {
 	mutation := newBody[forest](t)
 	_, err := mutation.DecodeBody(userContext(), []byte(`{"tree":{"a":{"b":{}}},"chain":[[],[[]]]}`))
 	require.NoError(t, err)
+}
+
+func TestMutationValidationPathsEndOnRecursiveCollections(t *testing.T) {
+	type grove struct {
+		Tree  tree  `json:"tree" validate:"required,dive,min=1"`
+		Chain chain `json:"chain" validate:"required,dive,min=1"`
+	}
+	mutation := newBody[grove](t)
+	var omitted, empty error
+	withinDeadline(t, func() {
+		_, omitted = mutation.DecodeBody(userContext(), []byte(`{}`))
+		_, empty = mutation.DecodeBody(userContext(), []byte(`{"tree":{"a":{}},"chain":[[[]],[]]}`))
+	})
+	fields := requireError(t, omitted, http.StatusBadRequest, livewire.CodeInvalidRequest, "tree")
+	require.Equal(t, map[string]string{"tree": "required", "chain": "required"}, fields, "an omitted recursive collection names its field")
+	fields = requireError(t, empty, http.StatusBadRequest, livewire.CodeInvalidRequest, "tree[a]")
+	require.Equal(t, map[string]string{"tree[a]": "min", "chain[1]": "min"}, fields, "each key consumes one level of the recursive type")
+}
+
+type pointerLoop *pointerLoop
+
+func TestDeclarationsRefusePointerLoops(t *testing.T) {
+	type looped struct {
+		Loop pointerLoop `json:"loop"`
+	}
+	declarations := map[string]livewire.Declaration{}
+	withinDeadline(t, func() {
+		declarations["resource item"] = livewire.NewResource("loops", "/loops", &livewire.ResourceOptions[pointerLoop]{
+			Read:   authorization.IsUser(),
+			Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "loops.id", Filter: true}},
+			List:   func(context.Context, *query.ListQuery) ([]pointerLoop, int, error) { return nil, 0, nil },
+		})
+		declarations["list item field"] = livewire.NewList("loopList", "/loop-list", &livewire.ListOptions[looped, livewire.NoParameters]{
+			Read: authorization.IsUser(),
+			Load: func(context.Context, *livewire.NoParameters) ([]looped, error) { return nil, nil },
+		})
+		declarations["object item field"] = livewire.NewObject("loopObject", "/loop-object", &livewire.ObjectOptions[looped, livewire.NoParameters]{
+			Read: authorization.IsUser(),
+			Load: func(context.Context, *livewire.NoParameters) (*looped, error) { return &looped{}, nil },
+		})
+		declarations["mutation field"] = livewire.NewMutation("loopMutation", http.MethodPost, "/loop-mutation", &livewire.MutationOptions[livewire.NoParameters, looped, livewire.NoContent]{
+			Check: authorization.IsUser(),
+			Handle: func(context.Context, *livewire.NoParameters, *looped) (*livewire.NoContent, error) {
+				return &livewire.NoContent{}, nil
+			},
+		})
+	})
+	for name, declaration := range declarations {
+		require.ErrorContains(t, addError(t, declaration), "points to itself", name)
+	}
 }
 
 func TestMutationValidationPathsWithPunctuationAndGenerics(t *testing.T) {
@@ -138,7 +277,7 @@ func TestMutationValidationPathsWithPunctuationAndGenerics(t *testing.T) {
 	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "values[a.b]")
 	require.Equal(t, map[string]string{"values[a.b]": "required", "values[c[d]]": "required"}, fields)
 
-	for _, key := range []string{"a]b.c", "a[", "a]"} {
+	for _, key := range []string{"a]b.c", "a[", "a]", "a].b[", "a]..x["} {
 		_, err = keyedMutation.DecodeBody(userContext(), []byte(`{"values":{"`+key+`":""}}`))
 		fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
 		require.Equal(t, map[string]string{"body": "required"}, fields, "an unbalanced key %q names the body, never a Go name", key)
@@ -153,16 +292,83 @@ func TestMutationValidationPathsWithPunctuationAndGenerics(t *testing.T) {
 	_, err = namedMutation.DecodeBody(userContext(), []byte(`{"nested":{"sku":"a","quantity":0}}`))
 	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "nested.quantity")
 	require.Equal(t, map[string]string{"nested.quantity": "min"}, fields, "a tagged embedding is a segment")
+
+	type unmarshaled struct {
+		Name     string `json:"name"`
+		Internal string `json:"-" validate:"required"`
+	}
+	unmarshaledMutation := newBody[unmarshaled](t)
+	_, err = unmarshaledMutation.DecodeBody(userContext(), []byte(`{"name":"a"}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
+	require.Equal(t, map[string]string{"body": "required"}, fields, "a field the body cannot carry names the body, never its Go name")
+}
+
+type branch struct {
+	Note string            `json:"note" validate:"required"`
+	Sub  map[string]branch `json:"sub" validate:"dive"`
+}
+
+func TestMutationValidationPathsThroughARecursiveMap(t *testing.T) {
+	mutation := newBody[branch](t)
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"note":"n","sub":{"k":{"note":"m","sub":{"j":{}}}}}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "sub[k].sub[j].note")
+	require.Equal(t, map[string]string{"sub[k].sub[j].note": "required"}, fields)
+
+	for _, key := range []string{"x]y.Sub[z", "k].Note[x", "k].Nope[x"} {
+		_, err = mutation.DecodeBody(userContext(), []byte(`{"note":"n","sub":{"`+key+`":{}}}`))
+		fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
+		require.Equal(t, map[string]string{"body": "required"}, fields, "a key %q that forges a path the type cannot explain names the body", key)
+	}
+}
+
+type labelled struct {
+	Name string `json:"label" validate:"max=1"`
+}
+
+// relabelled promotes labelled.Name under "label" beside its own Name under "name".
+type relabelled struct {
+	labelled
+	Name string `json:"name" validate:"required"`
+}
+
+func TestMutationValidationPathsTellFieldsWithOneGoNameApart(t *testing.T) {
+	mutation := newBody[relabelled](t)
+	for range 20 {
+		_, err := mutation.DecodeBody(userContext(), []byte(`{"label":"long"}`))
+		fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "name")
+		require.Equal(t, map[string]string{"name": "required", "label": "max"}, fields)
+	}
+}
+
+func TestMutationPathsOfABracketedFieldName(t *testing.T) {
+	type bracketed struct {
+		Nested struct {
+			Name string `json:"[name]" validate:"max=1"`
+		} `json:"nested"`
+	}
+	mutation := newBody[bracketed](t)
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"nested":{"[name]":"long"}}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "nested.[name]")
+	require.Equal(t, "max", fields["nested.[name]"])
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"nested":{"[name]":"a","[name]":"b"}}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "nested.[name]")
+	require.Equal(t, "duplicate member", fields["nested.[name]"], "a field segment is written as a field, whatever its name looks like")
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"nested":{"[name]":1}}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "nested.[name]")
+	require.Equal(t, "has the wrong type", fields["nested.[name]"])
 }
 
 type withMaps struct {
-	Name   string          `json:"name"`
-	Nested nested          `json:"nested"`
-	ByID   map[int]*nested `json:"byId" validate:"dive"`
-	Any    any             `json:"any"`
-	Raw    json.RawMessage `json:"raw"`
-	Loose  *lenient        `json:"loose"`
-	Number json.Number     `json:"number"`
+	Name   string            `json:"name"`
+	Nested nested            `json:"nested"`
+	ByID   map[int]*nested   `json:"byId" validate:"dive"`
+	ByName map[string]nested `json:"byName"`
+	Lines  []nested          `json:"lines"`
+	Any    any               `json:"any"`
+	Raw    json.RawMessage   `json:"raw"`
+	Loose  *lenient          `json:"loose"`
+	Cents  *boxed            `json:"cents"`
+	Number json.Number       `json:"number"`
 }
 
 type nested struct {
@@ -186,6 +392,15 @@ func TestMutationBodyWalkRefusalsByPath(t *testing.T) {
 		{name: "duplicate map key", raw: `{"byId":{"7":{},"7":{}}}`, field: "byId[7]", text: "duplicate member"},
 		{name: "duplicate inside an any value", raw: `{"any":{"secret":1,"secret":2}}`, field: "any.secret", text: "duplicate member"},
 		{name: "duplicate inside a raw value", raw: `{"raw":[{"x":1,"x":2}]}`, field: "raw[0].x", text: "duplicate member"},
+		{name: "duplicate inside the second raw element", raw: `{"raw":[{"x":1},{"x":1,"x":2}]}`, field: "raw[1].x", text: "duplicate member"},
+		{name: "wrong type of a map member", raw: `{"byName":{"a.b":{"note":1}}}`, field: "byName[a.b].note", text: "has the wrong type"},
+		{name: "unknown field of the same map member", raw: `{"byName":{"a.b":{"nope":1}}}`, field: "byName[a.b].nope", text: "unknown field"},
+		{name: "wrong type of an array element", raw: `{"lines":[{},{"note":1}]}`, field: "lines[1].note", text: "has the wrong type"},
+		{name: "unknown field of the same array element", raw: `{"lines":[{},{"nope":1}]}`, field: "lines[1].nope", text: "unknown field"},
+		{name: "wrong type of a whole value", raw: `{"name":"a","nested":[1]}`, field: "nested", text: "has the wrong type"},
+		{name: "map key of the wrong type names the entry", raw: `{"byId":{"x":{}}}`, field: "byId[x]", text: "has the wrong type"},
+		{name: "wrong type of the first of two elements", raw: `{"lines":[{"note":1},{}]}`, field: "lines[0].note", text: "has the wrong type"},
+		{name: "wrong type inside an own unmarshaler names the body", raw: `{"name":"abcdefghijklmnopqrst","cents":{"k":"v","n":"x"}}`, field: "body", text: "has the wrong type"},
 		{name: "duplicate inside a custom-unmarshaled value", raw: `{"loose":{"k":{"a":1,"a":2}}}`, field: "loose.k.a", text: "duplicate member"},
 		{name: "trailing garbage", raw: `{"name":"a"} x`, field: "body", text: "must be valid JSON"},
 	}
@@ -226,7 +441,10 @@ func TestMutationDeepBodyAllocatesInProportion(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	require.NoError(t, err)
 	allocated := after.TotalAlloc - before.TotalAlloc
-	require.Less(t, allocated, uint64(len(body))*40, "the walk and the decode together allocate a small multiple of the body (%d bytes for %d)", allocated, len(body))
+	// About 38x (40x under race), most of it encoding/json's own state and the segment stack;
+	// a path written eagerly on every push allocates in proportion to the depth squared,
+	// over 1000x here.
+	require.Less(t, allocated, uint64(len(body))*48, "the walk and the decode together allocate a small multiple of the body (%d bytes for %d)", allocated, len(body))
 
 	unknown := strings.Repeat(`{"child":`, depth) + `{"nope":1}` + strings.Repeat(`}`, depth)
 	_, err = mutation.DecodeBody(userContext(), []byte(unknown))

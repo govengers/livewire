@@ -170,6 +170,7 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 		}
 	}
 	resource.compileParameters(reflect.TypeFor[NoParameters]())
+	resource.failWith(refusePointerLoops(resource.itemType))
 	resource.failWith(resource.validate(options.MaximumLimit, options.DistinctMaximum))
 	resource.deriveNullable()
 	return resource
