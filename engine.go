@@ -28,8 +28,9 @@ import (
 // engine's outcomes go to the registry's Observer (D49).
 //
 // The limits (D10) default when zero: SubscriptionsPerSocket 64, InFlightPerSocket 16,
-// PresencesPerSocket 64 (records one socket may join at once), FiltersPerSocket 64 (inline
-// filters one socket may register, D13), QueuedBytesPerSocket 8 MiB, FrameBytes 64 KiB,
+// PresencesPerSocket 64 (records one socket may join at once), FiltersPerSocket 64 (the
+// distinct inline filters the live subscriptions of one socket hold, D13; it bounds no
+// filter rows beyond that socket's live ones), QueuedBytesPerSocket 8 MiB, FrameBytes 64 KiB,
 // QueryConcurrency 32 (D52); SocketsPerOwner 0 is unlimited. The intervals default when
 // zero: RevalidateInterval 60 s (D6, the cache of a socket's identity for re-runs and the
 // tick that re-validates every socket), SafetyTickInterval 30 s (the re-run of
@@ -238,13 +239,20 @@ func (e *Engine) Run(ctx context.Context) error {
 	defer e.lifetimes.Done()
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
-	var feed sync.WaitGroup
+	var work sync.WaitGroup
+	work.Go(func() { // Close cancels Run's work at once, a tick's store call included
+		select {
+		case <-e.done:
+			stop()
+		case <-ctx.Done():
+		}
+	})
 	if e.options.ChangeFeed != nil {
-		feed.Go(func() { e.consumeFeed(ctx) })
+		work.Go(func() { e.consumeFeed(ctx) })
 	}
 	e.tick(ctx)
 	stop()
-	feed.Wait()
+	work.Wait()
 	return nil
 }
 

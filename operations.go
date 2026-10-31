@@ -163,6 +163,8 @@ type presenceRecord struct {
 func (s *socket) join(ctx context.Context, frame *RequestFrame) {
 	unit := startUnit(OutcomeRequest, OperationJoin, frame.Target)
 	var resolved *resolvedRead
+	s.presenceMutex.Lock() // before the slot: a join waiting for another holds none
+	defer s.presenceMutex.Unlock()
 	err := s.engine.inSlot(ctx, func() error {
 		var err error
 		if resolved, err = s.engine.resolve(ctx, ReadRequest{Target: frame.Target, Kind: ReadPresence, Source: MapSource(frame.Parameters)}); err != nil {
@@ -182,11 +184,9 @@ func (s *socket) join(ctx context.Context, frame *RequestFrame) {
 	s.respond(frame.ID, http.StatusOK, nil)
 }
 
-// joinRecord counts and stores the join under the socket's presenceMutex, so a leave of the
+// joinRecord counts and stores the join; the caller holds presenceMutex, so a leave of the
 // same record waits until the store answered and the accounting matches it.
 func (s *socket) joinRecord(ctx context.Context, record presenceRecord, state json.RawMessage) error {
-	s.presenceMutex.Lock()
-	defer s.presenceMutex.Unlock()
 	fresh, err := s.reservePresence(record)
 	if err != nil {
 		return err
@@ -239,6 +239,24 @@ func (s *socket) forgetPresence(record presenceRecord) {
 // socket did not join is 404.
 func (s *socket) leave(ctx context.Context, frame *RequestFrame) {
 	unit := startUnit(OutcomeRequest, OperationLeave, frame.Target)
+	s.presenceMutex.Lock() // before the slot, like join
+	defer s.presenceMutex.Unlock()
+	resolved, err := s.leaveJoined(ctx, frame)
+	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
+	if err != nil {
+		s.respondError(frame.ID, err)
+		return
+	}
+	s.respond(frame.ID, http.StatusOK, nil)
+}
+
+// leaveJoined answers 404 before anything is decoded or resolved when the socket joined no
+// record of the declaration under the key; otherwise it resolves the tenant from the
+// declaration's parameters to leave exactly that record. The caller holds presenceMutex.
+func (s *socket) leaveJoined(ctx context.Context, frame *RequestFrame) (*resolvedRead, error) {
+	if !s.joinedAny(frame.Target, frame.Parameters[ParameterPresenceKey]) {
+		return nil, NotFound()
+	}
 	var resolved *resolvedRead
 	err := s.engine.inSlot(ctx, func() error {
 		request := ReadRequest{Target: frame.Target, Kind: ReadPresence, Source: MapSource(frame.Parameters)}
@@ -250,19 +268,24 @@ func (s *socket) leave(ctx context.Context, frame *RequestFrame) {
 			return err
 		}
 		record := presenceRecord{tenant: resolved.tenant, target: resolved.request.Target, key: resolved.presenceKey}
-		s.presenceMutex.Lock()
-		defer s.presenceMutex.Unlock()
 		if !s.hasJoined(record) {
 			return NotFound()
 		}
 		return s.leaveRecord(WithTenant(ctx, record.tenant), record)
 	})
-	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
-	if err != nil {
-		s.respondError(frame.ID, err)
-		return
+	return resolved, err
+}
+
+// joinedAny reports whether the socket joined a record of target under key, in any tenant.
+func (s *socket) joinedAny(target, key string) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	for record := range s.presences {
+		if record.target == target && record.key == key {
+			return true
+		}
 	}
-	s.respond(frame.ID, http.StatusOK, nil)
+	return false
 }
 
 func (s *socket) hasJoined(record presenceRecord) bool {
@@ -309,7 +332,6 @@ func (s *socket) leavePresences() {
 	}
 }
 
-// hasPresences reports whether the socket joined a record.
 func (s *socket) hasPresences() bool {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()

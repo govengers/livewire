@@ -214,7 +214,6 @@ func sourceOrEmpty(source ParameterSource) ParameterSource {
 	return source
 }
 
-// maximumPresenceKeyBytes bounds the key that names a presence record.
 const maximumPresenceKeyBytes = 256
 
 func presenceKeyFrom(source ParameterSource) (string, error) {

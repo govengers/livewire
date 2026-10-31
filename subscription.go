@@ -51,7 +51,10 @@ type subscription struct {
 	backingOff    bool        // a retry is pending: dirty marks wait for it
 	stopRetry     func() bool // the pending retry's timer
 	recordDue     bool        // a presence re-run runs the record read again
-	filterHash    string      // the inline filter this subscription counts against FiltersPerSocket
+	// recordIdentity is the identity generation (its pointer) the last record read ran
+	// under; a presence read under another one runs the record read first.
+	recordIdentity *auth.Identity
+	filterHash     string // the inline filter this subscription counts against FiltersPerSocket
 }
 
 // rerunMarks are what a re-run owes beyond reading again: a snapshot push, a record read.
@@ -146,7 +149,7 @@ func (i *installation) firstFrames(ctx context.Context) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	push, err := i.subscription.firstPush(result)
+	push, err := i.subscription.firstPush(result, auth.IdentityFrom(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -276,8 +279,15 @@ func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead, liv
 		return "", err
 	}
 	liveSubscription.mutex.Lock()
-	liveSubscription.filterHash = hash // released by end, whatever happens next
+	ended := liveSubscription.ended
+	if !ended {
+		liveSubscription.filterHash = hash // released by end, whatever happens next
+	}
 	liveSubscription.mutex.Unlock()
+	if ended {
+		s.releaseFilter(hash) // ended during its first load: its end released nothing
+		return "", NotFound()
+	}
 	var stored *StoredFilter
 	err = recovering(func() error {
 		var saveError error
@@ -339,16 +349,16 @@ func (s *socket) removeSubscription(id string) *subscription {
 	return liveSubscription
 }
 
-// firstPush takes the first read as delivered and encodes its push: a list's snapshot or an
-// object's replace.
-func (s *subscription) firstPush(result *readResult) ([]byte, error) {
+// firstPush takes the first read, run under identity, as delivered and encodes its push: a
+// list's snapshot or an object's replace.
+func (s *subscription) firstPush(result *readResult, identity *auth.Identity) ([]byte, error) {
 	first, err := s.viewOf(result)
 	if err != nil {
 		return nil, err
 	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	s.current, s.delivered, s.sequence = first, first, 1
+	s.current, s.delivered, s.sequence, s.recordIdentity = first, first, 1, identity
 	kind := PushReplace
 	if s.list {
 		kind = PushSnapshot
@@ -443,9 +453,16 @@ func (s *subscription) run() {
 // refusal (4xx, a changed tenant included) ends the subscription with an error push, a
 // failure (5xx, a panicking loader included) is retried with a backoff (section 5).
 func (s *subscription) rerun() {
+	s.rerunWith(s.takeMarks())
+}
+
+// rerunWith is one re-run owing marks. Whatever the marks say, a presence read under an
+// identity generation its last record read did not run under runs the record read first: an
+// adopt between the marks and the identity, or a fresh identity the expired cache fetched,
+// is no reason to skip it.
+func (s *subscription) rerunWith(marks rerunMarks) {
 	unit := startUnit(OutcomeRerun, "", s.request.Target)
 	unit.subscription = s.id
-	marks := s.takeMarks()
 	ctx := s.ctx
 	identity, err := s.socket.rerunIdentity(ctx)
 	if errors.Is(err, errIdentityGone) {
@@ -455,10 +472,14 @@ func (s *subscription) rerun() {
 	var next *view
 	if err == nil {
 		ctx = auth.WithIdentity(ctx, identity)
+		marks.record = marks.record || s.recordReadIdentity() != identity
 		resolved, next, err = s.read(ctx, marks.record)
 	}
 	if s.ctx.Err() != nil {
 		return
+	}
+	if err == nil && marks.record {
+		s.recordReadUnder(identity)
 	}
 	switch {
 	case err == nil:
@@ -496,6 +517,18 @@ func (s *subscription) read(ctx context.Context, recordDue bool) (*resolvedRead,
 		return err
 	})
 	return resolved, next, err
+}
+
+func (s *subscription) recordReadIdentity() *auth.Identity {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.recordIdentity
+}
+
+func (s *subscription) recordReadUnder(identity *auth.Identity) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.recordIdentity = identity
 }
 
 func (s *subscription) takeMarks() rerunMarks {
@@ -572,7 +605,9 @@ func (s *subscription) pushContent(current, delivered *view) (PushKind, json.Raw
 	return PushListChange, payload
 }
 
-// endWithError ends the subscription with an error push carrying the refusal's body.
+// endWithError ends the subscription with an error push carrying the refusal's body. It
+// marks the subscription ended and takes the last sequence number in one step, so no push
+// can follow the error.
 func (s *subscription) endWithError(err error) {
 	_, body := ResponseFor(err)
 	payload, _ := json.Marshal(body) //nolint:errchkjson // an ErrorBody always marshals
@@ -583,9 +618,10 @@ func (s *subscription) endWithError(err error) {
 	}
 	s.sequence++
 	encoded, encodeError := encodePush(s.id, s.sequence, PushError, payload)
+	cleanUp := s.markEndedLocked()
 	s.mutex.Unlock()
 	s.socket.removeSubscription(s.id)
-	s.end()
+	cleanUp()
 	if encodeError == nil {
 		s.socket.enqueue(encoded)
 	}
@@ -625,9 +661,17 @@ func (s *subscription) retryNow() {
 // its inline filter is released.
 func (s *subscription) end() {
 	s.mutex.Lock()
+	cleanUp := s.markEndedLocked()
+	s.mutex.Unlock()
+	cleanUp()
+}
+
+// markEndedLocked marks the subscription ended and stops its retry; s.mutex is held. The
+// work that takes other locks (cancel, unindex, the filter release) is returned, to run
+// after the unlock; for a subscription that ended before it is nothing.
+func (s *subscription) markEndedLocked() func() {
 	if s.ended {
-		s.mutex.Unlock()
-		return
+		return func() {}
 	}
 	s.ended = true
 	if s.stopRetry != nil {
@@ -635,12 +679,14 @@ func (s *subscription) end() {
 		s.stopRetry = nil
 	}
 	filterHash := s.filterHash
-	s.mutex.Unlock()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	s.socket.engine.unindex(s)
-	if filterHash != "" {
-		s.socket.releaseFilter(filterHash)
+	s.filterHash = ""
+	return func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.socket.engine.unindex(s)
+		if filterHash != "" {
+			s.socket.releaseFilter(filterHash)
+		}
 	}
 }

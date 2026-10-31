@@ -444,7 +444,8 @@ func (s *socket) freshIdentity(ctx context.Context) (*auth.Identity, error) {
 
 // adopt takes the identity of Identify call sequence unless a later call's was adopted
 // already, and returns the identity the socket acts as. A changed identity marks every
-// subscription dirty and moves the socket's owner count.
+// subscription dirty and moves the socket's owner count; an equal one keeps the adopted
+// pointer, so a pointer names one generation of the identity.
 func (s *socket) adopt(identity *auth.Identity, sequence uint64) *auth.Identity {
 	s.mutex.Lock()
 	if sequence < s.identityAdopted {
@@ -453,7 +454,11 @@ func (s *socket) adopt(identity *auth.Identity, sequence uint64) *auth.Identity 
 		return current
 	}
 	changed := !reflect.DeepEqual(s.identity, identity)
-	s.identity, s.identifiedAt, s.identityAdopted = identity, time.Now(), sequence
+	if changed {
+		s.identity = identity // an unchanged identity keeps its pointer: the pointer is its generation
+	}
+	s.identifiedAt, s.identityAdopted = time.Now(), sequence
+	current := s.identity
 	var subscriptions []*subscription
 	if changed {
 		for _, liveSubscription := range s.subscriptions {
@@ -467,7 +472,7 @@ func (s *socket) adopt(identity *auth.Identity, sequence uint64) *auth.Identity 
 	for _, liveSubscription := range subscriptions {
 		liveSubscription.markIdentityChanged()
 	}
-	return identity
+	return current
 }
 
 func (s *socket) lastIdentity() *auth.Identity {
