@@ -137,7 +137,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets()))
 	return registry
 }
 
@@ -179,6 +179,27 @@ func (b *testbed) gadgets() *livewire.Resource {
 			return values, nil
 		},
 	})
+}
+
+// myGadgets lists the gadgets of the caller's group, partitioned by it: a partition that
+// follows the identity (its Data "group").
+func (b *testbed) myGadgets() *livewire.List {
+	return livewire.NewList("myGadgets", "/my-gadgets", &livewire.ListOptions[gadget, livewire.NoParameters]{
+		Tables:    []string{"gadgets"},
+		Read:      authorization.HasRole(roleReader),
+		Partition: func(ctx context.Context, _ any) string { return groupOf(ctx) },
+		Load: func(ctx context.Context, _ *livewire.NoParameters) ([]gadget, error) {
+			if err := b.world.load(ctx); err != nil {
+				return nil, err
+			}
+			return b.world.sorted(groupOf(ctx)), nil
+		},
+	})
+}
+
+func groupOf(ctx context.Context) string {
+	group, _ := auth.IdentityFrom(ctx).Data["group"].(string)
+	return group
 }
 
 // groupList is the typed-parameters list of one group, partitioned by it (D25).
@@ -549,4 +570,22 @@ func errorOf(t *testing.T, payload json.RawMessage) livewire.ErrorBody {
 	var body livewire.ErrorBody
 	require.NoError(t, json.Unmarshal(payload, &body))
 	return body
+}
+
+func admin(subject string) *auth.Identity {
+	return person(subject, roleReader, roleWriter, auth.RoleAdmin)
+}
+
+func outcomeWith(bed *testbed, kind livewire.OutcomeKind, match func(livewire.Outcome) bool) bool {
+	for _, outcome := range bed.outcomes.of(kind) {
+		if match(outcome) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *client) batch(calls []livewire.BatchCall, key string) livewire.ResponseFrame {
+	c.t.Helper()
+	return c.response(c.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: mustJSON(calls), IdempotencyKey: key}))
 }

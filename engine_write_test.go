@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/govengers/auth"
+	"github.com/govengers/auth/authorization"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
@@ -232,4 +234,116 @@ func requireStatus(t *testing.T, err error, status int) {
 	require.Error(t, err)
 	got, _ := livewire.ResponseFor(err)
 	require.Equal(t, status, got, "%v", err)
+}
+
+func TestMutationResponsesPassTheResourceGuards(t *testing.T) {
+	bed := newTestbed(t, nil)
+	bed.identities.set(admin("root"))
+	user, root := bed.dial("ada"), bed.dial("root")
+
+	require.NotContains(t, string(user.call("revealGadget", nil, nil, "").Payload), "s3cret", "a guarded field leaves no mutation response (D39)")
+	require.Contains(t, string(root.call("revealGadget", nil, nil, firstKey).Payload), "s3cret")
+	batch := []livewire.BatchCall{{Target: "revealGadget"}}
+	refusedBatch := user.response(user.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: mustJSON(batch)}))
+	require.True(t, refusedBatch.OK)
+	require.NotContains(t, string(refusedBatch.Payload), "s3cret", "every call of a batch passes its guards")
+	rootBatch := root.response(root.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: mustJSON(batch), IdempotencyKey: secondKey}))
+	require.Contains(t, string(rootBatch.Payload), "s3cret")
+
+	bed.identities.set(person("root", roleReader, roleWriter))
+	replayed := root.call("revealGadget", nil, nil, firstKey)
+	require.True(t, replayed.OK)
+	require.NotContains(t, string(replayed.Payload), "s3cret", "a replay passes the guards of the identity that asks now")
+	replayedBatch := root.response(root.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: mustJSON(batch), IdempotencyKey: secondKey}))
+	require.True(t, replayedBatch.OK)
+	require.NotContains(t, string(replayedBatch.Payload), "s3cret")
+}
+
+func TestAnonymousCallsSkipIdempotency(t *testing.T) {
+	bed := newTestbed(t, nil)
+	for want := 1; want <= 2; want++ {
+		_, payload, err := bed.engine.Call(t.Context(), livewire.CallRequest{Target: "anonymousGadget", IdempotencyKey: firstKey})
+		require.NoError(t, err)
+		require.JSONEq(t, `{"count":`+strconv.Itoa(want)+`}`, string(payload), "an anonymous caller has no owner to replay for (D16)")
+	}
+}
+
+func TestReplayRollsBackItsTransaction(t *testing.T) {
+	bed := newTestbed(t, nil)
+	socket := bed.dial("ada")
+	require.True(t, socket.call("createGadget", nil, map[string]string{"name": "Anchor"}, firstKey).OK)
+	rollbacks := bed.transactor.rollbacks.Load()
+	require.True(t, socket.call("createGadget", nil, map[string]string{"name": "Anchor"}, firstKey).OK)
+	require.Equal(t, rollbacks+1, bed.transactor.rollbacks.Load(), "a replay writes nothing and rolls back")
+}
+
+func TestBatchNameIsReservedAndKeysDoNotCross(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.ErrorContains(t, registry.Add(livewire.NewMutation("batch", http.MethodPost, "/batch", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})), "reserved")
+
+	bed := newTestbed(t, nil)
+	socket := bed.dial("ada")
+	batch := mustJSON([]livewire.BatchCall{{Target: "createGadget", Body: mustJSON(map[string]string{"name": "Anchor"})}})
+	require.True(t, socket.response(socket.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: batch, IdempotencyKey: firstKey})).OK)
+	require.Equal(t, http.StatusConflict, socket.call("createGadget", nil, map[string]string{"name": "Bolt"}, firstKey).Status, "a batch's key is no call's")
+	require.True(t, socket.call("createGadget", nil, map[string]string{"name": "Bolt"}, secondKey).OK)
+	crossed := socket.response(socket.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: batch, IdempotencyKey: secondKey}))
+	require.Equal(t, http.StatusConflict, crossed.Status, "a call's key is no batch's")
+}
+
+func TestBatchBodyMustEndAfterTheArray(t *testing.T) {
+	bed := newTestbed(t, nil)
+	ctx := auth.WithIdentity(t.Context(), person("ada", roleReader, roleWriter))
+	for _, body := range []string{`[{"target":"failGadget"}]]`, `[{"target":"failGadget"}] {}`, `[{"target":"failGadget"}] []`} {
+		_, err := bed.engine.Batch(ctx, livewire.BatchRequest{Body: json.RawMessage(body)})
+		requireStatus(t, err, http.StatusBadRequest) // the handler never runs: it would answer 409
+	}
+}
+
+func TestBatchReplayIsBoundToItsCalls(t *testing.T) {
+	bed := newTestbed(t, nil)
+	bed.identities.set(admin("root"))
+	root := bed.dial("root")
+	recorded := root.batch([]livewire.BatchCall{{Target: "revealGadget"}}, firstKey)
+	require.Contains(t, string(recorded.Payload), "s3cret")
+
+	bed.identities.set(person("root", roleReader, roleWriter))
+	substituted := root.batch([]livewire.BatchCall{{Target: "anonymousGadget"}}, firstKey)
+	require.Equal(t, http.StatusConflict, substituted.Status, "a key sent again with other targets is no replay")
+	require.NotContains(t, string(substituted.Payload), "s3cret")
+	counted := root.batch([]livewire.BatchCall{{Target: "revealGadget"}, {Target: "revealGadget"}}, firstKey)
+	require.Equal(t, http.StatusConflict, counted.Status, "another number of calls is a conflict, not a server failure")
+	replayed := root.batch([]livewire.BatchCall{{Target: "revealGadget"}}, firstKey)
+	require.True(t, replayed.OK)
+	require.NotContains(t, string(replayed.Payload), "s3cret", "the recorded calls' guards under the identity of the replay")
+}
+
+func TestEffectTargetGuardsApplyOnTheirOwn(t *testing.T) {
+	bed := newTestbed(t, nil)
+	socket := bed.dial("ada")
+	revealed := socket.call("revealGadget", nil, nil, "")
+	require.True(t, revealed.OK)
+	require.NotContains(t, string(revealed.Payload), "s3cret", "an Effect target declaring the field unguarded cancels nothing")
+	grouped := socket.call("groupReveal", nil, nil, "")
+	require.True(t, grouped.OK)
+	require.NotContains(t, string(grouped.Payload), "s3cret", "an Effect-only mutation passes its list's guards")
+	_, payload, err := bed.engine.Call(auth.WithIdentity(t.Context(), admin("root")), livewire.CallRequest{Target: "groupReveal"})
+	require.NoError(t, err)
+	require.Contains(t, string(payload), "s3cret")
+}
+
+func TestEngineReadRecoversAPanickingFilterStore(t *testing.T) {
+	bed := newTestbed(t, nil)
+	ctx := auth.WithIdentity(t.Context(), person("ada", roleReader))
+	stored, err := bed.filters.Save(ctx, &livewire.StoredFilter{Owner: livewire.Owner{Key: "test:ada"}, Resource: "gadgets", Document: []byte(`{}`), Hash: "h"})
+	require.NoError(t, err)
+	bed.filters.panicGet.Store(true)
+	_, err = bed.engine.Read(ctx, livewire.ReadRequest{Target: "gadgets", Source: livewire.MapSource{"filterId": stored.ID}})
+	requireStatus(t, err, http.StatusInternalServerError)
 }
