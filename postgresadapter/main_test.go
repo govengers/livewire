@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"sync"
@@ -71,6 +72,9 @@ func run(m *testing.M) int {
 		return fail("start embedded postgres", err)
 	}
 	defer func() { _ = server.Stop() }() // the test result is decided; a failed stop changes nothing
+	// A first start downloads the binaries over the default client, whose idle connection
+	// would otherwise outlive the tests and fail goleak.
+	http.DefaultClient.CloseIdleConnections()
 	if err := migrateTemplate(); err != nil {
 		return fail("migrate the template database", err)
 	}
