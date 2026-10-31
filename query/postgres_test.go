@@ -73,6 +73,8 @@ var (
 		{Name: "owner", Type: query.TypeUUID, SQL: "walk.owner", Filter: true, Sort: true, Nullable: true},
 		{Name: "weight", Type: query.TypeFloat, SQL: "walk.weight", Filter: true, Sort: true, Nullable: true},
 		{Name: "share", Type: query.TypeFloat, SQL: "walk.share", Filter: true, Sort: true, Nullable: true},
+		// bucket is non-nullable with heavy ties: the leading bound of a cursor page must keep them.
+		{Name: "bucket", Type: query.TypeInteger, SQL: "coalesce(walk.rank, -1)", Filter: true, Sort: true},
 	}
 	indexedTable = table{specification: &query.ResourceSQL{From: "indexed", IDColumn: "indexed.id"}, fields: query.Fields{
 		{Name: "id", Type: query.TypeUUID, SQL: "indexed.id", Filter: true, Sort: true},
@@ -243,6 +245,10 @@ func TestPostgresSemantics(t *testing.T) {
 			{{Field: "at"}},
 			{{Field: "owner", Descending: true}, {Field: "rank"}},
 			{{Field: "rank"}, {Field: "label", Descending: true}, {Field: "at"}, {Field: "owner"}},
+			{{Field: "bucket"}},
+			{{Field: "bucket", Descending: true}},
+			{{Field: "bucket"}, {Field: "label", Descending: true}},
+			{{Field: "bucket", Descending: true}, {Field: "label"}},
 		} {
 			t.Run(fmt.Sprint(sort), func(t *testing.T) {
 				whole, err := query.Compile(walkTable.fields, nil, sort, query.Page{Limit: 100}, nil)
@@ -302,9 +308,9 @@ func TestPostgresSemantics(t *testing.T) {
 
 	t.Run("filters are served by an index", func(t *testing.T) {
 		for name, raw := range map[string]string{
-			"eq":         `{"where":{"field":"name","op":"eq","value":"name-4242"}}`,
-			"in":         `{"where":{"field":"name","op":"in","value":["name-1","name-2"]}}`,
-			"startsWith": `{"where":{"field":"createdAt","op":"gte","value":"2026-01-04T10:00:00Z"}}`,
+			"eq":            `{"where":{"field":"name","op":"eq","value":"name-4242"}}`,
+			"in":            `{"where":{"field":"name","op":"in","value":["name-1","name-2"]}}`,
+			"gte on a time": `{"where":{"field":"createdAt","op":"gte","value":"2026-01-04T10:00:00Z"}}`,
 		} {
 			t.Run(name, func(t *testing.T) {
 				document, err := query.Parse(indexedTable.fields, []byte(raw))
