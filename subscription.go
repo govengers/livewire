@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -488,8 +489,8 @@ func (s *subscription) rerunWith(marks rerunMarks) {
 		marks.record = marks.record || s.recordReadIdentity() != identity
 		resolved, next, err = s.read(ctx, marks.record)
 	}
-	if s.ctx.Err() != nil {
-		return
+	if s.isOver() {
+		return // the socket or subscription ended during the read: nothing to report or retry
 	}
 	if err == nil && marks.record {
 		s.recordReadUnder(identity)
@@ -512,33 +513,48 @@ func (s *subscription) read(ctx context.Context, recordDue bool) (*resolvedRead,
 	var resolved *resolvedRead
 	var next *view
 	err := s.socket.engine.inSlot(ctx, func() error {
-		if s.isOver() {
-			return errSocketClosed
-		}
-		var err error
-		if resolved, err = s.socket.engine.resolve(ctx, s.request); err != nil {
+		return recovering(func() error { // a panicking Check, Tenant or Partition costs a retry, like a loader
+			if s.isOver() {
+				return errSocketClosed
+			}
+			var err error
+			if resolved, err = s.socket.engine.resolve(ctx, s.request); err != nil {
+				return err
+			}
+			if resolved.tenant != s.tenant {
+				return errTenantChanged
+			}
+			s.followPartition(ctx, resolved)
+			load := s.socket.engine.load
+			if s.presence && !recordDue {
+				load = s.socket.engine.loadPresenceOnly
+			}
+			result, err := load(ctx, resolved)
+			if err != nil {
+				return err
+			}
+			next, err = s.viewOf(result)
 			return err
-		}
-		if resolved.tenant != s.tenant {
-			return errTenantChanged
-		}
-		if partition := partitionOf(ctx, resolved); partition != s.partition {
-			// re-indexed before the load, so a change in the new partition during it is not lost
-			s.socket.engine.repartition(s, resolved.plan.declaration.Tables(), partition)
-			s.partition = partition
-		}
-		load := s.socket.engine.load
-		if s.presence && !recordDue {
-			load = s.socket.engine.loadPresenceOnly
-		}
-		result, err := load(ctx, resolved)
-		if err != nil {
-			return err
-		}
-		next, err = s.viewOf(result)
-		return err
+		})
 	})
 	return resolved, next, err
+}
+
+// followPartition re-indexes the declaration's tables when its resolver names another
+// partition now, before the load, so a change in the new partition during it is not lost.
+// A presence subscription keeps the presence table in the tenant, a declaration that lists
+// it too.
+func (s *subscription) followPartition(ctx context.Context, resolved *resolvedRead) {
+	partition := partitionOf(ctx, resolved)
+	if partition == s.partition {
+		return
+	}
+	tables := resolved.plan.declaration.Tables()
+	if s.presence {
+		tables = slices.DeleteFunc(slices.Clone(tables), func(table string) bool { return table == PresenceTable })
+	}
+	s.socket.engine.repartition(s, tables, partition)
+	s.partition = partition
 }
 
 // isOver reports whether the subscription or its socket ended. The socket's context is asked
