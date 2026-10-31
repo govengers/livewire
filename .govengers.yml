@@ -1,2 +1,7 @@
 profile: library
-exceptions: []
+exceptions:
+  - rule: DES-001
+    reason: >-
+      Declaration constructors (NewResource, NewList, NewObject, NewMutation, NewUpload) return the declaration
+      without an error so a registry is one Add(...) expression in main; every declaration mistake is returned
+      by Registry.Add, which main checks (design D43). Components proper (Registry, Engine, adapters) follow DES-001.
