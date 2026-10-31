@@ -1,0 +1,12 @@
+# govengers/livewire
+
+> Declare an API once in Go; serve it as REST, as a WebSocket with reads, subscriptions and writes fed by PostgreSQL LISTEN/NOTIFY, and as generated TypeScript, Go and CLI clients plus OpenAPI 3.0.3. Authorization is govengers/auth; filterable resources carry a filter document model with stored filters; mutations run in an engine-owned transaction with audit and idempotency.
+
+- Module: `github.com/govengers/livewire` (v1, in development on `feat/v1`), Go 1.26, MIT.
+- Packages: `livewire` (root), `query`, `ginadapter`, `postgresadapter`, `prometheusadapter`, `generate`, `livewiretest`.
+- Standards: govengers/standards, `library` profile.
+
+## Docs
+
+- [docs/design.md](docs/design.md): the binding design, decisions D1-D41, packages, wire protocol, work packages, migration from mxcd/livewire v0.2.
+- [docs/wiki/Home.md](docs/wiki/Home.md): model and package map (written per work package).
