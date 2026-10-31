@@ -142,8 +142,9 @@ func direction(term OrderTerm) string {
 // rows that come after it in the first term, or tie it there and come after in the second,
 // and so on down to the id. A NULL cursor value has no row after it in its term, so that
 // branch is dropped. The NULL branches exist for Nullable terms only (Field.Nullable). A
-// non-nullable leading term with a value gets the redundant bound `(term) >= v` in front,
-// the range the planner reads from an index on the sort; the OR form alone is a filter.
+// non-nullable leading term with a value gets the redundant bound `(term) >= v` (ascending)
+// or `(term) <= v` (descending) in front, the range the planner reads from an index on the
+// sort; the OR form alone is a filter.
 func (q *ListQuery) keyset(idColumn string) Predicate {
 	if q.Cursor == nil {
 		return nil
@@ -160,18 +161,20 @@ func (q *ListQuery) keyset(idColumn string) Predicate {
 }
 
 func (q *ListQuery) leadingBound() Predicate {
-	if len(q.Order) == 0 || q.Order[0].Nullable || q.Cursor.Values[0] == nil {
+	if !q.leadingTermBoundsTheRange() {
 		return nil
 	}
-	term, value := q.Order[0], q.Cursor.Values[0]
-	comparison := " >= "
+	term := q.Order[0]
 	if term.Descending {
-		comparison = " <= "
+		return compare(term, " <= ", q.Cursor.Values[0])
 	}
-	return func(builder *Builder) {
-		builder.WriteString("(" + term.SQL + ")" + comparison)
-		writeValue(builder, value)
-	}
+	return compare(term, " >= ", q.Cursor.Values[0])
+}
+
+// leadingTermBoundsTheRange: a non-nullable leading term with a cursor value is a range the
+// index serves; a nullable one needs its OR IS NULL branch, which is not.
+func (q *ListQuery) leadingTermBoundsTheRange() bool {
+	return len(q.Order) > 0 && !q.Order[0].Nullable && q.Cursor.Values[0] != nil
 }
 
 // ties are the equalities with the cursor on the order terms before index.
@@ -184,27 +187,31 @@ func (q *ListQuery) ties(index int) []Predicate {
 }
 
 func equals(term OrderTerm, value any) Predicate {
-	return func(builder *Builder) {
-		if value == nil {
-			builder.WriteString("(" + term.SQL + ") IS NULL")
-			return
-		}
-		builder.WriteString("(" + term.SQL + ") = ")
-		writeValue(builder, value)
+	if value == nil {
+		return isNull(term)
 	}
+	return compare(term, " = ", value)
 }
 
 func after(term OrderTerm, value any) Predicate {
-	comparison := " > "
+	beyond := compare(term, " > ", value)
 	if term.Descending {
-		comparison = " < "
-	}
-	beyond := func(builder *Builder) {
-		builder.WriteString("(" + term.SQL + ")" + comparison)
-		writeValue(builder, value)
+		beyond = compare(term, " < ", value)
 	}
 	if !term.Nullable {
 		return beyond
 	}
-	return Or(beyond, func(builder *Builder) { builder.WriteString("(" + term.SQL + ") IS NULL") })
+	return Or(beyond, isNull(term))
+}
+
+// compare writes `(term) <operator> value` with the value bound like a filter value.
+func compare(term OrderTerm, operator string, value any) Predicate {
+	return func(builder *Builder) {
+		builder.WriteString("(" + term.SQL + ")" + operator)
+		writeValue(builder, value)
+	}
+}
+
+func isNull(term OrderTerm) Predicate {
+	return func(builder *Builder) { builder.WriteString("(" + term.SQL + ") IS NULL") }
 }

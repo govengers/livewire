@@ -156,6 +156,29 @@ func TestParseKeepsTimesInsideTheRFC3339Years(t *testing.T) {
 	}
 }
 
+func TestParseRefusesADocumentWhoseCanonicalFormExceedsTheLimit(t *testing.T) {
+	testCases := map[string]string{
+		"numbers written out": `{"where":{"and":[{"field":"load","op":"in","value":[` + repeat("1e15", 500) + `]},{"field":"load","op":"in","value":[` + repeat("1e15", 500) + `]}]}}`,
+		"U+2028 escaped":      `{"where":{"field":"name","op":"in","value":[` + repeat(`"`+strings.Repeat(" ", 341)+`"`, 14) + `]}}`,
+	}
+	for name, raw := range testCases {
+		t.Run(name, func(t *testing.T) {
+			require.LessOrEqual(t, len(raw), query.MaximumDocumentBytes)
+			_, err := query.Parse(testFields, []byte(raw))
+			fields := requireQueryError(t, err, query.CodeInvalidFilter)
+			require.Contains(t, fields[""], "canonical form")
+		})
+	}
+}
+
+func repeat(item string, count int) string {
+	parts := make([]string, count)
+	for index := range parts {
+		parts[index] = item
+	}
+	return strings.Join(parts, ",")
+}
+
 func TestCanonicalIsIdempotent(t *testing.T) {
 	for name, raw := range validDocuments() {
 		t.Run(name, func(t *testing.T) {

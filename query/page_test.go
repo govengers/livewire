@@ -145,6 +145,20 @@ func TestCursorRefusesTimesOutsideTheRFC3339Years(t *testing.T) {
 	_, err := (&query.Cursor{Sort: sort, Values: []any{time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)}, ID: alpha}).Encode()
 	require.ErrorContains(t, err, "outside 0 to 9999")
 
+	// A driver returns local times: the UTC instant decides, and the wire carries UTC.
+	east, west := time.FixedZone("east", 2*3600), time.FixedZone("west", -2*3600)
+	for _, inRange := range []time.Time{time.Date(10000, 1, 1, 1, 0, 0, 0, east), time.Date(-1, 12, 31, 23, 0, 0, 0, west)} {
+		encoded, err := (&query.Cursor{Sort: sort, Values: []any{inRange}, ID: alpha}).Encode()
+		require.NoError(t, err, inRange)
+		decoded, err := query.ParseCursor(testFields, encoded)
+		require.NoError(t, err)
+		require.Equal(t, []any{inRange.UTC()}, decoded.Values)
+	}
+	for _, outOfRange := range []time.Time{time.Date(9999, 12, 31, 23, 0, 0, 0, west), time.Date(0, 1, 1, 1, 0, 0, 0, east)} {
+		_, err := (&query.Cursor{Sort: sort, Values: []any{outOfRange}, ID: alpha}).Encode()
+		require.ErrorContains(t, err, "outside 0 to 9999", outOfRange)
+	}
+
 	encoded, err := (&query.Cursor{Sort: sort, Values: []any{time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)}, ID: alpha}).Encode()
 	require.NoError(t, err)
 	_, err = query.ParseCursor(testFields, encoded)
