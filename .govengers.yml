@@ -5,3 +5,9 @@ exceptions:
       Declaration constructors (NewResource, NewList, NewObject, NewMutation, NewUpload) return the declaration
       without an error so a registry is one Add(...) expression in main; every declaration mistake is returned
       by Registry.Add, which main checks (design D43). Components proper (Registry, Engine, adapters) follow DES-001.
+  - rule: CON-002
+    reason: >-
+      The live engine's socket and subscription objects are lifetimes, not calls: each owns the context that
+      ends it (cancelled on close, unsubscribe or engine shutdown) and every goroutine it starts derives from
+      that context. Storing it on the lifetime object is the only way to cancel it from another goroutine;
+      functions still take ctx as their first parameter.

@@ -58,6 +58,8 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D48 | The engine's own test suite runs on in-memory fakes of the adapter contracts (fast, deterministic, race-checked); the engine against embedded Postgres (real transactions, LISTEN feed, advisory locks) is the `postgresadapter` suite of WP4 plus the two-engine e2e of WP8. D24's "engine tests on embedded-postgres" is satisfied there, not in WP3. |
 | D49 | One Observer: the registry's (`RegistryOptions.Observer`) receives every engine outcome; `EngineOptions` carries none. The migration table's `Observer` on EngineOptions is superseded. Outcome kinds grew by open, close, revalidate, feed and heartbeat so background failures reach the application. |
 | D50 | FilterStore and PresenceStore calls run outside the read transaction: a filter lookup marks the filter used (a write a READ ONLY transaction cannot do) and presence rows are the library's own, keyed by the explicit tenant. Every other read runs inside the engine's read transaction (D45). |
+| D51 | Identity re-validation runs on subscribe, query, call, batch, join, leave, every re-run and the RevalidateInterval tick; `ping` and `unsubscribe` are exempt (they carry no data, and the tick closes a revoked socket within the interval). Section 6's "every op" reads with this exemption. |
+| D52 | The engine's query semaphore (`QueryConcurrency`) bounds socket work only: subscribe, query, call, batch, re-runs and identity checks started from sockets. REST calls into `Engine.Read`, `Call`, `Batch` and `Upload` are bounded by the HTTP server and the connection pool, so a burst of socket re-runs can never take the connections REST requests need (the intent behind D10). |
 
 ## 2. Packages
 
