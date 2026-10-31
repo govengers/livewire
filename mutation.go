@@ -3,22 +3,25 @@ package livewire
 import (
 	"bytes"
 	"context"
+	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 	"github.com/govengers/auth/authorization"
 
 	"github.com/govengers/livewire/query"
 )
 
-// NoBody is the request type of a mutation without a body.
+// NoBody is the request type of a mutation without a body; a request that sends one is
+// refused.
 type NoBody struct{}
 
 // NoContent is the response type of a mutation that answers without a body (204 unless
@@ -28,14 +31,12 @@ type NoContent struct{}
 // ClientIDVersion says which client-generated `id` a create accepts (D18).
 type ClientIDVersion int
 
-// The client id versions. Without one (the zero value) no `id` is accepted in the body.
+// The client id versions. Without one (the zero value) a create accepts no `id` in the body.
 const (
 	ClientIDNone ClientIDVersion = iota
 	UUIDv7
 	UUIDv4
 )
-
-var uuidVersions = map[ClientIDVersion]uuid.Version{UUIDv7: 7, UUIDv4: 4}
 
 // EffectKind is what an optimistic effect does to a live list (D36).
 type EffectKind string
@@ -43,7 +44,7 @@ type EffectKind string
 // The effect kinds.
 const (
 	EffectUpserts EffectKind = "upserts" // the response is upserted into the list
-	EffectRemoves EffectKind = "removes" // the item with the body's or path's id is removed
+	EffectRemoves EffectKind = "removes" // the item whose id is the request's `id` path parameter is removed
 )
 
 // Effect is the optimistic effect of a mutation on the live lists of Target (D36); the zero
@@ -56,28 +57,31 @@ type Effect struct {
 // Upserts is the effect that upserts the response into the live lists of target.
 func Upserts(target string) Effect { return Effect{Kind: EffectUpserts, Target: target} }
 
-// Removes is the effect that removes the mutated id from the live lists of target.
+// Removes is the effect that removes the item named by the `id` path parameter from the live
+// lists of target; the mutation's parameters must carry `path:"id"`.
 func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: target} }
 
 // MutationOptions declares a write. Check and Handle are required. Status is the success
-// status (default 200, or 204 for a NoContent response). ClientID accepts a client-generated
-// `id` in the body (D18). Resource names a registered resource whose field Write checks
-// apply to the body by JSON name (D39); FieldChecks adds a check per JSON field of Request.
-// Effect is the optimistic effect on live lists (D36).
-type MutationOptions[Params, Request, Response any] struct {
+// status (default 200, or 204 for a NoContent response, which allows no other). ClientID
+// accepts a client-generated `id` in the body of a create (POST, D18); the body of any other
+// method may carry an id and the handler judges it. Resource names a registered resource
+// whose field Write checks apply to the body by JSON name (D39); FieldChecks adds a check per
+// JSON field of Request. Effect is the optimistic effect on live lists (D36). The body is
+// validated with `validate` tags (go-playground/validator) after the structural checks.
+type MutationOptions[Parameters, Request, Response any] struct {
 	Check       authorization.Check
 	Status      int
 	ClientID    ClientIDVersion
 	Resource    string
 	FieldChecks map[string]authorization.Check
 	Effect      Effect
-	Handle      func(ctx context.Context, parameters *Params, body *Request) (*Response, error)
+	Handle      func(ctx context.Context, parameters *Parameters, body *Request) (*Response, error)
 }
 
 // Mutation is a write: a JSON body decoded with unknown fields refused (D40), checked field
-// by field (D39), handled in the engine's transaction (D31).
+// by field (D39), validated, handled in the engine's transaction (D31).
 type Mutation struct {
-	Signature
+	signature
 	parametersType reflect.Type
 	requestType    reflect.Type
 	responseType   reflect.Type
@@ -87,97 +91,49 @@ type Mutation struct {
 	fieldChecks    map[string]authorization.Check
 	writeChecks    map[string]authorization.Check
 	effect         Effect
+	validate       *validator.Validate
 	handle         func(ctx context.Context, parameters, body any) (any, error)
 }
 
 // NewMutation declares a write with method (POST, PUT, PATCH or DELETE) at path, whose
-// `{name}` placeholders are the `path:"name"` fields of Params. Request is the body type
-// (a struct, or NoBody), Response the response type (NoContent for none). A mistake is
-// reported by Registry.Add.
-func NewMutation[Params, Request, Response any](name, method, path string, options *MutationOptions[Params, Request, Response]) *Mutation {
+// `{name}` placeholders are the `path:"name"` fields of Parameters. Request is the body type
+// (a struct, or NoBody), Response the response type (NoContent for none). The options are
+// copied. A mistake is reported by Registry.Add (D43).
+func NewMutation[Parameters, Request, Response any](name, method, path string, options *MutationOptions[Parameters, Request, Response]) *Mutation {
 	if options == nil {
-		options = &MutationOptions[Params, Request, Response]{}
+		options = &MutationOptions[Parameters, Request, Response]{}
 	}
 	mutation := &Mutation{
-		Signature:      newSignature(name, method, path, nil, options.Check),
-		parametersType: reflect.TypeFor[Params](),
+		signature:      newSignature(name, method, path, nil, options.Check),
+		parametersType: reflect.TypeFor[Parameters](),
 		requestType:    reflect.TypeFor[Request](),
 		responseType:   reflect.TypeFor[Response](),
-		status:         options.Status,
 		clientID:       options.ClientID,
 		resource:       options.Resource,
-		fieldChecks:    cloneChecks(options.FieldChecks),
-		writeChecks:    cloneChecks(options.FieldChecks),
+		fieldChecks:    maps.Clone(options.FieldChecks),
+		writeChecks:    maps.Clone(options.FieldChecks),
 		effect:         options.Effect,
 	}
-	if options.Handle != nil {
+	fallback := http.StatusOK
+	if !mutation.HasContent() {
+		fallback = http.StatusNoContent
+	}
+	mutation.status = intOrDefault(options.Status, fallback)
+	if handle := options.Handle; handle != nil {
 		mutation.handle = func(ctx context.Context, parameters, body any) (any, error) {
-			return options.Handle(ctx, parameters.(*Params), body.(*Request))
+			return handle(ctx, parameters.(*Parameters), body.(*Request))
 		}
+	}
+	if mutation.HasBody() {
+		mutation.validate = validator.New(validator.WithRequiredStructEnabled())
+		mutation.validate.RegisterTagNameFunc(func(field reflect.StructField) string {
+			name, _ := jsonName(field)
+			return name
+		})
 	}
 	mutation.compileParameters(mutation.parametersType)
-	mutation.validate(options.Handle == nil)
+	mutation.failWith(mutation.validateDeclaration(options.Status))
 	return mutation
-}
-
-func (m *Mutation) validate(handleMissing bool) {
-	switch {
-	case handleMissing:
-		m.fail("Handle is required")
-	case !slices.Contains(writeMethods, m.method):
-		m.fail("the method %q is not a write method (POST, PUT, PATCH, DELETE)", m.method)
-	case m.status != 0 && (m.status < http.StatusOK || m.status > 299):
-		m.fail("Status %d is not a success status", m.status)
-	case m.HasBody() && m.requestType.Kind() != reflect.Struct:
-		m.fail("the request type %s is not a struct", m.requestType)
-	case m.clientID < ClientIDNone || m.clientID > UUIDv4:
-		m.fail("ClientID %d is not a ClientIDVersion", m.clientID)
-	case m.clientID != ClientIDNone && !m.HasBody():
-		m.fail("ClientID needs a body")
-	case m.effect.Kind != "" && m.effect.Kind != EffectUpserts && m.effect.Kind != EffectRemoves:
-		m.fail("Effect kind %q is unknown", m.effect.Kind)
-	case (m.effect.Kind == "") != (m.effect.Target == ""):
-		m.fail("Effect needs Kind and Target")
-	}
-	if m.err != nil {
-		return
-	}
-	if m.status == 0 {
-		m.status = http.StatusOK
-		if !m.HasContent() {
-			m.status = http.StatusNoContent
-		}
-	}
-	if m.clientID != ClientIDNone {
-		m.failWith(requireJSONField(m.requestType, keyFieldJSON, "ClientID accepts it"))
-	}
-	for _, name := range sortedKeys(m.fieldChecks) {
-		if m.fieldChecks[name] == nil {
-			m.fail("FieldChecks[%q] is nil", name)
-			return
-		}
-		m.failWith(requireJSONField(m.requestType, name, "FieldChecks names it"))
-	}
-}
-
-// bindResource builds the body write checks from the resource's fields: Write, or Read when
-// Write is nil, plus FieldChecks; a field with both runs both.
-func (m *Mutation) bindResource(fields query.Fields) {
-	m.writeChecks = cloneChecks(m.fieldChecks)
-	for _, field := range fields {
-		check := field.Write
-		if check == nil {
-			check = field.Read
-		}
-		if check == nil {
-			continue
-		}
-		if existing, ok := m.writeChecks[field.Name]; ok {
-			m.writeChecks[field.Name] = authorization.All(authorization.Check(check), existing)
-			continue
-		}
-		m.writeChecks[field.Name] = authorization.Check(check)
-	}
 }
 
 // Kind is KindMutation.
@@ -210,16 +166,20 @@ func (m *Mutation) Resource() string { return m.resource }
 // Effect is the optimistic effect (D36); the zero value is none.
 func (m *Mutation) Effect() Effect { return m.effect }
 
-func (m *Mutation) routes() []route { return []route{{m.method, m.path}} }
-
 // DecodeBody decodes raw into a new body value (a *Request) under the identity in ctx. A
-// body that is not valid JSON of the request type, or that carries an unknown field, is 400
-// invalid_request naming the field (D40); a client id the mutation does not accept, or of
-// the wrong version, is 400 naming "id" (D18); a field whose write check refuses is 403
-// forbidden_field (D39). A mutation without a body ignores raw.
+// body that is not a JSON object of the request type, or that carries an unknown field at
+// any depth, is 400 invalid_request naming the field by its path (D40); a client id a create
+// does not accept, or of the wrong form or version, is 400 naming "id" (D18); a field whose
+// write check refuses is 403 forbidden_field (D39); a body that fails its `validate` tags is
+// 400 naming each field with the failed tag. Every text in the response is fixed; the cause
+// of a decoding failure stays on the server. A mutation without a body refuses a non-empty
+// raw.
 func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	body := reflect.New(m.requestType).Interface()
 	if !m.HasBody() {
+		if len(bytes.TrimSpace(raw)) > 0 {
+			return nil, invalidParameter("body", "not accepted")
+		}
 		return body, nil
 	}
 	present, err := m.presentFields(raw)
@@ -237,11 +197,91 @@ func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	if err := m.checkWrites(ctx, present); err != nil {
 		return nil, err
 	}
+	if err := m.validate.StructCtx(ctx, body); err != nil {
+		return nil, validationError(err)
+	}
 	return body, nil
 }
 
-// presentFields returns the body's top-level fields; an unknown one is refused by name,
-// which the decoder cannot do (its message is text only).
+// Handle runs the handler with the decoded parameters (a *Parameters) and body (a *Request);
+// the response is a *Response.
+func (m *Mutation) Handle(ctx context.Context, parameters, body any) (any, error) {
+	return m.handle(ctx, parameters, body)
+}
+
+func (m *Mutation) declaration() Declaration { return m }
+
+func (m *Mutation) routes() []route { return []route{{m.method, m.path}} }
+
+func (m *Mutation) validateDeclaration(status int) error {
+	bodylessClientID := m.clientID != ClientIDNone && (!m.HasBody() || m.method != http.MethodPost)
+	effectHalfSet := (m.effect.Kind == "") != (m.effect.Target == "")
+	unknownEffect := m.effect.Kind != "" && m.effect.Kind != EffectUpserts && m.effect.Kind != EffectRemoves
+	switch {
+	case m.handle == nil:
+		return errors.New("Handle is required")
+	case !slices.Contains(writeMethods, m.method):
+		return fmt.Errorf("the method %q is not a write method (POST, PUT, PATCH, DELETE)", m.method)
+	case status != 0 && !isSuccessStatus(status):
+		return fmt.Errorf("Status %d is not a success status", status)
+	case status == http.StatusNoContent && m.HasContent():
+		return errors.New("Status 204 cannot carry the response body")
+	case m.HasBody() && m.requestType.Kind() != reflect.Struct:
+		return fmt.Errorf("the request type %s is not a struct", m.requestType)
+	case m.clientID < ClientIDNone || m.clientID > UUIDv4:
+		return fmt.Errorf("ClientID %d is not a ClientIDVersion", m.clientID)
+	case bodylessClientID:
+		return errors.New("ClientID needs a POST with a body: it is a create's option (D18)")
+	case unknownEffect:
+		return fmt.Errorf("Effect kind %q is unknown", m.effect.Kind)
+	case effectHalfSet:
+		return errors.New("Effect needs Kind and Target")
+	}
+	if m.clientID != ClientIDNone {
+		if err := requireJSONField(m.requestType, keyFieldJSON, "ClientID accepts it"); err != nil {
+			return err
+		}
+	}
+	return m.validateFieldChecks()
+}
+
+func (m *Mutation) validateFieldChecks() error {
+	for _, name := range sortedKeys(m.fieldChecks) {
+		if m.fieldChecks[name] == nil {
+			return fmt.Errorf("FieldChecks[%q] is nil", name)
+		}
+		if err := requireJSONField(m.requestType, name, "FieldChecks names it"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeChecksFor builds the body write checks from the resource's fields: Write, or Read
+// when Write is nil, plus FieldChecks; a field with both runs both. The registry applies the
+// result once every declaration of its Add passed.
+func (m *Mutation) writeChecksFor(fields query.Fields) map[string]authorization.Check {
+	checks := make(map[string]authorization.Check, len(fields)+len(m.fieldChecks))
+	maps.Copy(checks, m.fieldChecks)
+	for _, field := range fields {
+		check := field.Write
+		if check == nil {
+			check = field.Read
+		}
+		if check == nil {
+			continue
+		}
+		if existing, ok := checks[field.Name]; ok {
+			checks[field.Name] = authorization.All(authorization.Check(check), existing)
+			continue
+		}
+		checks[field.Name] = authorization.Check(check)
+	}
+	return checks
+}
+
+// presentFields returns the body's top-level fields after refusing an unknown field at any
+// depth by its path, which the decoder cannot do (its message is text only).
 func (m *Mutation) presentFields(raw []byte) (map[string]json.RawMessage, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, invalidParameter("body", "required")
@@ -249,24 +289,22 @@ func (m *Mutation) presentFields(raw []byte) (map[string]json.RawMessage, error)
 	var present map[string]json.RawMessage
 	var typeError *json.UnmarshalTypeError
 	err := json.Unmarshal(raw, &present)
+	notObject := errors.As(err, &typeError) || (err == nil && present == nil)
 	switch {
-	case errors.As(err, &typeError), err == nil && present == nil:
+	case notObject:
 		return nil, invalidParameter("body", "must be an object")
 	case err != nil:
-		return nil, bodyError(err)
+		return nil, invalidParameter("body", "must be valid JSON")
 	}
-	known := jsonFieldsOf(m.requestType)
-	for _, name := range sortedKeys(present) {
-		if _, ok := known[name]; !ok {
-			return nil, invalidParameter(name, "unknown field")
-		}
+	if path, unknown := unknownField(present, m.requestType, ""); unknown {
+		return nil, invalidParameter(path, "unknown field")
 	}
 	return present, nil
 }
 
 func (m *Mutation) checkClientID(present map[string]json.RawMessage) error {
 	rawID, ok := present[keyFieldJSON]
-	if !ok {
+	if !ok || m.method != http.MethodPost {
 		return nil
 	}
 	if m.clientID == ClientIDNone {
@@ -276,11 +314,22 @@ func (m *Mutation) checkClientID(present map[string]json.RawMessage) error {
 	if err := json.Unmarshal(rawID, &text); err != nil {
 		return invalidParameter(keyFieldJSON, "must be a uuid string")
 	}
-	id, err := uuid.Parse(text)
-	if err != nil || id.Version() != uuidVersions[m.clientID] {
-		return invalidParameter(keyFieldJSON, fmt.Sprintf("must be a UUID version %d", uuidVersions[m.clientID]))
+	if !isClientID(text, uuidVersions[m.clientID]) {
+		return invalidParameter(keyFieldJSON, fmt.Sprintf("must be a canonical UUID version %d", uuidVersions[m.clientID]))
 	}
 	return nil
+}
+
+var uuidVersions = map[ClientIDVersion]uuid.Version{UUIDv7: 7, UUIDv4: 4}
+
+// isClientID accepts the 36-character canonical form of an RFC 4122 uuid of the version.
+func isClientID(text string, version uuid.Version) bool {
+	const canonicalLength = 36
+	if len(text) != canonicalLength {
+		return false
+	}
+	id, err := uuid.Parse(text)
+	return err == nil && id.Variant() == uuid.RFC4122 && id.Version() == version
 }
 
 func (m *Mutation) checkWrites(ctx context.Context, present map[string]json.RawMessage) error {
@@ -296,28 +345,80 @@ func (m *Mutation) checkWrites(ctx context.Context, present map[string]json.RawM
 	return nil
 }
 
-// Handle runs the handler with the decoded parameters (a *Params) and body (a *Request);
-// the response is a *Response.
-func (m *Mutation) Handle(ctx context.Context, parameters, body any) (any, error) {
-	return m.handle(ctx, parameters, body)
+var (
+	jsonUnmarshalerType = reflect.TypeFor[json.Unmarshaler]()
+	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+)
+
+// unknownField finds the first JSON key of object that the struct type does not marshal,
+// descending into nested structs and arrays of structs; the path is dotted ("nested.note",
+// "lines[1].sku"). Types with their own unmarshaler are theirs to judge.
+func unknownField(object map[string]json.RawMessage, structType reflect.Type, prefix string) (string, bool) {
+	known := jsonFieldsOf(structType)
+	for _, key := range sortedKeys(object) {
+		field, ok := known[key]
+		if !ok {
+			return prefix + key, true
+		}
+		if path, unknown := unknownNested(object[key], field.Type, prefix+key); unknown {
+			return path, true
+		}
+	}
+	return "", false
 }
 
+func unknownNested(raw json.RawMessage, fieldType reflect.Type, path string) (string, bool) {
+	fieldType = unwrapPointer(fieldType)
+	switch {
+	case hasOwnUnmarshaler(fieldType):
+		return "", false
+	case fieldType.Kind() == reflect.Struct:
+		var nested map[string]json.RawMessage
+		if json.Unmarshal(raw, &nested) != nil || nested == nil {
+			return "", false // the decoder reports the shape
+		}
+		return unknownField(nested, fieldType, path+".")
+	case fieldType.Kind() == reflect.Slice || fieldType.Kind() == reflect.Array:
+		var elements []json.RawMessage
+		if json.Unmarshal(raw, &elements) != nil {
+			return "", false
+		}
+		for position, element := range elements {
+			if nestedPath, unknown := unknownNested(element, fieldType.Elem(), fmt.Sprintf("%s[%d]", path, position)); unknown {
+				return nestedPath, true
+			}
+		}
+	}
+	return "", false
+}
+
+func hasOwnUnmarshaler(fieldType reflect.Type) bool {
+	pointer := reflect.PointerTo(fieldType)
+	return pointer.Implements(jsonUnmarshalerType) || pointer.Implements(textUnmarshalerType)
+}
+
+// bodyError maps a decoder failure to a fixed text; the decoder's own message, which may
+// repeat a custom unmarshaler's text, never reaches the client.
 func bodyError(err error) *Error {
 	var typeError *json.UnmarshalTypeError
-	switch {
-	case errors.Is(err, io.EOF):
-		return invalidParameter("body", "required")
-	case errors.As(err, &typeError) && typeError.Field != "":
-		return invalidParameter(typeError.Field, "must be a "+typeError.Type.String())
-	default:
-		return invalidParameter("body", "must be valid JSON of the request type: "+err.Error())
+	if errors.As(err, &typeError) && typeError.Field != "" {
+		return invalidParameter(typeError.Field, "has the wrong type")
 	}
+	return invalidParameter("body", "could not be decoded as the request type")
 }
 
-func cloneChecks(checks map[string]authorization.Check) map[string]authorization.Check {
-	cloned := make(map[string]authorization.Check, len(checks))
-	maps.Copy(cloned, checks)
-	return cloned
+// validationError maps the failed tags to the fields by JSON path.
+func validationError(err error) error {
+	var failures validator.ValidationErrors
+	if !errors.As(err, &failures) {
+		return fmt.Errorf("livewire: validate the body: %w", err)
+	}
+	fields := make(map[string]string, len(failures))
+	for _, failure := range failures {
+		_, path, _ := strings.Cut(failure.Namespace(), ".")
+		fields[path] = failure.Tag()
+	}
+	return Invalid(fields)
 }
 
 func sortedKeys[Value any](values map[string]Value) []string {

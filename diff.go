@@ -8,16 +8,18 @@ import (
 )
 
 // ListState is what a list subscription last pushed (the engine keeps one per list
-// subscription; a client applies Diff the same way): every item's JSON by id, the order of
-// the ids and the total of the list.
+// subscription; a client applies ListChange the same way): every item's JSON by id, the
+// order of the ids and the total of the list.
 type ListState struct {
 	order []string
 	items map[string]json.RawMessage
 	total int
 }
 
-// NewListState indexes the marshaled items (a JSON array) by their "id", which is a string
-// or a number; an item without one is an error, the list cannot be diffed.
+// NewListState indexes the marshaled items (a JSON array) by their "id", a string or a
+// number. An item without an id, with an id of another shape, or with the id of an earlier
+// item (the number 1 and the string "1" are the same id) is an error: such a list cannot be
+// diffed and must not be pushed.
 func NewListState(rawItems json.RawMessage, total int) (*ListState, error) {
 	var items []json.RawMessage
 	if err := json.Unmarshal(rawItems, &items); err != nil {
@@ -29,24 +31,13 @@ func NewListState(rawItems json.RawMessage, total int) (*ListState, error) {
 		if err != nil {
 			return nil, err
 		}
+		if _, duplicate := state.items[id]; duplicate {
+			return nil, fmt.Errorf("livewire: two list items carry the id %q", id)
+		}
 		state.order = append(state.order, id)
 		state.items[id] = item
 	}
 	return state, nil
-}
-
-func itemID(item json.RawMessage) (string, error) {
-	var keyed struct {
-		ID json.RawMessage `json:"id"`
-	}
-	if err := json.Unmarshal(item, &keyed); err != nil || len(keyed.ID) == 0 || bytes.Equal(keyed.ID, []byte("null")) {
-		return "", fmt.Errorf("livewire: a list item has no id: %s", item)
-	}
-	var id string
-	if err := json.Unmarshal(keyed.ID, &id); err == nil {
-		return id, nil
-	}
-	return string(keyed.ID), nil
 }
 
 // Snapshot is the items as one JSON array, in order.
@@ -63,11 +54,11 @@ func (s *ListState) Snapshot() json.RawMessage {
 	return snapshot.Bytes()
 }
 
-// Diff returns what changed from previous to s: the items that are new or whose JSON
-// differs, the ids that are gone, the full order when membership or order changed, and the
-// total when it changed. It returns nil when nothing changed.
-func (s *ListState) Diff(previous *ListState) *Diff {
-	changes := &Diff{Upserts: []json.RawMessage{}, Removes: []string{}}
+// ChangesSince returns what changed from previous to s: the items that are new or whose
+// JSON differs, the ids that are gone, the full order when membership or order changed, and
+// the total when it changed. It returns nil when nothing changed.
+func (s *ListState) ChangesSince(previous *ListState) *ListChange {
+	changes := &ListChange{Upserts: []json.RawMessage{}, Removes: []string{}}
 	for _, id := range s.order {
 		if old, ok := previous.items[id]; !ok || !bytes.Equal(old, s.items[id]) {
 			changes.Upserts = append(changes.Upserts, s.items[id])
@@ -84,8 +75,29 @@ func (s *ListState) Diff(previous *ListState) *Diff {
 	if previous.total != s.total {
 		changes.Total = new(s.total)
 	}
-	if len(changes.Upserts) == 0 && len(changes.Removes) == 0 && changes.Order == nil && changes.Total == nil {
+	unchanged := len(changes.Upserts) == 0 && len(changes.Removes) == 0 && changes.Order == nil && changes.Total == nil
+	if unchanged {
 		return nil
 	}
 	return changes
+}
+
+// itemID is the item's id as the key of the list: a JSON string as it is, a JSON number as
+// its text.
+func itemID(item json.RawMessage) (string, error) {
+	var keyed struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(item, &keyed); err != nil || len(keyed.ID) == 0 || bytes.Equal(keyed.ID, []byte("null")) {
+		return "", fmt.Errorf("livewire: a list item has no id: %s", item)
+	}
+	var text string
+	if err := json.Unmarshal(keyed.ID, &text); err == nil {
+		return text, nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(keyed.ID, &number); err == nil {
+		return number.String(), nil
+	}
+	return "", fmt.Errorf("livewire: a list item's id is neither a string nor a number: %s", keyed.ID)
 }

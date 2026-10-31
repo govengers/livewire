@@ -9,35 +9,41 @@ import (
 	"github.com/govengers/livewire"
 )
 
-func TestNewListStateRefusesItemsWithoutID(t *testing.T) {
+func TestNewListStateRefusesUnusableIDs(t *testing.T) {
 	testCases := []struct {
 		name string
 		raw  string
+		want string
 	}{
-		{name: "not an array", raw: `{"id":"a"}`},
-		{name: "item without id", raw: `[{"name":"bolt"}]`},
-		{name: "null id", raw: `[{"id":null}]`},
-		{name: "item not an object", raw: `["a"]`},
+		{name: "not an array", raw: `{"id":"a"}`, want: "not a JSON array"},
+		{name: "item without id", raw: `[{"name":"bolt"}]`, want: "has no id"},
+		{name: "null id", raw: `[{"id":null}]`, want: "has no id"},
+		{name: "object id", raw: `[{"id":{}}]`, want: "neither a string nor a number"},
+		{name: "array id", raw: `[{"id":[1]}]`, want: "neither a string nor a number"},
+		{name: "boolean id", raw: `[{"id":true}]`, want: "neither a string nor a number"},
+		{name: "item not an object", raw: `["a"]`, want: "has no id"},
+		{name: "duplicate string ids", raw: `[{"id":"a"},{"id":"a","v":2}]`, want: `two list items carry the id "a"`},
+		{name: "number and string collide", raw: `[{"id":1},{"id":"1"}]`, want: `two list items carry the id "1"`},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			_, err := livewire.NewListState(json.RawMessage(testCase.raw), 0)
-			require.Error(t, err)
+			require.ErrorContains(t, err, testCase.want)
 		})
 	}
 }
 
 func TestListStateSnapshotKeepsOrderAndNumericIDs(t *testing.T) {
-	state, err := livewire.NewListState(json.RawMessage(`[{"id":2,"name":"nut"},{"id":"a","name":"bolt"}]`), 2)
+	state, err := livewire.NewListState(json.RawMessage(`[{"id":2,"name":"nut"},{"id":"a","name":"bolt"},{"id":1.5}]`), 3)
 	require.NoError(t, err)
-	require.JSONEq(t, `[{"id":2,"name":"nut"},{"id":"a","name":"bolt"}]`, string(state.Snapshot()))
+	require.JSONEq(t, `[{"id":2,"name":"nut"},{"id":"a","name":"bolt"},{"id":1.5}]`, string(state.Snapshot()))
 
 	empty, err := livewire.NewListState(json.RawMessage(`[]`), 0)
 	require.NoError(t, err)
 	require.Equal(t, `[]`, string(empty.Snapshot()))
 }
 
-func TestListStateDiff(t *testing.T) {
+func TestListStateChangesSince(t *testing.T) {
 	testCases := []struct {
 		name          string
 		previous      string
@@ -96,7 +102,7 @@ func TestListStateDiff(t *testing.T) {
 			next, err := livewire.NewListState(json.RawMessage(testCase.next), testCase.nextTotal)
 			require.NoError(t, err)
 
-			changes := next.Diff(previous)
+			changes := next.ChangesSince(previous)
 			if testCase.want == "" {
 				require.Nil(t, changes)
 				return

@@ -18,6 +18,7 @@ import (
 func TestResponseFor(t *testing.T) {
 	_, queryError := query.ParseSort(partFields(), "nope")
 	require.Error(t, queryError)
+	sortField := map[string]string{"sort[0]": "unknown or unsortable field \"nope\""}
 
 	testCases := []struct {
 		name       string
@@ -25,7 +26,6 @@ func TestResponseFor(t *testing.T) {
 		status     int
 		code       livewire.Code
 		wantFields map[string]string
-		noMessage  bool
 	}{
 		{name: "not found", err: livewire.NotFound(), status: http.StatusNotFound, code: livewire.CodeNotFound},
 		{name: "conflict", err: livewire.Conflict(), status: http.StatusConflict, code: livewire.CodeConflict},
@@ -33,13 +33,22 @@ func TestResponseFor(t *testing.T) {
 		{name: "invalid", err: livewire.Invalid(map[string]string{"name": "required"}), status: http.StatusBadRequest, code: livewire.CodeInvalidRequest, wantFields: map[string]string{"name": "required"}},
 		{name: "forbidden field", err: livewire.ForbiddenField("secret"), status: http.StatusForbidden, code: livewire.CodeForbiddenField, wantFields: map[string]string{"secret": "forbidden"}},
 		{name: "wrapped core error", err: fmt.Errorf("load part: %w", livewire.NotFound()), status: http.StatusNotFound, code: livewire.CodeNotFound},
-		{name: "query error", err: queryError, status: http.StatusBadRequest, code: livewire.CodeInvalidSort, wantFields: map[string]string{"sort[0]": "unknown or unsortable field \"nope\""}},
-		{name: "wrapped query error", err: fmt.Errorf("list: %w", queryError), status: http.StatusBadRequest, code: livewire.CodeInvalidSort, wantFields: map[string]string{"sort[0]": "unknown or unsortable field \"nope\""}},
+		{name: "query error", err: queryError, status: http.StatusBadRequest, code: livewire.CodeInvalidSort, wantFields: sortField},
+		{name: "wrapped query error", err: fmt.Errorf("list: %w", queryError), status: http.StatusBadRequest, code: livewire.CodeInvalidSort, wantFields: sortField},
 		{name: "auth forbidden", err: &auth.Error{Kind: auth.ErrForbidden, Reason: "missing role admin"}, status: http.StatusForbidden, code: livewire.CodeForbidden},
-		{name: "auth unauthenticated with code", err: &auth.Error{Kind: auth.ErrUnauthenticated, Code: "session_expired"}, status: http.StatusUnauthorized, code: "session_expired"},
+		{name: "auth custom code maps to the kind", err: &auth.Error{Kind: auth.ErrUnauthenticated, Code: "session_expired"}, status: http.StatusUnauthorized, code: livewire.CodeUnauthenticated},
+		{name: "auth invalid request with code", err: &auth.Error{Kind: auth.ErrInvalidRequest, Code: "invalid_api_key"}, status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
+		{name: "auth conflict with code", err: &auth.Error{Kind: auth.ErrConflict, Code: "username_taken"}, status: http.StatusConflict, code: livewire.CodeConflict},
+		{name: "auth forbidden with code", err: &auth.Error{Kind: auth.ErrForbidden, Code: "inactive"}, status: http.StatusForbidden, code: livewire.CodeForbidden},
 		{name: "auth sentinel", err: auth.ErrConflict, status: http.StatusConflict, code: livewire.CodeConflict},
-		{name: "auth invalid request", err: fmt.Errorf("bad: %w", auth.ErrInvalidRequest), status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
+		{name: "wrapped auth sentinel", err: fmt.Errorf("bad: %w", auth.ErrInvalidRequest), status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
 		{name: "check refusal", err: authorization.IsAdmin()(userContext()), status: http.StatusForbidden, code: livewire.CodeForbidden},
+		{name: "auth error of an unknown kind", err: &auth.Error{Kind: errors.New("odd")}, status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "refusal wrapping a core cause answers the refusal", err: &auth.Error{Kind: auth.ErrForbidden, Err: livewire.NotFound()}, status: http.StatusForbidden, code: livewire.CodeForbidden},
+		{name: "refusal wrapping a query cause answers the refusal", err: &auth.Error{Kind: auth.ErrForbidden, Err: queryError}, status: http.StatusForbidden, code: livewire.CodeForbidden},
+		{name: "sentinel wrapping a core cause answers the sentinel", err: fmt.Errorf("%w: %w", auth.ErrUnauthenticated, livewire.Conflict()), status: http.StatusUnauthorized, code: livewire.CodeUnauthenticated},
+		{name: "core error wrapping a refusal answers the core error", err: fmt.Errorf("%w: %w", livewire.NotFound(), auth.ErrForbidden), status: http.StatusNotFound, code: livewire.CodeNotFound},
+		{name: "query error wrapping a refusal answers the query error", err: fmt.Errorf("%w (%w)", queryError, auth.ErrForbidden), status: http.StatusBadRequest, code: livewire.CodeInvalidSort, wantFields: sortField},
 		{name: "unknown error", err: errors.New("pq: connection refused to 10.0.0.1"), status: http.StatusInternalServerError, code: livewire.CodeInternal},
 		{name: "nil", err: nil, status: http.StatusInternalServerError, code: livewire.CodeInternal},
 	}
@@ -50,17 +59,15 @@ func TestResponseFor(t *testing.T) {
 			require.Equal(t, testCase.code, body.Code)
 			require.NotEmpty(t, body.Message)
 			require.Equal(t, testCase.wantFields, body.Fields)
-			if testCase.err != nil {
-				require.NotContains(t, body.Message, "10.0.0.1")
-				require.NotContains(t, body.Message, "missing role")
-			}
+			require.NotContains(t, body.Message, "10.0.0.1")
+			require.NotContains(t, body.Message, "missing role")
 		})
 	}
 }
 
 func TestErrorText(t *testing.T) {
-	err := livewire.Invalid(map[string]string{"name": "required"})
-	require.Equal(t, "invalid_request: the request is not valid (name: required)", err.Error())
+	err := livewire.Invalid(map[string]string{"name": "required", "age": "must be an integer"})
+	require.Equal(t, "invalid_request: the request is not valid (age: must be an integer) (name: required)", err.Error())
 	require.Equal(t, "not_found: not found", livewire.NotFound().Error())
 }
 

@@ -33,11 +33,16 @@ func TestResourceDeclarationErrors(t *testing.T) {
 		{name: "default sort guarded", change: func(options *livewire.ResourceOptions[part]) {
 			options.DefaultSort = []query.SortTerm{{Field: "secret"}}
 		}, want: "guarded field"},
+		{name: "default sort twice", change: func(options *livewire.ResourceOptions[part]) {
+			options.DefaultSort = []query.SortTerm{{Field: "name"}, {Field: "name", Descending: true}}
+		}, want: `DefaultSort names "name" twice`},
 		{name: "export column unknown", change: func(options *livewire.ResourceOptions[part]) { options.ExportColumns = []string{"nope"} }, want: "not a field"},
-		{name: "get without item", change: func(options *livewire.ResourceOptions[part]) { options.Item = nil }, want: "Get needs Item"},
-		{name: "item without get", change: func(options *livewire.ResourceOptions[part]) { options.Get = nil }, want: "Get is required with Item"},
+		{name: "get without item", change: func(options *livewire.ResourceOptions[part]) { options.Item = nil }, want: "Get loader needs Item"},
+		{name: "item without get", change: func(options *livewire.ResourceOptions[part]) { options.Get = nil }, want: "Get loader is required with Item"},
 		{name: "item without parameter", change: func(options *livewire.ResourceOptions[part]) { options.Item.Parameter = "" }, want: "Item needs Parameter and Field"},
+		{name: "item parameter spliced into the route", change: func(options *livewire.ResourceOptions[part]) { options.Item.Parameter = "id}/extra/{other" }, want: "Item.Parameter"},
 		{name: "item field unknown", change: func(options *livewire.ResourceOptions[part]) { options.Item.Field = "nope" }, want: "not a filterable field"},
+		{name: "item field of a float type", change: func(options *livewire.ResourceOptions[part]) { options.Item.Field = "price" }, want: "an item key is uuid, string, text, enum, int or time"},
 		{name: "item field not in the item type", change: func(options *livewire.ResourceOptions[part]) {
 			options.Fields = append(options.Fields, query.Field{Name: "sku", Type: query.TypeString, SQL: "parts.sku", Filter: true})
 			options.Item.Field = "sku"
@@ -71,20 +76,66 @@ func TestResourceDeclarationErrors(t *testing.T) {
 	t.Run("item type without id is fine when not live", func(t *testing.T) {
 		require.NoError(t, addError(t, names(nil, false)))
 	})
+	t.Run("live list of pointer items without id", func(t *testing.T) {
+		err := addError(t, livewire.NewResource("names", "/names", &livewire.ResourceOptions[*withoutID]{
+			Tables: []string{"parts"},
+			Read:   authorization.IsUser(),
+			Fields: query.Fields{{Name: "name", Type: query.TypeString, SQL: "parts.name"}},
+			List:   func(context.Context, *query.ListQuery) ([]*withoutID, int, error) { return nil, 0, nil },
+		}))
+		require.ErrorContains(t, err, `no JSON field "id"`)
+	})
 	t.Run("nil options", func(t *testing.T) {
 		require.ErrorContains(t, addError(t, livewire.NewResource[part]("parts", "/parts", nil)), "Check is required")
+	})
+	t.Run("name is not an identifier", func(t *testing.T) {
+		for _, name := range []string{"", "parts list", "1parts", "parts-list"} {
+			require.ErrorContains(t, addError(t, livewire.NewResource(name, "/parts", partOptions())), "is not an identifier")
+		}
 	})
 	t.Run("placeholder in the path", func(t *testing.T) {
 		require.ErrorContains(t, addError(t, livewire.NewResource("parts", "/tenants/{tenant}/parts", partOptions())), "no field tagged")
 	})
 }
 
-func TestResourceDerivesNullableAndCopies(t *testing.T) {
+func TestResourceCopiesOptions(t *testing.T) {
+	options := partOptions()
+	partition := func(context.Context, any) string { return "p1" }
+	options.Partition = partition
+	resource := newParts(t, options)
+
+	options.List, options.Get, options.Distinct, options.Partition = nil, nil, nil, nil
+	options.Fields[2].Enum[0] = "changed"
+	options.Fields[0].Name = "changed"
+	options.DefaultSort[0].Field = "changed"
+	options.Item.Field = "changed"
+	options.Tables[0] = "changed"
+
+	items, _, err := resource.LoadList(userContext(), &query.ListQuery{})
+	require.NoError(t, err)
+	require.Equal(t, []part{}, items)
+	_, err = resource.LoadItem(userContext(), &query.ListQuery{})
+	require.NoError(t, err)
+	_, err = resource.LoadDistinct(userContext(), "type", &query.ListQuery{})
+	require.NoError(t, err)
+	require.Equal(t, "p1", resource.Partition()(context.Background(), nil))
+	require.Equal(t, "id", resource.Fields()[0].Name)
+	require.Equal(t, []string{"bolt", "nut"}, resource.Fields()[2].Enum)
+	require.Equal(t, "createdAt", resource.DefaultSort()[0].Field)
+	require.Equal(t, "id", resource.Item().Field)
+	require.Equal(t, []string{"parts"}, resource.Tables())
+
+	fields := resource.Fields()
+	fields[0].Name, fields[2].Enum[0] = "changed", "changed"
+	require.Equal(t, "id", resource.Fields()[0].Name)
+	require.Equal(t, "bolt", resource.Fields()[2].Enum[0], "Fields returns copies")
+}
+
+func TestResourceDerivesNullable(t *testing.T) {
 	options := partOptions()
 	resource := newParts(t, options)
-	fields := resource.Fields()
 	byName := map[string]query.Field{}
-	for _, field := range fields {
+	for _, field := range resource.Fields() {
 		byName[field.Name] = field
 	}
 	require.True(t, byName["price"].Nullable, "pointer field")
@@ -92,15 +143,6 @@ func TestResourceDerivesNullableAndCopies(t *testing.T) {
 	require.False(t, byName["createdAt"].Nullable, "value field")
 	require.False(t, byName["name"].Nullable)
 	require.False(t, options.Fields[3].Nullable, "the caller's fields are untouched")
-
-	fields[0].Name = "changed"
-	require.Equal(t, "id", resource.Fields()[0].Name)
-	options.DefaultSort[0].Field = "changed"
-	require.Equal(t, "createdAt", resource.DefaultSort()[0].Field)
-	options.Item.Field = "changed"
-	require.Equal(t, "id", resource.Item().Field)
-	options.Tables[0] = "changed"
-	require.Equal(t, []string{"parts"}, resource.Tables())
 }
 
 func TestResourceAccessors(t *testing.T) {
@@ -121,6 +163,7 @@ func TestResourceAccessors(t *testing.T) {
 	require.Equal(t, reflect.TypeFor[part](), resource.ItemType())
 	require.Empty(t, resource.Parameters())
 	require.NotNil(t, resource.Check())
+	require.Nil(t, resource.Partition())
 	decoded, err := resource.DecodeParameters(livewire.MapSource{})
 	require.NoError(t, err)
 	require.Equal(t, &livewire.NoParameters{}, decoded)
@@ -165,16 +208,23 @@ func TestResourceListQuery(t *testing.T) {
 		require.NoError(t, err)
 		text, arguments := listQuery.PageSQL(specification)
 		require.Contains(t, text, "(parts.type) = $2")
-		require.Contains(t, text, "ILIKE $3")
+		require.Contains(t, text, "(parts.name) ILIKE $3")
+		require.NotContains(t, text, "parts.notes", "search skips the guarded searchable field")
 		require.Contains(t, text, "ORDER BY (parts.name) ASC, parts.id ASC")
 		require.Equal(t, []any{"t1", "bolt", "%m8%", 10, 20}, arguments)
+	})
+	t.Run("admin searches the guarded field too", func(t *testing.T) {
+		listQuery, err := resource.ListQuery(adminContext(), &livewire.ReadParameters{Filter: json.RawMessage(`{"search":"m8"}`)})
+		require.NoError(t, err)
+		text, _ := listQuery.PageSQL(specification)
+		require.Contains(t, text, "(parts.notes) ILIKE")
 	})
 	t.Run("limit is clamped", func(t *testing.T) {
 		listQuery, err := resource.ListQuery(userContext(), &livewire.ReadParameters{Limit: "500"})
 		require.NoError(t, err)
 		require.Equal(t, 50, listQuery.Limit)
 	})
-	t.Run("admin sees the guarded field", func(t *testing.T) {
+	t.Run("admin filters and sorts the guarded field", func(t *testing.T) {
 		_, err := resource.ListQuery(adminContext(), &livewire.ReadParameters{Filter: json.RawMessage(`{"where":{"field":"secret","op":"eq","value":"x"}}`), Sort: "secret"})
 		require.NoError(t, err)
 	})
@@ -189,7 +239,10 @@ func TestResourceListQuery(t *testing.T) {
 		{name: "unknown filter field is 400", parameters: &livewire.ReadParameters{Filter: json.RawMessage(`{"where":{"field":"nope","op":"eq","value":"x"}}`)}, status: http.StatusBadRequest, code: livewire.CodeInvalidFilter, field: "where.field"},
 		{name: "guarded filter field is 403", parameters: &livewire.ReadParameters{Filter: json.RawMessage(`{"where":{"field":"secret","op":"eq","value":"x"}}`)}, status: http.StatusForbidden, code: livewire.CodeForbiddenField, field: "secret"},
 		{name: "guarded field nested in a visible condition is 403", parameters: &livewire.ReadParameters{Filter: json.RawMessage(`{"where":{"and":[{"field":"name","op":"eq","value":"x"},{"field":"secret","op":"isNull","value":true}]}}`)}, status: http.StatusForbidden, code: livewire.CodeForbiddenField, field: "secret"},
-		{name: "unknown and guarded: unknown wins", parameters: &livewire.ReadParameters{Filter: json.RawMessage(`{"where":{"and":[{"field":"secret","op":"eq","value":"x"},{"field":"nope","op":"eq","value":"x"}]}}`)}, status: http.StatusBadRequest, code: livewire.CodeInvalidFilter, field: "where.and[1].field"},
+		{name: "unknown and guarded in the filter: unknown wins", parameters: &livewire.ReadParameters{Filter: json.RawMessage(`{"where":{"and":[{"field":"secret","op":"eq","value":"x"},{"field":"nope","op":"eq","value":"x"}]}}`)}, status: http.StatusBadRequest, code: livewire.CodeInvalidFilter, field: "where.and[1].field"},
+		{name: "guarded filter and unknown sort: unknown wins", parameters: &livewire.ReadParameters{Filter: json.RawMessage(`{"where":{"field":"secret","op":"eq","value":"x"}}`), Sort: "nope"}, status: http.StatusBadRequest, code: livewire.CodeInvalidSort, field: "sort[0]"},
+		{name: "guarded sort and bad page: bad page wins", parameters: &livewire.ReadParameters{Sort: "secret", Limit: "-1"}, status: http.StatusBadRequest, code: livewire.CodeInvalidPage, field: "limit"},
+		{name: "guarded sort and bad cursor: bad cursor wins", parameters: &livewire.ReadParameters{Sort: "secret", After: "x"}, status: http.StatusBadRequest, code: livewire.CodeInvalidRequest, field: "after"},
 		{name: "malformed filter", parameters: &livewire.ReadParameters{Filter: json.RawMessage(`{`)}, status: http.StatusBadRequest, code: livewire.CodeInvalidFilter},
 		{name: "unknown sort is 400", parameters: &livewire.ReadParameters{Sort: "nope"}, status: http.StatusBadRequest, code: livewire.CodeInvalidSort, field: "sort[0]"},
 		{name: "guarded sort is 403", parameters: &livewire.ReadParameters{Sort: "-secret"}, status: http.StatusForbidden, code: livewire.CodeForbiddenField, field: "secret"},
@@ -204,7 +257,7 @@ func TestResourceListQuery(t *testing.T) {
 	}
 }
 
-func TestResourceListQueryCursorAndScopeError(t *testing.T) {
+func TestResourceListQueryCursor(t *testing.T) {
 	options := partOptions()
 	options.Cursor = true
 	resource := newParts(t, options)
@@ -222,9 +275,21 @@ func TestResourceListQueryCursorAndScopeError(t *testing.T) {
 	_, err = resource.ListQuery(userContext(), &livewire.ReadParameters{Sort: "name", After: "not-a-cursor"})
 	requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidCursor, "after")
 
+	t.Run("default sort round trip", func(t *testing.T) {
+		firstPage, err := resource.ListQuery(userContext(), &livewire.ReadParameters{})
+		require.NoError(t, err)
+		next, err := firstPage.NextCursor([]any{"2026-01-01T00:00:00Z"}, "3f7b2c10-9e1d-4a6b-8c2f-1a2b3c4d5e6f").Encode()
+		require.NoError(t, err)
+		secondPage, err := resource.ListQuery(userContext(), &livewire.ReadParameters{After: next})
+		require.NoError(t, err)
+		require.NotNil(t, secondPage.Cursor)
+	})
+}
+
+func TestResourceListQueryScopeError(t *testing.T) {
 	failing := partOptions()
 	failing.Scope = func(context.Context) (query.Predicate, error) { return nil, errors.New("tenant unknown") }
-	_, err = newParts(t, failing).ListQuery(userContext(), &livewire.ReadParameters{})
+	_, err := newParts(t, failing).ListQuery(userContext(), &livewire.ReadParameters{})
 	require.ErrorContains(t, err, "tenant unknown")
 }
 
@@ -243,23 +308,25 @@ func TestResourceDistinctQuery(t *testing.T) {
 	require.NoError(t, err)
 
 	refusals := []struct {
-		name   string
-		field  string
-		status int
-		code   livewire.Code
+		name       string
+		parameters *livewire.ReadParameters
+		status     int
+		code       livewire.Code
 	}{
-		{name: "missing", field: "", status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
-		{name: "unknown", field: "nope", status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
-		{name: "guarded", field: "secret", status: http.StatusForbidden, code: livewire.CodeForbiddenField},
+		{name: "missing", parameters: &livewire.ReadParameters{}, status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
+		{name: "unknown", parameters: &livewire.ReadParameters{Field: "nope"}, status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
+		{name: "array field", parameters: &livewire.ReadParameters{Field: "tags"}, status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
+		{name: "guarded", parameters: &livewire.ReadParameters{Field: "secret"}, status: http.StatusForbidden, code: livewire.CodeForbiddenField},
+		{name: "guarded field and unknown filter: unknown wins", parameters: &livewire.ReadParameters{Field: "secret", Filter: json.RawMessage(`{"where":{"field":"nope","op":"eq","value":1}}`)}, status: http.StatusBadRequest, code: livewire.CodeInvalidFilter},
+		{name: "guarded filter and unknown distinct field: unknown wins", parameters: &livewire.ReadParameters{Field: "nope", Filter: json.RawMessage(`{"where":{"field":"secret","op":"eq","value":"x"}}`)}, status: http.StatusBadRequest, code: livewire.CodeInvalidRequest},
+		{name: "unknown sort", parameters: &livewire.ReadParameters{Field: "type", Sort: "nope"}, status: http.StatusBadRequest, code: livewire.CodeInvalidSort},
 	}
 	for _, testCase := range refusals {
 		t.Run(testCase.name, func(t *testing.T) {
-			_, _, err := resource.DistinctQuery(userContext(), &livewire.ReadParameters{Field: testCase.field})
+			_, _, err := resource.DistinctQuery(userContext(), testCase.parameters)
 			requireError(t, err, testCase.status, testCase.code, "")
 		})
 	}
-	_, _, err = resource.DistinctQuery(userContext(), &livewire.ReadParameters{Field: "type", Sort: "nope"})
-	requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidSort, "sort[0]")
 }
 
 func TestResourceItemQuery(t *testing.T) {
@@ -272,7 +339,8 @@ func TestResourceItemQuery(t *testing.T) {
 
 	_, err = resource.ItemQuery(userContext(), livewire.MapSource{})
 	requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "id")
-	fields := requireError(t, resourceItemError(resource, "not-a-uuid"), http.StatusBadRequest, livewire.CodeInvalidRequest, "id")
+	_, err = resource.ItemQuery(userContext(), livewire.MapSource{"id": "not-a-uuid"})
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "id")
 	require.Equal(t, "must be a uuid", fields["id"])
 
 	type numbered struct {
@@ -295,11 +363,6 @@ func TestResourceItemQuery(t *testing.T) {
 	requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "number")
 	_, err = byNumber.ItemQuery(userContext(), livewire.MapSource{"number": "42"})
 	requireError(t, err, http.StatusForbidden, livewire.CodeForbiddenField, "number")
-}
-
-func resourceItemError(resource *livewire.Resource, id string) error {
-	_, err := resource.ItemQuery(userContext(), livewire.MapSource{"id": id})
-	return err
 }
 
 func TestResourceLoaders(t *testing.T) {

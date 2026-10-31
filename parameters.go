@@ -13,7 +13,7 @@ import (
 
 // ParameterSource hands the decoder the raw values of a request: path values by name and
 // query values by name, where a query key may repeat. The REST adapter builds one from the
-// route, the engine from a RequestFrame's Params (MapSource).
+// route, the engine from a RequestFrame's Parameters (MapSource).
 type ParameterSource interface {
 	Path(name string) (string, bool)
 	Query(name string) ([]string, bool)
@@ -91,25 +91,61 @@ func compileParameters(parametersType reflect.Type, path string) (*parameterSpec
 	if parametersType.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("parameters type %s is not a struct", parametersType)
 	}
-	spec := &parameterSpec{parametersType: parametersType}
-	if err := spec.collect(parametersType, nil); err != nil {
+	specification := &parameterSpec{parametersType: parametersType}
+	if err := specification.collect(parametersType, nil); err != nil {
 		return nil, err
 	}
 	placeholders, err := pathPlaceholders(path)
 	if err != nil {
 		return nil, err
 	}
-	for _, field := range spec.fields {
+	for _, field := range specification.fields {
 		if field.In == InPath && !slices.Contains(placeholders, field.Name) {
 			return nil, fmt.Errorf("path parameter %q is not in the path %q", field.Name, path)
 		}
 	}
 	for _, placeholder := range placeholders {
-		if !spec.hasPath(placeholder) {
+		if !specification.hasPath(placeholder) {
 			return nil, fmt.Errorf("the path %q has no field tagged path:%q", path, placeholder)
 		}
 	}
-	return spec, nil
+	return specification, nil
+}
+
+// decode fills a new parameters value from source. A missing or empty path parameter, a
+// repeated scalar parameter and a value of the wrong form answer Invalid naming the
+// parameter; a missing query parameter leaves its field zero.
+func (s *parameterSpec) decode(source ParameterSource) (any, error) {
+	parameters := reflect.New(s.parametersType)
+	for _, field := range s.fields {
+		values, err := readValues(source, field.Parameter)
+		if err != nil {
+			return nil, err
+		}
+		if values == nil {
+			continue
+		}
+		target := parameters.Elem().FieldByIndex(field.index)
+		if field.List {
+			err = setList(target, field.Parameter, values)
+		} else {
+			err = setScalar(target, field.Parameter, values[0])
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return parameters.Interface(), nil
+}
+
+func (s *parameterSpec) parameters() []Parameter {
+	parameters := make([]Parameter, 0, len(s.fields))
+	for _, field := range s.fields {
+		parameter := field.Parameter
+		parameter.Enum = slices.Clone(parameter.Enum)
+		parameters = append(parameters, parameter)
+	}
+	return parameters
 }
 
 func (s *parameterSpec) collect(structType reflect.Type, prefix []int) error {
@@ -118,10 +154,8 @@ func (s *parameterSpec) collect(structType reflect.Type, prefix []int) error {
 		index := append(slices.Clone(prefix), position)
 		location, name := parameterTag(field)
 		if name == "" {
-			if field.Anonymous && field.Type.Kind() == reflect.Struct {
-				if err := s.collect(field.Type, index); err != nil {
-					return err
-				}
+			if err := s.collectEmbedded(field, index); err != nil {
+				return err
 			}
 			continue
 		}
@@ -135,6 +169,22 @@ func (s *parameterSpec) collect(structType reflect.Type, prefix []int) error {
 		s.fields = append(s.fields, parameterField{Parameter: parameter, index: index})
 	}
 	return nil
+}
+
+// collectEmbedded flattens an embedded struct by value; an embedded pointer is refused
+// because its fields could not be decoded into a nil pointer.
+func (s *parameterSpec) collectEmbedded(field reflect.StructField, index []int) error {
+	if !field.Anonymous {
+		return nil
+	}
+	switch field.Type.Kind() {
+	case reflect.Struct:
+		return s.collect(field.Type, index)
+	case reflect.Pointer:
+		return fmt.Errorf("embedded %s: embed parameters structs by value", field.Type)
+	default:
+		return nil
+	}
 }
 
 func (s *parameterSpec) lookup(name string) *parameterField {
@@ -151,16 +201,6 @@ func (s *parameterSpec) hasPath(name string) bool {
 	return field != nil && field.In == InPath
 }
 
-func (s *parameterSpec) parameters() []Parameter {
-	parameters := make([]Parameter, 0, len(s.fields))
-	for _, field := range s.fields {
-		parameter := field.Parameter
-		parameter.Enum = slices.Clone(parameter.Enum)
-		parameters = append(parameters, parameter)
-	}
-	return parameters
-}
-
 func parameterTag(field reflect.StructField) (ParameterIn, string) {
 	if name := field.Tag.Get(string(InPath)); name != "" {
 		return InPath, name
@@ -173,10 +213,11 @@ func parameterTag(field reflect.StructField) (ParameterIn, string) {
 
 func describeParameter(field reflect.StructField, location ParameterIn, name string) (Parameter, error) {
 	parameter := Parameter{Name: name, In: location, Type: field.Type}
-	if !field.IsExported() {
+	taggedTwice := field.Tag.Get(string(InPath)) != "" && field.Tag.Get(string(InQuery)) != ""
+	switch {
+	case !field.IsExported():
 		return parameter, fmt.Errorf("parameter %q is the unexported field %s", name, field.Name)
-	}
-	if field.Tag.Get(string(InPath)) != "" && field.Tag.Get(string(InQuery)) != "" {
+	case taggedTwice:
 		return parameter, fmt.Errorf("parameter %q is tagged path and query", name)
 	}
 	if enum, ok := field.Tag.Lookup("enum"); ok {
@@ -184,19 +225,18 @@ func describeParameter(field reflect.StructField, location ParameterIn, name str
 	}
 	scalar := field.Type
 	if scalar.Kind() == reflect.Slice {
-		if location != InQuery || scalar.Elem().Kind() != reflect.String {
+		stringList := location == InQuery && scalar.Elem().Kind() == reflect.String
+		if !stringList {
 			return parameter, fmt.Errorf("parameter %q: a list parameter is a query parameter of string elements, not %s", name, field.Type)
 		}
 		parameter.List = true
 		scalar = scalar.Elem()
 	}
-	if scalar.Kind() == reflect.Pointer {
-		scalar = scalar.Elem()
-	}
-	if !supportedParameterType(scalar) {
+	scalar = unwrapPointer(scalar)
+	switch {
+	case !supportedParameterType(scalar):
 		return parameter, fmt.Errorf("parameter %q has the unsupported type %s", name, field.Type)
-	}
-	if parameter.Enum != nil && scalar.Kind() != reflect.String {
+	case parameter.Enum != nil && scalar.Kind() != reflect.String:
 		return parameter, fmt.Errorf("parameter %q has enum values but is %s, not a string", name, field.Type)
 	}
 	return parameter, nil
@@ -225,9 +265,10 @@ func pathPlaceholders(path string) ([]string, error) {
 		switch {
 		case segment == "":
 			return nil, fmt.Errorf("the path %q has an empty segment", path)
-		case strings.HasPrefix(segment, "{") && strings.HasSuffix(segment, "}") && len(segment) > 2:
+		case isPlaceholder(segment):
 			name := segment[1 : len(segment)-1]
-			if strings.ContainsAny(name, "{}") || slices.Contains(placeholders, name) {
+			malformed := strings.ContainsAny(name, "{}") || slices.Contains(placeholders, name)
+			if malformed {
 				return nil, fmt.Errorf("the path %q has a malformed or repeated placeholder %q", path, segment)
 			}
 			placeholders = append(placeholders, name)
@@ -238,47 +279,32 @@ func pathPlaceholders(path string) ([]string, error) {
 	return placeholders, nil
 }
 
-// decode fills a new parameters value from source. A missing or empty path parameter and a
-// value of the wrong form answer Invalid naming the parameter; a missing query parameter
-// leaves its field zero.
-func (s *parameterSpec) decode(source ParameterSource) (any, error) {
-	parameters := reflect.New(s.parametersType)
-	for _, field := range s.fields {
-		values, err := readValues(source, field.Parameter)
-		if err != nil {
-			return nil, err
-		}
-		if values == nil {
-			continue
-		}
-		target := parameters.Elem().FieldByIndex(field.index)
-		if field.List {
-			err = setList(target, field.Parameter, values)
-		} else {
-			err = setScalar(target, field.Parameter, values[0])
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-	return parameters.Interface(), nil
+func isPlaceholder(segment string) bool {
+	return len(segment) > 2 && strings.HasPrefix(segment, "{") && strings.HasSuffix(segment, "}")
 }
 
 // readValues returns the raw values of a parameter, nil when it is absent.
 func readValues(source ParameterSource, parameter Parameter) ([]string, error) {
-	var values []string
 	if parameter.In == InPath {
 		value, ok := source.Path(parameter.Name)
 		if !ok || value == "" {
 			return nil, invalidParameter(parameter.Name, "required")
 		}
-		values = []string{value}
-	} else {
-		var ok bool
-		values, ok = source.Query(parameter.Name)
-		if !ok || len(values) == 0 || (len(values) == 1 && values[0] == "") {
-			return nil, nil
-		}
+		return []string{value}, nil
+	}
+	return readQueryValues(source, parameter.Name, parameter.List)
+}
+
+// readQueryValues returns the values of a query key: nil when the key is absent or its one
+// value is empty, an error when a scalar key repeats.
+func readQueryValues(source ParameterSource, name string, list bool) ([]string, error) {
+	values, ok := source.Query(name)
+	absent := !ok || len(values) == 0 || (len(values) == 1 && values[0] == "")
+	switch {
+	case absent:
+		return nil, nil
+	case !list && len(values) > 1:
+		return nil, invalidParameter(name, "must not repeat")
 	}
 	return values, nil
 }

@@ -12,7 +12,26 @@ import (
 // The interfaces the engine consumes and the adapters implement (D3). The core declares
 // them so it imports no driver; postgresadapter implements the stores and the feed, auth's
 // session.Guard or an API-key resolver the IdentitySource. Every implementation must be
-// safe for concurrent use.
+// safe for concurrent use. Every stored row carries the tenant of D42 and every lookup is
+// scoped by it: with a single tenant the tenant is "" everywhere and changes nothing.
+
+// Owner scopes a stored row to who stored it: the identity key "provider:subject" and the
+// tenant of the request (D42, "" in a single-tenant registry). Two owners are the same only
+// when both parts are equal; a key of another owner is a fresh key (section 6).
+type Owner struct {
+	Key    string
+	Tenant string
+}
+
+// OwnerOf is the owner of the identity in ctx under the tenant in ctx (TenantFrom); the key
+// is "" without an identity.
+func OwnerOf(ctx context.Context) Owner {
+	owner := Owner{Tenant: TenantFrom(ctx)}
+	if identity := auth.IdentityFrom(ctx); identity != nil {
+		owner.Key = identity.Provider + ":" + identity.Subject
+	}
+	return owner
+}
 
 // ChangeOperation is what happened to a row.
 type ChangeOperation string
@@ -44,43 +63,56 @@ type ChangeFeed interface {
 }
 
 // IdentitySource re-validates who a socket acts as (D6): the engine calls Identify with the
-// upgrade request on every subscribe, call, re-run and tick. A nil identity with a nil
-// error means the identity is gone (no session, expired, revoked) and closes the socket
-// with CloseIdentityGone; an error is a failure of the source and is retried.
+// upgrade request on every subscribe, call, re-run and tick. The identity is gone, and the
+// socket closes with CloseIdentityGone, when the source returns an error matching
+// auth.ErrUnauthenticated (no session, expired, revoked: what session.Guard.Identify
+// returns) or auth.ErrForbidden (a refused refresh), or a nil identity with a nil error. Any
+// other error is a failure of the source: the engine keeps the last identity and retries.
 type IdentitySource interface {
 	Identify(ctx context.Context, request *http.Request) (*auth.Identity, error)
 }
 
-// Transaction is the engine's mutation transaction (D31) as the core sees it. Exactly one
-// of Commit and Rollback is called, once.
+// Transaction is an engine transaction (D31, D42) as the core sees it. Only the engine holds
+// it: exactly one of Commit and Rollback is called, once. Handle is the adapter's query
+// handle (a pgx.Tx for postgresadapter) that the engine puts into the handler's context
+// (WithTransaction) so repositories run in the transaction without being able to end it.
 type Transaction interface {
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
+	Handle() any
 }
 
-// TransactionInfo is what the transaction records as the actor of the mutation (D31, D32):
-// the effective identity (its Real() is the real actor), the mutation's name and the
-// request id. Mutation is empty and Parameters nil for a batch's outer transaction.
+// TransactionInfo is what a transaction records for the triggers and policies (D31, D32,
+// D42): the tenant (SET LOCAL livewire.tenant, "" with a single tenant), the effective
+// identity (its Real() is the real actor), the mutation's name and decoded parameters and
+// the request id (SET LOCAL livewire.actor). ReadOnly marks the REPEATABLE READ READ ONLY
+// transaction of a read (ListPage): it carries the tenant and no actor; Mutation is empty
+// then and for a batch's outer transaction.
 type TransactionInfo struct {
+	Tenant     string
 	Identity   *auth.Identity
 	Mutation   string
 	Parameters any
 	RequestID  string
+	ReadOnly   bool
 }
 
-// Transactor begins the mutation transaction (D31). The implementation sets the actor of
-// info for the triggers (SET LOCAL) before it returns.
+// Transactor begins an engine transaction (D31, D42). The implementation sets the tenant and,
+// for a write, the actor of transactionInfo (SET LOCAL) before it returns, so triggers and
+// Row Level Security policies see them.
 type Transactor interface {
-	Begin(ctx context.Context, info TransactionInfo) (Transaction, error)
+	Begin(ctx context.Context, transactionInfo TransactionInfo) (Transaction, error)
 }
 
-// StoredFilter is a filter document a client stored for a resource (D13). Owner is the
-// identity key "provider:subject"; Name is empty for an unnamed filter, which is swept
-// after 30 days without use; Hash is query.Hash of Document.
+// StoredFilter is a filter document a client stored for a resource (D13). Context is the
+// app's dimension of the dedup key (a view or page name, "" for none); Name is empty for an
+// unnamed filter, which is swept after 30 days without use; Hash is query.Hash of Document.
+// Dedup is per owner, resource, context and hash.
 type StoredFilter struct {
 	ID         string
-	Owner      string
+	Owner      Owner
 	Resource   string
+	Context    string
 	Name       string
 	Document   json.RawMessage
 	Hash       string
@@ -88,38 +120,43 @@ type StoredFilter struct {
 	LastUsedAt time.Time
 }
 
-// FilterStore keeps the stored filters of D13. Filters are visible to their owner only:
-// every method takes the owner and treats another owner's filter as absent.
+// FilterStore keeps the stored filters of D13. Filters are visible to their owner only, the
+// tenant included: every method takes the owner and treats another owner's filter as absent.
 type FilterStore interface {
 	// Save stores filter and returns the stored one with its ID; an unnamed filter whose
-	// Hash the owner already stored for the resource returns that filter instead of a copy.
+	// Hash the owner already stored for the resource and context returns that filter.
 	Save(ctx context.Context, filter *StoredFilter) (*StoredFilter, error)
 	// Get returns the owner's filter and marks it used; it returns NotFound when there is
 	// none.
-	Get(ctx context.Context, owner, id string) (*StoredFilter, error)
+	Get(ctx context.Context, owner Owner, id string) (*StoredFilter, error)
 	// List returns the owner's filters of a resource, every resource when resource is empty.
-	List(ctx context.Context, owner, resource string) ([]StoredFilter, error)
+	List(ctx context.Context, owner Owner, resource string) ([]StoredFilter, error)
 	// Delete removes the owner's filter; a filter that is not there is no error.
-	Delete(ctx context.Context, owner, id string) error
+	Delete(ctx context.Context, owner Owner, id string) error
 }
 
 // IdempotencyRecord is the recorded answer of a mutation call (D16): the owner, the key the
-// client sent, and the status and body that were answered. Status is 0 while the call is in
-// flight.
+// client sent, the mutation it was sent for, and the status and body that were answered.
+// Status is 0 while the call is in flight.
 type IdempotencyRecord struct {
-	Owner    string
+	Owner    Owner
 	Key      string
+	Mutation string
 	Status   int
 	Response json.RawMessage
 }
 
 // IdempotencyStore keeps the records of D16. Both methods run inside the mutation's
-// transaction (TransactionFrom(ctx)), so a rolled-back call frees its key.
+// transaction (TransactionFrom(ctx)), so a rolled-back call frees its key. Reserve must not
+// block on another transaction's reservation of the same key: the postgresadapter takes
+// pg_try_advisory_xact_lock over a hash of the owner and key, answers InProgress when the
+// lock is held, replays a committed record, and inserts the reservation otherwise.
 type IdempotencyStore interface {
-	// Reserve claims the key for the owner. A fresh key returns replay false; a key whose
-	// call finished returns the record and replay true; a key whose call is still in flight
-	// returns InProgress.
-	Reserve(ctx context.Context, owner, key string) (record *IdempotencyRecord, replay bool, err error)
+	// Reserve claims the key for the owner and mutation. A fresh key returns replay false;
+	// a key whose call finished returns the record and replay true; a key whose call is
+	// still in flight returns InProgress; a key recorded for another mutation returns
+	// Conflict.
+	Reserve(ctx context.Context, owner Owner, key, mutation string) (record *IdempotencyRecord, replay bool, err error)
 	// Record stores the answer of a reserved key.
 	Record(ctx context.Context, record *IdempotencyRecord) error
 }
@@ -128,7 +165,7 @@ type IdempotencyStore interface {
 // display name, the target and key that name the record, and the client's state.
 type Presence struct {
 	Socket    string
-	Owner     string
+	Owner     Owner
 	Display   string
 	Target    string
 	Key       string
@@ -137,7 +174,7 @@ type Presence struct {
 }
 
 // PresenceStore keeps the rows of D37; a change to them reaches the engine through the
-// ChangeFeed like any other table.
+// ChangeFeed like any other table. A record is named by tenant, target and key.
 type PresenceStore interface {
 	// Join inserts or updates the socket's presence on the record.
 	Join(ctx context.Context, presence *Presence) error
@@ -145,8 +182,8 @@ type PresenceStore interface {
 	Leave(ctx context.Context, socket, target, key string) error
 	// Heartbeat refreshes UpdatedAt of every presence of the socket.
 	Heartbeat(ctx context.Context, socket string) error
-	// List returns the presences on a record.
-	List(ctx context.Context, target, key string) ([]Presence, error)
+	// List returns the presences on a record of the tenant.
+	List(ctx context.Context, tenant, target, key string) ([]Presence, error)
 	// Sweep removes every presence older than maximumAge and returns how many.
 	Sweep(ctx context.Context, maximumAge time.Duration) (int, error)
 }
@@ -165,15 +202,17 @@ const (
 )
 
 // Outcome is one unit of work the engine or an adapter finished (D4, D30). Target is the
-// declaration's name; Op is set on the socket, empty on REST; Subscription is set for
-// subscribe and rerun; Parameters is the decoded parameters value (a *Params) when they
-// were decoded; Status is the HTTP status answered; Err is the refusal or failure, with the
-// server-side Reason of an *auth.Error, and nil on success.
+// declaration's name; Operation is set on the socket, empty on REST; Subscription is set for
+// subscribe and rerun; Tenant is the resolved tenant (D42); Parameters is the decoded
+// parameters value (a *Parameters) when they were decoded; Status is the HTTP status answered;
+// Err is the refusal or failure, with the server-side Reason of an *auth.Error, and nil on
+// success.
 type Outcome struct {
 	Kind         OutcomeKind
-	Op           Op
+	Operation    Operation
 	Target       string
 	Subscription string
+	Tenant       string
 	Identity     *auth.Identity
 	Parameters   any
 	Status       int

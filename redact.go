@@ -3,37 +3,64 @@ package livewire
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/govengers/livewire/query"
 )
 
-// Redact strips the fields whose Read check refuses the identity in ctx from raw, which is
-// the marshaled list of items or one marshaled item (D39). Fields that are visible or absent
-// from the JSON are left alone; a raw value without guarded fields is returned as it is,
-// otherwise the result is re-marshaled with its keys sorted.
-func Redact(ctx context.Context, fields query.Fields, raw json.RawMessage) (json.RawMessage, error) {
+// RedactItems strips the fields whose Read check refuses the identity in ctx from every item
+// of raw, a marshaled JSON array of objects (D39). Fields that are visible or absent are left
+// alone; a raw value without guarded fields is returned as it is, otherwise the result is
+// re-marshaled with its keys sorted. Anything but an array of objects is an error, so a
+// wrong caller fails instead of leaking.
+func RedactItems(ctx context.Context, fields query.Fields, raw json.RawMessage) (json.RawMessage, error) {
 	hidden := hiddenFields(ctx, fields)
 	if len(hidden) == 0 {
 		return raw, nil
 	}
 	var items []map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &items); err == nil {
-		for _, item := range items {
-			for name := range hidden {
-				delete(item, name)
-			}
+	if err := json.Unmarshal(raw, &items); err != nil || items == nil {
+		return nil, errors.New("livewire: redact: the value is not a JSON array of objects")
+	}
+	for _, item := range items {
+		if item == nil {
+			return nil, errors.New("livewire: redact: the array holds a null item")
 		}
-		return marshalRedacted(items)
+		for name := range hidden {
+			delete(item, name)
+		}
+	}
+	return marshalRedacted(items)
+}
+
+// RedactItem is RedactItems for one marshaled object.
+func RedactItem(ctx context.Context, fields query.Fields, raw json.RawMessage) (json.RawMessage, error) {
+	hidden := hiddenFields(ctx, fields)
+	if len(hidden) == 0 {
+		return raw, nil
 	}
 	var item map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &item); err != nil {
-		return nil, fmt.Errorf("livewire: redact: the value is neither a list nor an object: %w", err)
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return nil, errors.New("livewire: redact: the value is not a JSON object")
 	}
 	for name := range hidden {
 		delete(item, name)
 	}
 	return marshalRedacted(item)
+}
+
+// hiddenFields names the fields whose Read check refuses ctx; the one visibility rule is
+// query.Fields.Visible.
+func hiddenFields(ctx context.Context, fields query.Fields) map[string]bool {
+	visible := fields.Visible(ctx)
+	hidden := map[string]bool{}
+	for _, field := range fields {
+		if _, ok := visible.Lookup(field.Name); !ok {
+			hidden[field.Name] = true
+		}
+	}
+	return hidden
 }
 
 func marshalRedacted(value any) (json.RawMessage, error) {
@@ -44,28 +71,7 @@ func marshalRedacted(value any) (json.RawMessage, error) {
 	return redacted, nil
 }
 
-// hiddenFields names the fields whose Read check refuses ctx.
-func hiddenFields(ctx context.Context, fields query.Fields) map[string]bool {
-	hidden := map[string]bool{}
-	for _, field := range fields {
-		if field.Read != nil && field.Read(ctx) != nil {
-			hidden[field.Name] = true
-		}
-	}
-	return hidden
-}
-
-func visibleFields(fields query.Fields, hidden map[string]bool) query.Fields {
-	visible := make(query.Fields, 0, len(fields))
-	for _, field := range fields {
-		if !hidden[field.Name] {
-			visible = append(visible, field)
-		}
-	}
-	return visible
-}
-
-// guardedFields turns the guards of a typed-parameters declaration into fields Redact
+// guardedFields turns the guards of a typed-parameters declaration into fields the redaction
 // understands.
 func guardedFields(guarded []GuardedField) query.Fields {
 	fields := make(query.Fields, 0, len(guarded))

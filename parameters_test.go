@@ -2,6 +2,7 @@ package livewire_test
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"reflect"
 	"testing"
@@ -79,8 +80,7 @@ func TestDecodeParametersEveryKind(t *testing.T) {
 		Until:    new(since),
 		Note:     new("hi"),
 		Count:    9000000000,
-	}, parameters)
-	require.True(t, parameters.Until.Equal(since))
+	}, parameters, "times are decoded in UTC")
 }
 
 func TestDecodeParametersAbsentAndEmpty(t *testing.T) {
@@ -125,6 +125,20 @@ func TestDecodeParametersRefusals(t *testing.T) {
 			require.Equal(t, testCase.wantText, fields[testCase.wantField])
 		})
 	}
+}
+
+func TestDecodeParametersRefusesARepeatedScalar(t *testing.T) {
+	list := stats[everyParameter](t, "/stats/{id}/{name}")
+	require.NoError(t, addError(t, list))
+	source := querySource{path: map[string]string{"id": uuid.Nil.String(), "name": "x"}, query: map[string][]string{"status": {"open", "closed"}}}
+	_, err := list.DecodeParameters(source)
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "status")
+	require.Equal(t, "must not repeat", fields["status"])
+
+	source.query = map[string][]string{"statuses": {"open", "closed"}}
+	decoded, err := list.DecodeParameters(source)
+	require.NoError(t, err, "a list parameter repeats")
+	require.Equal(t, []status{"open", "closed"}, decoded.(*everyParameter).Statuses)
 }
 
 func TestParametersDescribe(t *testing.T) {
@@ -173,6 +187,12 @@ func TestParameterDeclarationErrors(t *testing.T) {
 	type withID struct {
 		ID string `path:"id"`
 	}
+	type embeddedPointerQuery struct {
+		*paging
+	}
+	type embeddedPointerPath struct {
+		*withID
+	}
 
 	testCases := []struct {
 		name string
@@ -187,6 +207,8 @@ func TestParameterDeclarationErrors(t *testing.T) {
 		{name: "list in the path", list: stats[pathList](t, "/stats/{names}"), want: "list parameter"},
 		{name: "enum on int", list: stats[enumOnInt](t, "/stats"), want: "enum values"},
 		{name: "declared twice", list: stats[duplicate](t, "/stats/{name}"), want: "declared twice"},
+		{name: "embedded pointer with query fields", list: stats[embeddedPointerQuery](t, "/stats"), want: "embed parameters structs by value"},
+		{name: "embedded pointer with a path field", list: stats[embeddedPointerPath](t, "/stats/{id}"), want: "embed parameters structs by value"},
 		{name: "placeholder without field", list: stats[livewire.NoParameters](t, "/stats/{id}"), want: "no field tagged path:\"id\""},
 		{name: "field without placeholder", list: stats[withID](t, "/stats"), want: "is not in the path"},
 		{name: "no leading slash", list: stats[livewire.NoParameters](t, "stats"), want: "does not start with a slash"},
@@ -207,14 +229,21 @@ func TestParameterDeclarationErrors(t *testing.T) {
 }
 
 func TestReadParametersFrom(t *testing.T) {
-	parameters := livewire.ReadParametersFrom(livewire.MapSource{
+	parameters, err := livewire.ReadParametersFrom(livewire.MapSource{
 		"filter": `{"search":"bolt"}`, "filterId": "f1", "sort": "-name", "limit": "10", "offset": "20", "after": "cursor", "field": "type",
 	})
+	require.NoError(t, err)
 	require.Equal(t, &livewire.ReadParameters{
 		Filter: []byte(`{"search":"bolt"}`), FilterID: "f1", Sort: "-name", Limit: "10", Offset: "20", After: "cursor", Field: "type",
 	}, parameters)
-	require.Equal(t, &livewire.ReadParameters{}, livewire.ReadParametersFrom(livewire.MapSource{}))
-	require.Nil(t, livewire.ReadParametersFrom(livewire.MapSource{"filter": ""}).Filter)
+
+	parameters, err = livewire.ReadParametersFrom(livewire.MapSource{"filter": ""})
+	require.NoError(t, err)
+	require.Equal(t, &livewire.ReadParameters{}, parameters)
+
+	_, err = livewire.ReadParametersFrom(querySource{query: map[string][]string{"filter": {`{}`, `{}`}}})
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "filter")
+	require.Equal(t, "must not repeat", fields["filter"])
 }
 
 // querySource is a ParameterSource with repeated query keys, as a REST adapter has them.
@@ -234,10 +263,7 @@ func (s querySource) Query(name string) ([]string, bool) {
 }
 
 func with(values map[string]string, name, value string) map[string]string {
-	extended := make(map[string]string, len(values)+1)
-	for key, existing := range values {
-		extended[key] = existing
-	}
+	extended := maps.Clone(values)
 	extended[name] = value
 	return extended
 }

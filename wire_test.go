@@ -17,12 +17,12 @@ func TestFrameRoundTrips(t *testing.T) {
 	}{
 		{
 			name:  "request",
-			frame: &livewire.RequestFrame{ID: "1", Op: livewire.OpCall, Target: "createPart", Params: map[string]string{"id": "7"}, Body: json.RawMessage(`{"name":"bolt"}`), IdempotencyKey: "key"},
+			frame: &livewire.RequestFrame{ID: "1", Operation: livewire.OperationCall, Target: "createPart", Parameters: map[string]string{"id": "7"}, Body: json.RawMessage(`{"name":"bolt"}`), IdempotencyKey: "key"},
 			want:  `{"id":"1","op":"call","target":"createPart","params":{"id":"7"},"body":{"name":"bolt"},"idempotencyKey":"key"}`,
 		},
 		{
 			name:  "request minimal",
-			frame: &livewire.RequestFrame{ID: "2", Op: livewire.OpPing},
+			frame: &livewire.RequestFrame{ID: "2", Operation: livewire.OperationPing},
 			want:  `{"id":"2","op":"ping"}`,
 		},
 		{
@@ -37,17 +37,17 @@ func TestFrameRoundTrips(t *testing.T) {
 		},
 		{
 			name:  "push",
-			frame: &livewire.PushFrame{Subscription: "s1", Sequence: 3, Kind: livewire.PushDiff, Payload: json.RawMessage(`{"upserts":[],"removes":["a"]}`)},
+			frame: &livewire.PushFrame{Subscription: "s1", Sequence: 3, Kind: livewire.PushListChange, Payload: json.RawMessage(`{"upserts":[],"removes":["a"]}`)},
 			want:  `{"sub":"s1","seq":3,"kind":"diff","payload":{"upserts":[],"removes":["a"]}}`,
 		},
 		{
-			name:  "diff",
-			frame: &livewire.Diff{Upserts: []json.RawMessage{json.RawMessage(`{"id":"a"}`)}, Removes: []string{}, Order: []string{"a"}, Total: new(1)},
+			name:  "list change",
+			frame: &livewire.ListChange{Upserts: []json.RawMessage{json.RawMessage(`{"id":"a"}`)}, Removes: []string{}, Order: []string{"a"}, Total: new(1)},
 			want:  `{"upserts":[{"id":"a"}],"removes":[],"order":["a"],"total":1}`,
 		},
 		{
-			name:  "diff without order and total",
-			frame: &livewire.Diff{Upserts: []json.RawMessage{}, Removes: []string{"b"}},
+			name:  "list change without order and total",
+			frame: &livewire.ListChange{Upserts: []json.RawMessage{}, Removes: []string{"b"}},
 			want:  `{"upserts":[],"removes":["b"]}`,
 		},
 	}
@@ -73,16 +73,17 @@ func newOf(frame any) any {
 	case *livewire.PushFrame:
 		return &livewire.PushFrame{}
 	default:
-		return &livewire.Diff{}
+		return &livewire.ListChange{}
 	}
 }
 
 func TestWireConstants(t *testing.T) {
 	require.Equal(t, 1000, livewire.CloseNormal)
+	require.Equal(t, 1001, livewire.CloseGoingAway)
 	require.Equal(t, 1013, livewire.CloseTooSlow)
 	require.Equal(t, 4401, livewire.CloseIdentityGone)
-	require.Equal(t, []livewire.Op{"query", "subscribe", "unsubscribe", "call", "batch", "join", "leave", "ping"},
-		[]livewire.Op{livewire.OpQuery, livewire.OpSubscribe, livewire.OpUnsubscribe, livewire.OpCall, livewire.OpBatch, livewire.OpJoin, livewire.OpLeave, livewire.OpPing})
+	require.Equal(t, []livewire.Operation{"query", "subscribe", "unsubscribe", "call", "batch", "join", "leave", "ping"},
+		[]livewire.Operation{livewire.OperationQuery, livewire.OperationSubscribe, livewire.OperationUnsubscribe, livewire.OperationCall, livewire.OperationBatch, livewire.OperationJoin, livewire.OperationLeave, livewire.OperationPing})
 	require.Equal(t, []livewire.PushKind{"snapshot", "diff", "replace", "error"},
-		[]livewire.PushKind{livewire.PushSnapshot, livewire.PushDiff, livewire.PushReplace, livewire.PushError})
+		[]livewire.PushKind{livewire.PushSnapshot, livewire.PushListChange, livewire.PushReplace, livewire.PushError})
 }

@@ -1,7 +1,6 @@
 package livewire
 
 import (
-	"errors"
 	"maps"
 	"net/http"
 
@@ -11,7 +10,7 @@ import (
 )
 
 // Code is the stable client-facing code of an error body. The set is closed: generated
-// clients switch on it.
+// clients switch on it, so a custom code of an *auth.Error is mapped to its kind's code.
 type Code string
 
 // The error codes. The invalid_* codes of the query package are repeated here so the set
@@ -33,7 +32,7 @@ const (
 
 // ErrorBody is the one JSON error shape of every REST response and socket error. Message
 // is fixed per code and safe to show; Fields names the offending parameters or body fields
-// with what is wrong with each.
+// (nested ones as a dotted path) with a fixed text per fault.
 type ErrorBody struct {
 	Code    Code              `json:"code"`
 	Message string            `json:"message"`
@@ -50,8 +49,7 @@ type Error struct {
 func (e *Error) Error() string {
 	text := string(e.Body.Code) + ": " + e.Body.Message
 	for _, name := range sortedKeys(e.Body.Fields) {
-		message := e.Body.Fields[name]
-		text += " (" + name + ": " + message + ")"
+		text += " (" + name + ": " + e.Body.Fields[name] + ")"
 	}
 	return text
 }
@@ -86,21 +84,78 @@ func ForbiddenField(name string) *Error {
 	return newError(http.StatusForbidden, CodeForbiddenField, map[string]string{name: "forbidden"})
 }
 
-// ResponseFor maps any error to the status and body a client gets. A *Error answers as it
-// is; a *query.Error answers 400 with its code and fields; the auth refusals (*auth.Error
-// and the bare sentinels) answer through auth.ResponseFor; anything else is a 500 with the
-// code internal and no text of the cause.
+// ResponseFor maps any error to the status and body a client gets. The outermost error of a
+// known kind in the chain decides, so a refusal that wraps a cause answers as the refusal:
+// a *Error answers as it is; a *query.Error answers 400 with its code and fields; an
+// *auth.Error or a bare auth sentinel answers its kind's status with the kind's code from
+// the closed set (a custom auth code is dropped); anything else is a 500 with the code
+// internal and no text of the cause.
 func ResponseFor(err error) (int, ErrorBody) {
-	var coreError *Error
-	if errors.As(err, &coreError) {
-		return coreError.Status, coreError.Body
+	for current := range errorChain(err) {
+		if status, body, ok := responseForOne(current); ok {
+			return status, body
+		}
 	}
-	var queryError *query.Error
-	if errors.As(err, &queryError) {
-		return http.StatusBadRequest, ErrorBody{Code: Code(queryError.Code), Message: queryError.Message, Fields: queryError.Fields}
+	status, response := auth.ResponseFor(nil)
+	return status, ErrorBody{Code: CodeInternal, Message: response.Message}
+}
+
+func responseForOne(err error) (int, ErrorBody, bool) {
+	switch typed := err.(type) { //nolint:errorlint // one node of the chain, not the chain: errors.As would look past it
+	case *Error:
+		return typed.Status, typed.Body, true
+	case *query.Error:
+		return http.StatusBadRequest, ErrorBody{Code: Code(typed.Code), Message: typed.Message, Fields: typed.Fields}, true
+	case *auth.Error:
+		return authResponse(typed.Kind)
 	}
-	status, response := auth.ResponseFor(err)
-	return status, ErrorBody{Code: Code(response.Code), Message: response.Message}
+	if _, isKind := authCodes[err]; isKind {
+		return authResponse(err)
+	}
+	return 0, ErrorBody{}, false
+}
+
+var authCodes = map[error]Code{
+	auth.ErrUnauthenticated: CodeUnauthenticated,
+	auth.ErrForbidden:       CodeForbidden,
+	auth.ErrInvalidRequest:  CodeInvalidRequest,
+	auth.ErrConflict:        CodeConflict,
+}
+
+func authResponse(kind error) (int, ErrorBody, bool) {
+	code, known := authCodes[kind]
+	if !known {
+		return 0, ErrorBody{}, false
+	}
+	status, response := auth.ResponseFor(kind)
+	return status, ErrorBody{Code: code, Message: response.Message}, true
+}
+
+// errorChain walks the error tree outermost first, depth first, like errors.As does.
+func errorChain(err error) func(yield func(error) bool) {
+	return func(yield func(error) bool) {
+		walkErrors(err, yield)
+	}
+}
+
+func walkErrors(err error, yield func(error) bool) bool {
+	if err == nil {
+		return true
+	}
+	if !yield(err) {
+		return false
+	}
+	switch unwrapper := err.(type) { //nolint:errorlint // this is the unwrapping itself
+	case interface{ Unwrap() error }:
+		return walkErrors(unwrapper.Unwrap(), yield)
+	case interface{ Unwrap() []error }:
+		for _, wrapped := range unwrapper.Unwrap() {
+			if !walkErrors(wrapped, yield) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 var messages = map[Code]string{

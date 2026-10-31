@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/govengers/auth"
 	"github.com/govengers/auth/authorization"
 	"github.com/stretchr/testify/require"
 
@@ -21,6 +22,18 @@ func newDashboard(name, path string) *livewire.Object {
 		Read: authorization.IsUser(),
 		Load: func(context.Context, *livewire.NoParameters) (*dashboard, error) { return &dashboard{Open: 1}, nil },
 	})
+}
+
+func newParameterizedList(name, path string) *livewire.List {
+	return livewire.NewList(name, path, &livewire.ListOptions[part, partID]{
+		Read: authorization.IsUser(),
+		Load: func(context.Context, *partID) ([]part, error) { return nil, nil },
+	})
+}
+
+// wrapped embeds a declaration kind, which forwards every method of the interface.
+type wrapped struct {
+	*livewire.Mutation
 }
 
 func TestNewRegistryValidatesBasePath(t *testing.T) {
@@ -42,32 +55,29 @@ func TestNewRegistryValidatesBasePath(t *testing.T) {
 
 func TestRegistryAddRefusals(t *testing.T) {
 	parts := func() *livewire.Resource { return livewire.NewResource("parts", "/parts", partOptions()) }
-	createMutation := func(options func(*livewire.MutationOptions[livewire.NoParameters, createPart, part])) *livewire.Mutation {
+	createMutation := func(options func(*createOptionsType)) *livewire.Mutation {
 		mutationOptions := createOptions()
 		options(mutationOptions)
 		return livewire.NewMutation("createPart", http.MethodPost, "/parts", mutationOptions)
 	}
+	var typedNil *livewire.Resource
 	testCases := []struct {
 		name         string
 		declarations []livewire.Declaration
 		want         string
 	}{
+		{name: "nil", declarations: []livewire.Declaration{nil}, want: "a nil declaration"},
+		{name: "typed nil", declarations: []livewire.Declaration{typedNil}, want: "a nil declaration"},
+		{name: "wrapped declaration", declarations: []livewire.Declaration{&wrapped{Mutation: createMutation(func(*createOptionsType) {})}}, want: "wraps a declaration"},
 		{name: "construction error", declarations: []livewire.Declaration{livewire.NewResource[part]("parts", "/parts", nil)}, want: `resource "parts": Check is required`},
 		{name: "duplicate name", declarations: []livewire.Declaration{parts(), newDashboard("parts", "/dashboard")}, want: `object "parts": the name is already registered`},
 		{name: "duplicate route", declarations: []livewire.Declaration{parts(), newDashboard("dashboard", "/parts")}, want: `the route GET /parts is already registered by "parts"`},
-		{name: "duplicate item route", declarations: []livewire.Declaration{parts(), newDashboard("dashboard", "/parts/distinct")}, want: `the route GET /parts/distinct is already registered`},
-		{name: "mutation resource missing", declarations: []livewire.Declaration{createMutation(func(options *livewire.MutationOptions[livewire.NoParameters, createPart, part]) {
-			options.Resource = "nope"
-		})}, want: `Resource "nope" is not a registered resource`},
-		{name: "mutation resource is a list", declarations: []livewire.Declaration{newDashboard("dashboard", "/dashboard"), createMutation(func(options *livewire.MutationOptions[livewire.NoParameters, createPart, part]) {
-			options.Resource = "dashboard"
-		})}, want: `Resource "dashboard" is not a registered resource`},
-		{name: "effect target missing", declarations: []livewire.Declaration{createMutation(func(options *livewire.MutationOptions[livewire.NoParameters, createPart, part]) {
-			options.Effect = livewire.Upserts("nope")
-		})}, want: `Effect target "nope" is not a registered list`},
-		{name: "effect target is an object", declarations: []livewire.Declaration{newDashboard("dashboard", "/dashboard"), createMutation(func(options *livewire.MutationOptions[livewire.NoParameters, createPart, part]) {
-			options.Effect = livewire.Upserts("dashboard")
-		})}, want: `Effect target "dashboard" is not a registered list`},
+		{name: "duplicate distinct route", declarations: []livewire.Declaration{parts(), newDashboard("dashboard", "/parts/distinct")}, want: `the route GET /parts/distinct is already registered`},
+		{name: "duplicate route with another placeholder name", declarations: []livewire.Declaration{parts(), newParameterizedList("byPart", "/parts/{id}")}, want: `the route GET /parts/{id} is already registered by "parts"`},
+		{name: "mutation resource missing", declarations: []livewire.Declaration{createMutation(func(options *createOptionsType) { options.Resource = "nope" })}, want: `Resource "nope" is not a registered resource`},
+		{name: "mutation resource is an object", declarations: []livewire.Declaration{newDashboard("dashboard", "/dashboard"), createMutation(func(options *createOptionsType) { options.Resource = "dashboard" })}, want: `Resource "dashboard" is not a registered resource`},
+		{name: "effect target missing", declarations: []livewire.Declaration{createMutation(func(options *createOptionsType) { options.Effect = livewire.Upserts("nope") })}, want: `Effect target "nope" is not a registered list`},
+		{name: "effect target is an object", declarations: []livewire.Declaration{newDashboard("dashboard", "/dashboard"), createMutation(func(options *createOptionsType) { options.Effect = livewire.Upserts("dashboard") })}, want: `Effect target "dashboard" is not a registered list`},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -95,9 +105,10 @@ func TestRegistryAddAndLookup(t *testing.T) {
 	})
 	require.NoError(t, registry.Add(create, parts, stats), "bindings resolve against the whole call")
 	require.NoError(t, registry.Add(newDashboard("dashboard", "/dashboard")))
+	require.NoError(t, registry.Add(newParameterizedList("byPart", "/parts/{id}/stats")), "a sibling route below the item route is fine")
 
 	declarations := registry.Declarations()
-	require.Len(t, declarations, 4)
+	require.Len(t, declarations, 5)
 	require.Equal(t, []string{"createPart", "parts", "stats", "dashboard"}, []string{declarations[0].Name(), declarations[1].Name(), declarations[2].Name(), declarations[3].Name()})
 	declarations[0] = nil
 	require.Equal(t, "createPart", registry.Declarations()[0].Name(), "Declarations returns a copy")
@@ -109,7 +120,38 @@ func TestRegistryAddAndLookup(t *testing.T) {
 	require.False(t, ok)
 
 	require.ErrorContains(t, registry.Add(newDashboard("parts", "/x")), "already registered")
-	require.Len(t, registry.Declarations(), 4)
+	require.Len(t, registry.Declarations(), 5)
+
+	other, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.ErrorContains(t, other.Add(parts), `resource "parts" is registered with another registry`)
+}
+
+func TestRegistryAddLeavesDeclarationsUntouchedOnFailure(t *testing.T) {
+	strict := partOptions()
+	strict.Fields[1].Write = authorization.IsAdmin() // name is admin-only on this registry's resource
+	createOptions := createOptions()
+	createOptions.Resource = "parts"
+	create := livewire.NewMutation("createPart", http.MethodPost, "/parts", createOptions)
+
+	failing, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	err = failing.Add(livewire.NewResource("parts", "/parts", strict), create, newDashboard("parts", "/dashboard"))
+	require.ErrorContains(t, err, "already registered")
+	require.Empty(t, failing.Declarations())
+
+	open, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.NoError(t, open.Add(livewire.NewResource("parts", "/parts", partOptions()), create), "the failed Add left the mutation unbound")
+	_, err = create.DecodeBody(userContext(), []byte(`{"name":"bolt"}`))
+	require.NoError(t, err, "the binding is the open registry's, not the failed one's")
+
+	again, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	err = again.Add(livewire.NewResource("parts", "/parts", strict), create)
+	require.ErrorContains(t, err, "registered with another registry")
+	_, err = create.DecodeBody(userContext(), []byte(`{"name":"bolt"}`))
+	require.NoError(t, err, "the refused Add changed nothing")
 }
 
 func TestRegistryTenantAndObserve(t *testing.T) {
@@ -151,21 +193,26 @@ func TestTypedDeclarations(t *testing.T) {
 	type statParameters struct {
 		Since string `query:"since"`
 	}
-	stats := livewire.NewList("stats", "/stats", &livewire.ListOptions[part, statParameters]{
-		Tables:  []string{"parts"},
-		Read:    authorization.IsUser(),
-		Guarded: []livewire.GuardedField{{Name: "secret", Read: authorization.IsAdmin()}},
+	partition := func(_ context.Context, parameters any) string { return "since:" + parameters.(*statParameters).Since }
+	options := &livewire.ListOptions[part, statParameters]{
+		Tables:    []string{"parts"},
+		Read:      authorization.IsUser(),
+		Partition: partition,
+		Guarded:   []livewire.GuardedField{{Name: "secret", Read: authorization.IsAdmin()}},
 		Load: func(_ context.Context, parameters *statParameters) ([]part, error) {
 			if parameters.Since == "fail" {
 				return nil, livewire.NotFound()
 			}
 			return nil, nil
 		},
-	})
+	}
+	stats := livewire.NewList("stats", "/stats", options)
+	options.Load, options.Partition, options.Guarded[0].Name = nil, nil, "changed"
 	dashboardObject := livewire.NewObject("dashboard", "/dashboard", &livewire.ObjectOptions[dashboard, livewire.NoParameters]{
-		Read:    authorization.IsUser(),
-		Guarded: []livewire.GuardedField{{Name: "open", Read: authorization.IsAdmin()}},
-		Load:    func(context.Context, *livewire.NoParameters) (*dashboard, error) { return nil, nil }, //nolint:nilnil // provokes the no-item-no-error failure
+		Read:      authorization.IsUser(),
+		Partition: func(context.Context, any) string { return "all" },
+		Guarded:   []livewire.GuardedField{{Name: "open", Read: authorization.IsAdmin()}},
+		Load:      func(context.Context, *livewire.NoParameters) (*dashboard, error) { return nil, nil }, //nolint:nilnil // provokes the no-item-no-error failure
 	})
 	require.NoError(t, addError(t, stats, dashboardObject))
 
@@ -174,8 +221,9 @@ func TestTypedDeclarations(t *testing.T) {
 	require.Equal(t, []string{"parts"}, stats.Tables())
 	require.Len(t, stats.Parameters(), 1)
 	require.Len(t, stats.Fields(), 1)
-	require.Equal(t, "secret", stats.Fields()[0].Name)
+	require.Equal(t, "secret", stats.Fields()[0].Name, "the options were copied")
 	require.NotNil(t, stats.Fields()[0].Read)
+	require.Equal(t, "since:x", stats.Partition()(context.Background(), &statParameters{Since: "x"}))
 	items, err := stats.Load(userContext(), &statParameters{})
 	require.NoError(t, err)
 	require.Equal(t, []part{}, items)
@@ -184,11 +232,13 @@ func TestTypedDeclarations(t *testing.T) {
 
 	require.Equal(t, livewire.KindObject, dashboardObject.Kind())
 	require.Equal(t, "open", dashboardObject.Fields()[0].Name)
+	require.Equal(t, "all", dashboardObject.Partition()(context.Background(), nil))
 	_, err = dashboardObject.Load(userContext(), &livewire.NoParameters{})
 	require.ErrorContains(t, err, "no item and no error")
 	item, err := newDashboard("d", "/d").Load(userContext(), &livewire.NoParameters{})
 	require.NoError(t, err)
 	require.Equal(t, &dashboard{Open: 1}, item)
+	require.Nil(t, newDashboard("d", "/d").Partition())
 }
 
 func TestTypedDeclarationErrors(t *testing.T) {
@@ -202,10 +252,14 @@ func TestTypedDeclarationErrors(t *testing.T) {
 	}{
 		{name: "list without load", declaration: livewire.NewList("s", "/s", &livewire.ListOptions[part, livewire.NoParameters]{Read: authorization.IsUser()}), want: "Load is required"},
 		{name: "list nil options", declaration: livewire.NewList[part, livewire.NoParameters]("s", "/s", nil), want: "Check is required"},
-		{name: "list without name", declaration: livewire.NewList("", "/s", &livewire.ListOptions[part, livewire.NoParameters]{Read: authorization.IsUser()}), want: "needs a name"},
+		{name: "list without name", declaration: livewire.NewList("", "/s", &livewire.ListOptions[part, livewire.NoParameters]{Read: authorization.IsUser()}), want: "is not an identifier"},
 		{name: "live list without id", declaration: livewire.NewList("s", "/s", &livewire.ListOptions[withoutID, livewire.NoParameters]{
 			Tables: []string{"t"}, Read: authorization.IsUser(),
 			Load: func(context.Context, *livewire.NoParameters) ([]withoutID, error) { return nil, nil },
+		}), want: `no JSON field "id"`},
+		{name: "live list of pointers without id", declaration: livewire.NewList("s", "/s", &livewire.ListOptions[*withoutID, livewire.NoParameters]{
+			Tables: []string{"t"}, Read: authorization.IsUser(),
+			Load: func(context.Context, *livewire.NoParameters) ([]*withoutID, error) { return nil, nil },
 		}), want: `no JSON field "id"`},
 		{name: "guard unknown field", declaration: livewire.NewList("s", "/s", &livewire.ListOptions[part, livewire.NoParameters]{
 			Read: authorization.IsUser(), Guarded: []livewire.GuardedField{{Name: "nope", Read: authorization.IsAdmin()}},
@@ -232,17 +286,34 @@ func TestTypedDeclarationErrors(t *testing.T) {
 	}
 }
 
+func TestLivePointerItemsWithID(t *testing.T) {
+	type keyed struct {
+		ID string `json:"id"`
+	}
+	list := livewire.NewList("s", "/s", &livewire.ListOptions[*keyed, livewire.NoParameters]{
+		Tables: []string{"t"}, Read: authorization.IsUser(),
+		Load: func(context.Context, *livewire.NoParameters) ([]*keyed, error) { return nil, nil },
+	})
+	require.NoError(t, addError(t, list))
+}
+
+type fakeHandle struct{ name string }
+
 func TestContextCarriers(t *testing.T) {
 	ctx := context.Background()
 	require.Nil(t, livewire.TransactionFrom(ctx))
 	require.Empty(t, livewire.IdempotencyKeyFrom(ctx))
-	transaction := &fakeTransaction{}
-	ctx = livewire.WithIdempotencyKey(livewire.WithTransaction(ctx, transaction), "key")
-	require.Same(t, transaction, livewire.TransactionFrom(ctx))
+	require.Empty(t, livewire.TenantFrom(ctx))
+	require.Equal(t, livewire.Owner{}, livewire.OwnerOf(ctx))
+
+	handle := &fakeHandle{name: "tx"}
+	ctx = livewire.WithTenant(livewire.WithIdempotencyKey(livewire.WithTransaction(ctx, handle), "key"), "t1")
+	typed, ok := livewire.TransactionFrom(ctx).(*fakeHandle)
+	require.True(t, ok, "the stored value is the adapter's handle, asserted back to its type")
+	require.Same(t, handle, typed)
 	require.Equal(t, "key", livewire.IdempotencyKeyFrom(ctx))
+	require.Equal(t, "t1", livewire.TenantFrom(ctx))
+
+	ctx = auth.WithIdentity(ctx, &auth.Identity{Provider: "password", Subject: "u1"})
+	require.Equal(t, livewire.Owner{Key: "password:u1", Tenant: "t1"}, livewire.OwnerOf(ctx))
 }
-
-type fakeTransaction struct{}
-
-func (f *fakeTransaction) Commit(context.Context) error   { return nil }
-func (f *fakeTransaction) Rollback(context.Context) error { return nil }
