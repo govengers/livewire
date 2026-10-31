@@ -22,4 +22,4 @@ go get github.com/govengers/livewire
 
 ## License
 
-MIT
+Apache 2.0, see [LICENSE](LICENSE).

@@ -2,7 +2,7 @@
 
 Status: agreed 31.10.2026 after seven grill rounds with MaPa. Binding for the v1.0.0 implementation. Decisions are numbered; a later change gets a new number, never a rewrite.
 
-livewire declares an API once in Go and serves it as REST, as a WebSocket with reads, subscriptions and writes, and as generated clients (TypeScript, Go, CLI) plus an OpenAPI 3.0.3 document. It is the contract between database, backend and UI for every govengers app. Successor of `github.com/mxcd/livewire` v0.2.x; module `github.com/govengers/livewire`, profile `library`, govengers/standards apply.
+livewire declares an API once in Go and serves it as REST, as a WebSocket with reads, subscriptions and writes, and as generated clients (TypeScript, Go, CLI) plus an OpenAPI 3.0.3 document. It is the contract between database, backend and UI for every govengers app. Successor of `github.com/mxcd/livewire` v0.2.x; module `github.com/govengers/livewire`, Apache 2.0 (MaPa, 31.10.2026; v0.2 was MIT), profile `library`, govengers/standards apply.
 
 ## 1. Decisions
 
@@ -42,7 +42,7 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D32 | Action audit: one row per mutation in `livewire_audit` (actor, real actor, mutation, params, key, status, duration), written in the transaction of D31, partitioned by month, retention sweep configurable. |
 | D33 | Bulk calls: `POST /batch` and socket op `batch` run several mutations in one transaction of D31, all or nothing, one idempotency key, one audit row per call, one response per call. Uploads are excluded. |
 | D34 | Versioning: a resource declares `Versioned: true`; `postgresadapter.HistorySQL(table)` creates `<table>_history` (row as jsonb, version, operation, valid_from, valid_to, actor, real_actor, mutation, request_id) and a trigger that appends on insert, update and delete, reading the actor of D31. The live table stays mutable; history is insert-only; INT-002's field changes are the diff of consecutive versions; `GET /{resource}/{id}/history` is a live, filterable read; the item carries `version`. Standards exception: the audit entry is written by a trigger in the mutation's transaction, not by a sqlc query in the repository. |
-| D35 | Export: `GET /{resource}/export?format=csv&filterId=...&sort=...` streams every row under scope and filter, columns from the declared fields or `ExportColumns`, chunked by keyset. CSV in the core (`encoding/csv`); `xlsx` in `livewire/xlsxadapter` on excelize, last work package, first to cut. REST only, a read for authorization, Observer outcome with the row count. |
+| D35 | Export: `GET /{resource}/export?format=csv&filterId=...&sort=...` streams every row under scope and filter, columns from the declared fields or `ExportColumns`, chunked by keyset. CSV in the core (`encoding/csv`). REST only, a read for authorization, Observer outcome with the row count. Excel (`xlsx`) is not built in v1; it stays an open TODO (an `xlsxadapter` on excelize would plug into the same export path). |
 | D36 | Optimistic effects: `Effect: livewire.Upserts("parts")` or `livewire.Removes("parts")` on a mutation; the runtime applies the response or the removal by id to those live lists at once with a `pending` marker, the next push reconciles (server wins), an error rolls back. |
 | D37 | Presence: socket ops `join {target, key, state}` and `leave`; rows in `livewire_presence` (socket, owner, display, target, key, state, updated_at), heartbeat 30 s, sweep after 90 s, changes through the change feed, `presence` is a subscribable target per record, `useLivePresence` in `vue.ts`. Postgres only. Collaborative editing of the same values is v2 and builds on this. |
 | D38 | Cursor mode: a filterable resource may opt into keyset pagination over its sort fields plus `id`, opaque `after`, `ListResponse.next`, `total` still capped; offset stays the default; `useLiveList({ mode: 'cursor' })` tiles pages with `loadMore()`. |
@@ -192,7 +192,6 @@ func (r *Repository) ListParts(ctx context.Context, listQuery *query.ListQuery) 
 | WP7 | `generate`: Go client, CLI | compiled against `examples/todo` |
 | WP8 | `livewiretest`, `examples/todo`, `test/e2e` (two engines, bun runtime) | e2e green in CI |
 | WP9 | docs, llms.txt, migration table, v1.0.0 | dual review |
-| WP10 | `xlsxadapter` | optional, cut first |
 
 Each WP: own branch, `just check` green, dual review (Codex and Fable) before merge.
 
