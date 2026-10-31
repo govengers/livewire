@@ -14,6 +14,7 @@ import (
 type outbox struct {
 	limit int
 	wait  time.Duration
+	clock clock
 	// wake has one slot: the writer has frames to send or a delivery is due.
 	wake chan struct{}
 
@@ -25,11 +26,11 @@ type outbox struct {
 	marked      bool
 	lastFlush   time.Time
 	flushDue    bool
-	timer       *time.Timer
+	stopTimer   func() bool
 }
 
-func newOutbox(limit int, wait time.Duration) *outbox {
-	return &outbox{limit: limit, wait: wait, wake: make(chan struct{}, 1), pending: map[*subscription]struct{}{}}
+func newOutbox(limit int, wait time.Duration, clock clock) *outbox {
+	return &outbox{limit: limit, wait: wait, clock: clock, wake: make(chan struct{}, 1), pending: map[*subscription]struct{}{}}
 }
 
 // enqueue queues frames in order and wakes the writer. It reports false when the frames
@@ -64,8 +65,8 @@ func (o *outbox) markPending(liveSubscription *subscription) {
 		return
 	}
 	o.marked = true
-	if delay := time.Until(o.lastFlush.Add(o.wait)); delay > 0 {
-		o.timer = time.AfterFunc(delay, o.flushNow)
+	if delay := o.lastFlush.Add(o.wait).Sub(o.clock.Now()); delay > 0 {
+		o.stopTimer = o.clock.AfterFunc(delay, o.flushNow)
 		return
 	}
 	o.flushDue = true
@@ -98,7 +99,7 @@ func (o *outbox) take() (frames [][]byte, due []*subscription) {
 		due = append(due, liveSubscription)
 	}
 	clear(o.pending)
-	o.marked, o.flushDue, o.lastFlush, o.timer = false, false, time.Now(), nil
+	o.marked, o.flushDue, o.lastFlush, o.stopTimer = false, false, o.clock.Now(), nil
 	return frames, due
 }
 
@@ -109,8 +110,8 @@ func (o *outbox) shut() {
 	o.closed = true
 	o.frames, o.queuedBytes = nil, 0
 	clear(o.pending)
-	if o.timer != nil {
-		o.timer.Stop()
-		o.timer = nil
+	if o.stopTimer != nil {
+		o.stopTimer()
+		o.stopTimer = nil
 	}
 }

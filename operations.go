@@ -3,6 +3,7 @@ package livewire
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -10,9 +11,9 @@ import (
 	"github.com/govengers/auth"
 )
 
-// handle dispatches one request frame. Ping and unsubscribe answer at once; every other op
-// runs on its own goroutine, at most InFlightPerSocket at a time (D10), under a fresh
-// identity (D6).
+// handle dispatches one request frame. Ping and unsubscribe answer at once (D51); every
+// other op runs on its own goroutine, at most InFlightPerSocket at a time (D10), under a
+// fresh identity (D6). Every frame reports one outcome (D30).
 func (s *socket) handle(frame *RequestFrame) {
 	switch frame.Operation {
 	case OperationPing:
@@ -23,15 +24,14 @@ func (s *socket) handle(frame *RequestFrame) {
 	case OperationQuery, OperationSubscribe, OperationCall, OperationBatch, OperationJoin, OperationLeave:
 		s.start(frame)
 	default:
-		s.respondError(frame.ID, invalidParameter("op", "is not an operation of the socket"))
+		refusal := invalidParameter("op", "is not an operation of the socket")
+		s.observe(startUnit(OutcomeRequest, frame.Operation, frame.Target), refusal)
+		s.respondError(frame.ID, refusal)
 	}
 }
 
-func (s *socket) observe(unit unitOfWork, err error) {
-	s.engine.registry.Observe(s.ctx, unit.outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), err))
-}
-
-// start runs an op on its own goroutine within the in-flight limit.
+// start runs an op on its own goroutine within the in-flight limit. A panic of the op is
+// answered as an internal error; the socket stays open.
 func (s *socket) start(frame *RequestFrame) {
 	limit := s.engine.options.InFlightPerSocket
 	s.mutex.Lock()
@@ -41,7 +41,9 @@ func (s *socket) start(frame *RequestFrame) {
 	}
 	s.mutex.Unlock()
 	if !admitted {
-		s.respondError(frame.ID, limitExceeded("requests", "at most "+strconv.Itoa(limit)+" in flight per socket"))
+		refusal := limitExceeded("requests", "at most "+strconv.Itoa(limit)+" in flight per socket")
+		s.observe(startUnit(OutcomeRequest, frame.Operation, frame.Target), refusal)
+		s.respondError(frame.ID, refusal)
 		return
 	}
 	s.spawn(func() {
@@ -50,15 +52,20 @@ func (s *socket) start(frame *RequestFrame) {
 			s.inFlight--
 			s.mutex.Unlock()
 		}()
-		s.run(frame)
+		unit := startUnit(OutcomeRequest, frame.Operation, frame.Target)
+		if err := recovering(func() error { s.run(frame); return nil }); err != nil {
+			s.observe(unit, err)
+			s.respondError(frame.ID, err)
+		}
 	})
 }
 
 // run re-validates the identity and runs the op under it.
 func (s *socket) run(frame *RequestFrame) {
+	unit := startUnit(OutcomeRequest, frame.Operation, frame.Target)
 	identity, err := s.freshIdentity(s.ctx)
 	if err != nil {
-		s.observe(startUnit(OutcomeRequest, frame.Operation, frame.Target), err)
+		s.observe(unit, err)
 		s.respondError(frame.ID, err)
 		return
 	}
@@ -81,16 +88,15 @@ func (s *socket) run(frame *RequestFrame) {
 }
 
 func (s *socket) query(ctx context.Context, frame *RequestFrame) {
-	request := readRequestOf(frame)
 	unit := startUnit(OutcomeRequest, OperationQuery, frame.Target)
 	var resolved *resolvedRead
 	var result *readResult
-	release, err := s.engine.acquire(ctx)
-	if err == nil {
-		resolved, result, err = s.engine.read(ctx, request)
-		release()
-	}
-	s.engine.registry.Observe(ctx, unit.readOutcome(ctx, resolved, err))
+	err := s.engine.inSlot(ctx, func() error {
+		var err error
+		resolved, result, err = s.engine.read(ctx, readRequestOf(frame))
+		return err
+	})
+	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
 	if err != nil {
 		s.respondError(frame.ID, err)
 		return
@@ -113,14 +119,14 @@ func (s *socket) unsubscribe(frame *RequestFrame) {
 }
 
 func (s *socket) call(ctx context.Context, frame *RequestFrame) {
-	release, err := s.engine.acquire(ctx)
-	if err != nil {
-		s.respondError(frame.ID, err)
-		return
-	}
-	defer release()
-	request := CallRequest{Target: frame.Target, Source: MapSource(frame.Parameters), Body: frame.Body, IdempotencyKey: frame.IdempotencyKey}
-	status, payload, err := s.engine.call(ctx, OperationCall, request)
+	var status int
+	var payload json.RawMessage
+	err := s.engine.inSlot(ctx, func() error {
+		var err error
+		request := CallRequest{Target: frame.Target, Source: MapSource(frame.Parameters), Body: frame.Body, IdempotencyKey: frame.IdempotencyKey}
+		status, payload, err = s.engine.call(ctx, OperationCall, request)
+		return err
+	})
 	if err != nil {
 		s.respondError(frame.ID, err)
 		return
@@ -129,13 +135,12 @@ func (s *socket) call(ctx context.Context, frame *RequestFrame) {
 }
 
 func (s *socket) batch(ctx context.Context, frame *RequestFrame) {
-	release, err := s.engine.acquire(ctx)
-	if err != nil {
-		s.respondError(frame.ID, err)
-		return
-	}
-	defer release()
-	payload, err := s.engine.batch(ctx, OperationBatch, BatchRequest{Body: frame.Body, IdempotencyKey: frame.IdempotencyKey})
+	var payload json.RawMessage
+	err := s.engine.inSlot(ctx, func() error {
+		var err error
+		payload, err = s.engine.batch(ctx, OperationBatch, BatchRequest{Body: frame.Body, IdempotencyKey: frame.IdempotencyKey})
+		return err
+	})
 	if err != nil {
 		s.respondError(frame.ID, err)
 		return
@@ -150,16 +155,26 @@ type presenceRecord struct {
 	key    string
 }
 
-// join announces the socket on a record of a readable declaration (D37); the frame's body is
-// the client's state. The declaration's static Check gates it like a read.
+// join announces the socket on a record (D37); the frame's body is the client's state. The
+// record is resolved like a presence read (the declaration's static Check, its parameters,
+// the tenant) and its own read runs under the caller first, so a record the caller may not
+// read cannot be joined. A socket joins at most PresencesPerSocket records; joining one
+// again updates its state.
 func (s *socket) join(ctx context.Context, frame *RequestFrame) {
 	unit := startUnit(OutcomeRequest, OperationJoin, frame.Target)
-	record, err := s.presenceRecordOf(ctx, frame)
-	if err == nil {
-		ctx = WithTenant(ctx, record.tenant)
-		err = s.joinRecord(ctx, record, frame.Body)
-	}
-	s.engine.registry.Observe(ctx, unit.outcome(ctx, err))
+	var resolved *resolvedRead
+	err := s.engine.inSlot(ctx, func() error {
+		var err error
+		if resolved, err = s.engine.resolve(ctx, ReadRequest{Target: frame.Target, Kind: ReadPresence, Source: MapSource(frame.Parameters)}); err != nil {
+			return err
+		}
+		if err := s.engine.checkRecord(ctx, resolved); err != nil {
+			return err
+		}
+		record := presenceRecord{tenant: resolved.tenant, target: resolved.request.Target, key: resolved.presenceKey}
+		return s.joinRecord(WithTenant(ctx, resolved.tenant), record, frame.Body)
+	})
+	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
 	if err != nil {
 		s.respondError(frame.ID, err)
 		return
@@ -168,6 +183,10 @@ func (s *socket) join(ctx context.Context, frame *RequestFrame) {
 }
 
 func (s *socket) joinRecord(ctx context.Context, record presenceRecord, state json.RawMessage) error {
+	fresh, err := s.reservePresence(record)
+	if err != nil {
+		return err
+	}
 	owner, _ := OwnerOf(ctx) // a socket always has an identity
 	identity := auth.IdentityFrom(ctx)
 	display := identity.Name
@@ -178,28 +197,61 @@ func (s *socket) joinRecord(ctx context.Context, record presenceRecord, state js
 		state = json.RawMessage("null")
 	}
 	presence := &Presence{Socket: s.id, Owner: owner, Display: display, Target: record.target, Key: record.key, State: state, UpdatedAt: time.Now()}
-	release, err := s.engine.acquire(ctx)
+	err = recovering(func() error { return s.engine.options.PresenceStore.Join(ctx, presence) })
 	if err != nil {
-		return err
+		if fresh {
+			s.forgetPresence(record)
+		}
+		return fmt.Errorf("livewire: join %s %q: %w", record.target, record.key, err)
 	}
-	defer release()
-	if err := s.engine.options.PresenceStore.Join(ctx, presence); err != nil {
-		return err
-	}
-	s.mutex.Lock()
-	s.presences[record] = struct{}{}
-	s.mutex.Unlock()
 	return nil
 }
 
+// reservePresence counts a record against PresencesPerSocket; fresh is false for a record
+// the socket joined already, which is an update.
+func (s *socket) reservePresence(record presenceRecord) (fresh bool, err error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if _, joined := s.presences[record]; joined {
+		return false, nil
+	}
+	limit := s.engine.options.PresencesPerSocket
+	if len(s.presences) >= limit {
+		return false, limitExceeded("presences", "at most "+strconv.Itoa(limit)+" per socket")
+	}
+	s.presences[record] = struct{}{}
+	return true, nil
+}
+
+func (s *socket) forgetPresence(record presenceRecord) {
+	s.mutex.Lock()
+	delete(s.presences, record)
+	s.mutex.Unlock()
+}
+
+// leave removes the socket's own presences on a record it joined, found by the
+// declaration's name and the key among its joins; it needs no read of the record, so a
+// caller who lost access to the record still leaves it. A record the socket did not join is
+// 404.
 func (s *socket) leave(ctx context.Context, frame *RequestFrame) {
 	unit := startUnit(OutcomeRequest, OperationLeave, frame.Target)
-	record, err := s.presenceRecordOf(ctx, frame)
-	if err == nil {
-		ctx = WithTenant(ctx, record.tenant)
-		err = s.leaveRecord(ctx, record)
-	}
-	s.engine.registry.Observe(ctx, unit.outcome(ctx, err))
+	err := s.engine.inSlot(ctx, func() error {
+		key, err := presenceKeyFrom(MapSource(frame.Parameters))
+		if err != nil {
+			return err
+		}
+		records := s.joinedRecords(frame.Target, key)
+		if len(records) == 0 || s.engine.options.PresenceStore == nil {
+			return NotFound()
+		}
+		for _, record := range records {
+			if err := s.leaveRecord(ctx, record); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	s.engine.observe(ctx, unit.outcome(ctx, err))
 	if err != nil {
 		s.respondError(frame.ID, err)
 		return
@@ -207,52 +259,37 @@ func (s *socket) leave(ctx context.Context, frame *RequestFrame) {
 	s.respond(frame.ID, http.StatusOK, nil)
 }
 
-func (s *socket) leaveRecord(ctx context.Context, record presenceRecord) error {
-	release, err := s.engine.acquire(ctx)
-	if err != nil {
-		return err
-	}
-	defer release()
-	if err := s.engine.options.PresenceStore.Leave(ctx, record.tenant, s.id, record.target, record.key); err != nil {
-		return err
-	}
+func (s *socket) joinedRecords(target, key string) []presenceRecord {
 	s.mutex.Lock()
-	delete(s.presences, record)
-	s.mutex.Unlock()
+	defer s.mutex.Unlock()
+	var records []presenceRecord
+	for record := range s.presences {
+		if record.target == target && record.key == key {
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
+func (s *socket) leaveRecord(ctx context.Context, record presenceRecord) error {
+	err := recovering(func() error {
+		return s.engine.options.PresenceStore.Leave(ctx, record.tenant, s.id, record.target, record.key)
+	})
+	if err != nil {
+		return fmt.Errorf("livewire: leave %s %q: %w", record.target, record.key, err)
+	}
+	s.forgetPresence(record)
 	return nil
 }
 
-// presenceRecordOf resolves the record a join or leave names: a readable declaration whose
-// Check passes, the key parameter and the tenant.
-func (s *socket) presenceRecordOf(ctx context.Context, frame *RequestFrame) (presenceRecord, error) {
-	request := ReadRequest{Target: frame.Target, Kind: ReadPresence, Source: MapSource(frame.Parameters)}
-	declaration, err := s.engine.readDeclaration(request)
-	if err != nil {
-		return presenceRecord{}, err
-	}
-	if err := declaration.Check()(ctx); err != nil {
-		return presenceRecord{}, err
-	}
-	key, err := presenceKeyFrom(request.Source)
-	if err != nil {
-		return presenceRecord{}, err
-	}
-	tenant, err := s.engine.registry.Tenant(ctx, nil)
-	if err != nil {
-		return presenceRecord{}, err
-	}
-	return presenceRecord{tenant: tenant, target: declaration.Name(), key: key}, nil
-}
-
-// leavePresences removes the presences of an ended socket; what fails is swept after
-// PresenceExpiry.
+// leavePresences removes the presences of an ended socket; a failed leave is reported and
+// the sweep removes the row after PresenceExpiry.
 func (s *socket) leavePresences() {
 	s.mutex.Lock()
 	records := make([]presenceRecord, 0, len(s.presences))
 	for record := range s.presences {
 		records = append(records, record)
 	}
-	clear(s.presences)
 	s.mutex.Unlock()
 	if len(records) == 0 {
 		return
@@ -260,7 +297,10 @@ func (s *socket) leavePresences() {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), leaveTimeout)
 	defer cancel()
 	for _, record := range records {
-		_ = s.engine.options.PresenceStore.Leave(ctx, record.tenant, s.id, record.target, record.key) // the sweep removes a presence a failed leave left behind
+		unit := startUnit(OutcomeRequest, OperationLeave, record.target)
+		if err := s.leaveRecord(ctx, record); err != nil {
+			s.observe(unit, err)
+		}
 	}
 }
 
@@ -272,7 +312,7 @@ func (s *socket) hasPresences() bool {
 }
 
 // refreshPresences is the presence tick (D37): a heartbeat for every socket with a presence,
-// then the sweep of the presences older than PresenceExpiry.
+// then the sweep of the presences older than PresenceExpiry; the first failure is reported.
 func (e *Engine) refreshPresences(ctx context.Context) {
 	store := e.options.PresenceStore
 	if store == nil {
@@ -287,12 +327,17 @@ func (e *Engine) refreshPresences(ctx context.Context) {
 		if !clientSocket.hasPresences() {
 			continue
 		}
-		if err := store.Heartbeat(ctx, clientSocket.id); err != nil && failure == nil {
-			failure = err
+		err := recovering(func() error { return store.Heartbeat(ctx, clientSocket.id) })
+		if err != nil && failure == nil {
+			failure = fmt.Errorf("livewire: the presence heartbeat of a socket: %w", err)
 		}
 	}
-	if _, err := store.Sweep(ctx, e.options.PresenceExpiry); err != nil && failure == nil {
-		failure = err
+	err := recovering(func() error {
+		_, sweepError := store.Sweep(ctx, e.options.PresenceExpiry)
+		return sweepError
+	})
+	if err != nil && failure == nil {
+		failure = fmt.Errorf("livewire: the presence sweep: %w", err)
 	}
-	e.registry.Observe(ctx, unit.outcome(ctx, failure))
+	e.observe(ctx, unit.outcome(ctx, failure))
 }

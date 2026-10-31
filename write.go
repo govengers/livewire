@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/govengers/auth"
+
+	"github.com/govengers/livewire/query"
 )
 
 // CallRequest is one mutation call as a transport hands it to Engine.Call: the mutation's
@@ -83,12 +86,15 @@ func (e *Engine) call(ctx context.Context, operation Operation, request CallRequ
 	unit := startUnit(OutcomeCall, operation, request.Target)
 	prepared, err := e.prepareCall(ctx, request.Target, request.Source, request.Body)
 	if err != nil {
-		e.registry.Observe(ctx, unit.outcome(ctx, err))
+		e.observe(ctx, unit.outcome(ctx, err))
 		return 0, nil, err
 	}
 	ctx = WithTenant(ctx, prepared.tenant)
 	plan := writePlan{mutation: request.Target, transactionMutation: request.Target, parameters: prepared.parameters, idempotencyKey: request.IdempotencyKey, requestID: request.RequestID}
 	answer, err := e.write(ctx, plan, prepared.handle)
+	if err == nil && answer.replayed {
+		answer.payload, err = redactResponse(ctx, prepared.guards, answer.payload)
+	}
 	e.observeWrite(ctx, unit, prepared.parameters, answer, err)
 	if err != nil {
 		return 0, nil, err
@@ -97,12 +103,13 @@ func (e *Engine) call(ctx context.Context, operation Operation, request CallRequ
 }
 
 // preparedCall is a call past its checks: the mutation with its decoded parameters, body
-// and tenant.
+// and tenant, and the field guards its response passes (D39).
 type preparedCall struct {
 	mutation   *Mutation
 	parameters any
 	body       any
 	tenant     string
+	guards     query.Fields
 }
 
 // prepareCall runs everything before the transaction, in the order of D8: the static check
@@ -134,16 +141,55 @@ func (e *Engine) prepareCall(ctx context.Context, target string, source Paramete
 	if err != nil {
 		return nil, err
 	}
-	return &preparedCall{mutation: mutation, parameters: parameters, body: body, tenant: tenant}, nil
+	prepared := &preparedCall{mutation: mutation, parameters: parameters, body: body, tenant: tenant, guards: e.responseGuards(mutation)}
+	return prepared, nil
 }
 
-// handle runs the handler in the transaction of ctx and marshals its response.
+// responseGuards are the field guards a mutation's response passes (D39): those of the
+// resource its body is bound to (Resource) and of the live list its Effect lands in (D36).
+func (e *Engine) responseGuards(mutation *Mutation) query.Fields {
+	var guards query.Fields
+	for _, name := range []string{mutation.Resource(), mutation.Effect().Target} {
+		declaration, _ := e.registry.Lookup(name)
+		switch bound := declaration.(type) {
+		case *Resource:
+			guards = append(guards, bound.Fields()...)
+		case *List:
+			guards = append(guards, bound.Fields()...)
+		}
+	}
+	return guards
+}
+
+// handle runs the handler in the transaction of ctx, marshals its response and strips the
+// fields the caller may not read, before the answer is recorded or returned.
 func (p *preparedCall) handle(ctx context.Context) (int, json.RawMessage, error) {
 	response, err := p.mutation.Handle(ctx, p.parameters, p.body)
 	if err != nil {
 		return 0, nil, err
 	}
-	return marshalResponse(p.mutation.Name(), p.mutation.Status(), p.mutation.HasContent(), response)
+	status, payload, err := marshalResponse(p.mutation.Name(), p.mutation.Status(), p.mutation.HasContent(), response)
+	if err != nil {
+		return 0, nil, err
+	}
+	payload, err = redactResponse(ctx, p.guards, payload)
+	return status, payload, err
+}
+
+// redactResponse strips the guarded fields the identity in ctx may not read from a
+// response: an object, or every object of an array; other JSON is left as it is.
+func redactResponse(ctx context.Context, guards query.Fields, payload json.RawMessage) (json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(payload)
+	switch {
+	case len(guards) == 0 || len(trimmed) == 0:
+		return payload, nil
+	case trimmed[0] == '[':
+		return RedactItems(ctx, guards, payload)
+	case trimmed[0] == '{':
+		return RedactItem(ctx, guards, payload)
+	default:
+		return payload, nil
+	}
 }
 
 func marshalResponse(name string, status int, hasContent bool, response any) (int, json.RawMessage, error) {
@@ -173,7 +219,7 @@ func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRe
 	unit := startUnit(OutcomeBatch, operation, batchMutation)
 	prepared, err := e.prepareBatch(ctx, request.Body)
 	if err != nil {
-		e.registry.Observe(ctx, unit.outcome(ctx, err))
+		e.observe(ctx, unit.outcome(ctx, err))
 		return nil, err
 	}
 	ctx = WithTenant(ctx, prepared[0].tenant)
@@ -181,16 +227,38 @@ func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRe
 	answer, err := e.write(ctx, plan, func(ctx context.Context) (int, json.RawMessage, error) {
 		return e.runBatch(ctx, operation, prepared)
 	})
-	e.registry.Observe(ctx, unit.outcome(ctx, err))
+	e.observe(ctx, unit.outcome(ctx, err))
 	if err != nil {
 		return nil, err
 	}
-	if !answer.replayed {
-		for _, call := range prepared {
-			e.registry.Observe(ctx, Outcome{Kind: OutcomeAfterCommit, Target: call.mutation.Name(), Tenant: call.tenant, Identity: auth.IdentityFrom(ctx), Parameters: call.parameters, Status: call.mutation.Status()})
-		}
+	if answer.replayed {
+		return redactBatch(ctx, prepared, answer.payload)
+	}
+	for _, call := range prepared {
+		e.observe(ctx, Outcome{Kind: OutcomeAfterCommit, Target: call.mutation.Name(), Tenant: call.tenant, Identity: auth.IdentityFrom(ctx), Parameters: call.parameters, Status: call.mutation.Status()})
 	}
 	return answer.payload, nil
+}
+
+// redactBatch passes every result of a replayed batch through its call's guards again: the
+// identity's rights may have changed since the batch ran.
+func redactBatch(ctx context.Context, prepared []*preparedCall, payload json.RawMessage) (json.RawMessage, error) {
+	var results []BatchResult
+	if err := json.Unmarshal(payload, &results); err != nil || len(results) != len(prepared) {
+		return nil, errors.New("livewire: the recorded batch answer does not match the batch")
+	}
+	for index := range results {
+		redacted, err := redactResponse(ctx, prepared[index].guards, results[index].Payload)
+		if err != nil {
+			return nil, err
+		}
+		results[index].Payload = redacted
+	}
+	redacted, err := json.Marshal(results)
+	if err != nil {
+		return nil, fmt.Errorf("livewire: marshal the batch results: %w", err)
+	}
+	return redacted, nil
 }
 
 // prepareBatch decodes the batch and prepares every call.
@@ -198,8 +266,8 @@ func (e *Engine) prepareBatch(ctx context.Context, body json.RawMessage) ([]*pre
 	var calls []BatchCall
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&calls); err != nil || decoder.More() {
-		return nil, invalidParameter("calls", "must be a JSON array of calls {target, params, body}")
+	if err := decoder.Decode(&calls); err != nil || !atEnd(decoder) {
+		return nil, invalidParameter("calls", "must be one JSON array of calls {target, params, body}")
 	}
 	switch {
 	case len(calls) == 0:
@@ -221,6 +289,12 @@ func (e *Engine) prepareBatch(ctx context.Context, body json.RawMessage) ([]*pre
 	return prepared, nil
 }
 
+// atEnd reports whether nothing but white space follows the decoded value.
+func atEnd(decoder *json.Decoder) bool {
+	_, err := decoder.Token()
+	return errors.Is(err, io.EOF)
+}
+
 // runBatch runs the prepared calls in the transaction of ctx; the first failure ends it.
 func (e *Engine) runBatch(ctx context.Context, operation Operation, prepared []*preparedCall) (int, json.RawMessage, error) {
 	results := make([]BatchResult, 0, len(prepared))
@@ -232,7 +306,7 @@ func (e *Engine) runBatch(ctx context.Context, operation Operation, prepared []*
 		if err == nil {
 			outcome.Status = status
 		}
-		e.registry.Observe(ctx, outcome)
+		e.observe(ctx, outcome)
 		if err != nil {
 			return 0, nil, batchFailure(index, err)
 		}
@@ -283,7 +357,7 @@ func (e *Engine) Upload(ctx context.Context, request UploadRequest) (status int,
 	unit := startUnit(OutcomeCall, "", request.Target)
 	prepared, err := e.prepareUpload(ctx, request)
 	if err != nil {
-		e.registry.Observe(ctx, unit.outcome(ctx, err))
+		e.observe(ctx, unit.outcome(ctx, err))
 		return 0, nil, err
 	}
 	ctx = WithTenant(ctx, prepared.tenant)
@@ -352,11 +426,11 @@ func (e *Engine) observeWrite(ctx context.Context, unit unitOfWork, parameters a
 	if err == nil {
 		outcome.Status = answer.status
 	}
-	e.registry.Observe(ctx, outcome)
+	e.observe(ctx, outcome)
 	if err == nil && !answer.replayed {
 		committed := outcome
 		committed.Kind, committed.Operation, committed.Err, committed.Duration = OutcomeAfterCommit, "", nil, 0
-		e.registry.Observe(ctx, committed)
+		e.observe(ctx, committed)
 	}
 }
 
@@ -417,9 +491,15 @@ func (e *Engine) runReserved(ctx context.Context, plan writePlan, run func(ctx c
 	owner, hasOwner := OwnerOf(ctx)
 	reserved := plan.idempotencyKey != "" && hasOwner && store != nil
 	if reserved {
-		record, replay, err := store.Reserve(ctx, owner, plan.idempotencyKey, plan.mutation)
+		var record *IdempotencyRecord
+		var replay bool
+		err := recovering(func() error {
+			var reserveError error
+			record, replay, reserveError = store.Reserve(ctx, owner, plan.idempotencyKey, plan.mutation)
+			return reserveError
+		})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("livewire: reserve the Idempotency-Key of %q: %w", plan.mutation, err)
 		}
 		if replay {
 			return &writeAnswer{status: record.Status, payload: record.Response, replayed: true}, nil
@@ -436,7 +516,7 @@ func (e *Engine) runReserved(ctx context.Context, plan writePlan, run func(ctx c
 	}
 	if reserved {
 		record := &IdempotencyRecord{Owner: owner, Key: plan.idempotencyKey, Mutation: plan.mutation, Status: answer.status, Response: answer.payload}
-		if err := store.Record(ctx, record); err != nil {
+		if err := recovering(func() error { return store.Record(ctx, record) }); err != nil {
 			return nil, fmt.Errorf("livewire: record the answer of %q: %w", plan.mutation, err)
 		}
 	}

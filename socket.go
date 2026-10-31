@@ -23,11 +23,12 @@ import (
 const (
 	pingInterval      = 30 * time.Second
 	pongWait          = pingInterval*2 + pingInterval/2
-	writeTimeout      = 10 * time.Second
 	closeFrameTimeout = time.Second
 	// leaveTimeout bounds the presence leaves of a closed socket; the sweep removes what
 	// they miss.
 	leaveTimeout = 5 * time.Second
+	// closeInternalError is the close code of a socket whose own goroutine panicked.
+	closeInternalError = websocket.CloseInternalServerErr
 )
 
 // errIdentityGone is the identity check's answer when it closed the socket 4401, and
@@ -89,7 +90,7 @@ func (e *Engine) originAllowed(request *http.Request) bool {
 
 // admit registers a socket for the upgrade, counted against SocketsPerOwner.
 func (e *Engine) admit(request *http.Request, identity *auth.Identity) (*socket, error) {
-	ownerKey := ownerKeyOf(identity)
+	ownerKey := OwnerKey(identity)
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 	switch {
@@ -113,14 +114,28 @@ func (e *Engine) release(clientSocket *socket) {
 		return
 	}
 	delete(e.sockets, clientSocket)
-	if e.perOwner[clientSocket.ownerKey]--; e.perOwner[clientSocket.ownerKey] <= 0 {
-		delete(e.perOwner, clientSocket.ownerKey)
-	}
+	e.uncountOwner(clientSocket.ownerKey)
 	e.lifetimes.Done()
 }
 
-func ownerKeyOf(identity *auth.Identity) string {
-	return identity.Provider + ":" + identity.Subject
+// migrateOwner moves a socket's SocketsPerOwner count to the owner its identity now has; the
+// socket counts there from now on, past the limit too, and stays open.
+func (e *Engine) migrateOwner(clientSocket *socket, ownerKey string) {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+	if _, ok := e.sockets[clientSocket]; !ok || clientSocket.ownerKey == ownerKey {
+		return
+	}
+	e.uncountOwner(clientSocket.ownerKey)
+	clientSocket.ownerKey = ownerKey
+	e.perOwner[ownerKey]++
+}
+
+// uncountOwner drops one socket of the owner; e.mutex is held.
+func (e *Engine) uncountOwner(ownerKey string) {
+	if e.perOwner[ownerKey]--; e.perOwner[ownerKey] <= 0 {
+		delete(e.perOwner, ownerKey)
+	}
 }
 
 // socket is one WebSocket connection. Its reader runs on the handler's goroutine, its writer,
@@ -131,9 +146,9 @@ type socket struct {
 	engine     *Engine
 	id         string
 	request    *http.Request // the upgrade request the IdentitySource re-validates
-	ownerKey   string
+	ownerKey   string        // guarded by engine.mutex: admit, migrateOwner, release
 	connection *websocket.Conn
-	//nolint:containedctx // the socket's lifetime: cancelled by close, the parent of every unit of work on the socket
+	//nolint:containedctx // the CON-002 exception of the repository: the socket's lifetime, cancelled by close
 	ctx        context.Context
 	cancel     context.CancelFunc
 	outbox     *outbox
@@ -146,11 +161,14 @@ type socket struct {
 	closed           bool
 	identity         *auth.Identity
 	identifiedAt     time.Time
+	identityIssued   uint64 // the number of the last Identify call started
+	identityAdopted  uint64 // the number of the Identify call the identity came from
 	subscriptions    map[string]*subscription
 	lastSubscription int
 	inFlight         int
 	presences        map[presenceRecord]struct{}
-	failure          error // the panic that closed the socket 1011, for its OutcomeClose
+	filterHashes     map[string]struct{} // the inline filters this socket registered (FiltersPerSocket)
+	failure          error               // the panic that closed the socket 1011, for its OutcomeClose
 }
 
 func newSocket(engine *Engine, request *http.Request, identity *auth.Identity, ownerKey string) *socket {
@@ -158,32 +176,33 @@ func newSocket(engine *Engine, request *http.Request, identity *auth.Identity, o
 	return &socket{
 		engine: engine, id: uuid.NewString(), request: request, ownerKey: ownerKey,
 		ctx: ctx, cancel: cancel,
-		outbox:       newOutbox(engine.options.QueuedBytesPerSocket, engine.options.DeliveryBatchWait),
+		outbox:       newOutbox(engine.options.QueuedBytesPerSocket, engine.options.DeliveryBatchWait, engine.clock),
 		revalidation: make(chan struct{}, 1),
 		identity:     identity, identifiedAt: time.Now(),
-		subscriptions: map[string]*subscription{}, presences: map[presenceRecord]struct{}{},
+		subscriptions: map[string]*subscription{}, presences: map[presenceRecord]struct{}{}, filterHashes: map[string]struct{}{},
 	}
 }
 
-// serve runs the socket until it ends, then waits for its goroutines, leaves its presences
-// and gives its slot back.
+// serve runs the socket until it ends; whatever happens, it then waits for the socket's
+// goroutines, leaves its presences and gives its slot back.
 func (s *socket) serve(connection *websocket.Conn) {
+	defer s.engine.release(s)
+	defer s.guarded(s.leavePresences)
+	defer s.goroutines.Wait()
 	s.mutex.Lock()
 	s.connection = connection
 	closed := s.closed
 	s.mutex.Unlock()
 	if closed { // Close ran between the admission and here and found no connection to end
 		s.writeClose(CloseGoingAway, "the server is shutting down")
-	} else {
-		s.observe(startUnit(OutcomeOpen, "", ""), nil)
-		s.spawn(s.write)
-		s.spawn(s.revalidate)
-		s.guarded(s.read)
-		s.close(CloseNormal, "")
+		return
 	}
-	s.goroutines.Wait()
-	s.leavePresences()
-	s.engine.release(s)
+	s.observe(startUnit(OutcomeOpen, "", ""), nil)
+	s.spawn(s.write)
+	s.spawn(s.revalidate)
+	code := closeInternalError
+	s.guarded(func() { code = s.read() })
+	s.guarded(func() { s.close(code, "") })
 }
 
 // spawn runs work on a goroutine the socket waits for; a panic closes the socket 1011.
@@ -196,30 +215,51 @@ func (s *socket) guarded(work func()) {
 		work()
 		return nil
 	})
-	if err != nil {
-		s.mutex.Lock()
-		s.failure = err
-		s.mutex.Unlock()
-		s.close(websocket.CloseInternalServerErr, "internal error")
+	if err == nil {
+		return
 	}
+	s.mutex.Lock()
+	s.failure = err
+	s.mutex.Unlock()
+	_ = recovering(func() error { // a close that panics again leaves the cleanup of serve to finish the socket
+		s.close(closeInternalError, "internal error")
+		return nil
+	})
 }
 
-func (s *socket) read() {
+// read reads frames until the connection ends and returns the close code it ended with: the
+// peer's own, 1009 for a frame past FrameBytes (gorilla answered it), 1006 for a connection
+// that broke or timed out without a close frame.
+func (s *socket) read() int {
 	s.connection.SetReadLimit(s.engine.options.FrameBytes)
 	_ = s.connection.SetReadDeadline(time.Now().Add(pongWait)) // a deadline on a live connection cannot fail
 	s.connection.SetPongHandler(func(string) error { return s.connection.SetReadDeadline(time.Now().Add(pongWait)) })
 	for {
 		_, data, err := s.connection.ReadMessage()
 		if err != nil {
-			return // the peer closed, the frame was too large (gorilla answered 1009) or the socket was closed
+			return closeCodeOf(err)
 		}
 		_ = s.connection.SetReadDeadline(time.Now().Add(pongWait))
 		var frame RequestFrame
 		if err := json.Unmarshal(data, &frame); err != nil {
-			s.respondError("", Invalid(map[string]string{"frame": "is not a JSON request frame"}))
+			refusal := Invalid(map[string]string{"frame": "is not a JSON request frame"})
+			s.observe(startUnit(OutcomeRequest, "", ""), refusal)
+			s.respondError("", refusal)
 			continue
 		}
 		s.handle(&frame)
+	}
+}
+
+func closeCodeOf(err error) int {
+	var closeError *websocket.CloseError
+	switch {
+	case errors.As(err, &closeError):
+		return closeError.Code
+	case errors.Is(err, websocket.ErrReadLimit):
+		return websocket.CloseMessageTooBig
+	default:
+		return websocket.CloseAbnormalClosure
 	}
 }
 
@@ -233,7 +273,7 @@ func (s *socket) write() {
 		case <-s.ctx.Done():
 			return
 		case <-ping.C:
-			if err := s.connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
+			if err := s.connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.engine.options.WriteTimeout)); err != nil {
 				s.closeAfterWriteFailure(err)
 				return
 			}
@@ -256,7 +296,7 @@ func (s *socket) writeFrames(frames [][]byte) bool {
 		if s.ctx.Err() != nil {
 			return false
 		}
-		_ = s.connection.SetWriteDeadline(time.Now().Add(writeTimeout))
+		_ = s.connection.SetWriteDeadline(time.Now().Add(s.engine.options.WriteTimeout))
 		if err := s.connection.WriteMessage(websocket.TextMessage, frame); err != nil {
 			s.closeAfterWriteFailure(err)
 			return false
@@ -265,15 +305,15 @@ func (s *socket) writeFrames(frames [][]byte) bool {
 	return true
 }
 
-// closeAfterWriteFailure closes a socket that did not take a write in time 1013, a slow
-// consumer; any other failure means the peer is gone.
+// closeAfterWriteFailure closes a socket that did not take a write within WriteTimeout 1013,
+// a slow consumer; any other failure means the connection broke (1006).
 func (s *socket) closeAfterWriteFailure(err error) {
 	var netError net.Error
 	if errors.As(err, &netError) && netError.Timeout() {
 		s.close(CloseTooSlow, "the socket did not take a write in time")
 		return
 	}
-	s.close(CloseGoingAway, "")
+	s.close(websocket.CloseAbnormalClosure, "")
 }
 
 // enqueue hands frames to the writer; a queue past QueuedBytesPerSocket closes the socket
@@ -285,7 +325,8 @@ func (s *socket) enqueue(frames ...[]byte) {
 }
 
 // close ends the socket once: its subscriptions leave the index, its goroutines are
-// cancelled, the close frame is sent when the connection still takes one.
+// cancelled, the close frame is sent when the connection still takes one, and an
+// OutcomeClose reports the code.
 func (s *socket) close(code int, reason string) {
 	s.closeOnce.Do(func() {
 		s.mutex.Lock()
@@ -295,7 +336,7 @@ func (s *socket) close(code int, reason string) {
 			subscriptions = append(subscriptions, liveSubscription)
 		}
 		clear(s.subscriptions)
-		connection := s.connection
+		connection, failure := s.connection, s.failure
 		s.mutex.Unlock()
 		s.outbox.shut()
 		s.cancel()
@@ -305,19 +346,19 @@ func (s *socket) close(code int, reason string) {
 		if connection != nil {
 			s.writeClose(code, reason)
 		}
-		s.mutex.Lock()
-		failure := s.failure
-		s.mutex.Unlock()
-		closed := startUnit(OutcomeClose, "", "")
-		outcome := closed.outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), failure)
+		outcome := startUnit(OutcomeClose, "", "").outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), failure)
 		outcome.Status = code
-		s.engine.registry.Observe(s.ctx, outcome)
+		s.engine.observe(s.ctx, outcome)
 	})
 }
 
+// writeClose sends the close frame and closes the connection; 1006 is a code no frame may
+// carry (the connection broke), so then it only closes.
 func (s *socket) writeClose(code int, reason string) {
-	_ = s.connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(closeFrameTimeout)) // a peer that does not take it is gone
-	_ = s.connection.Close()                                                                                                             // the close of a hijacked connection reports nothing to act on
+	if code != websocket.CloseAbnormalClosure {
+		_ = s.connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(closeFrameTimeout)) // a peer that does not take it is gone
+	}
+	_ = s.connection.Close() // the close of a hijacked connection reports nothing to act on
 }
 
 // requestRevalidation asks the socket's re-validation goroutine for a fresh identity.
@@ -335,16 +376,9 @@ func (s *socket) revalidate() {
 		case <-s.ctx.Done():
 			return
 		case <-s.revalidation:
-			started := time.Now()
+			unit := startUnit(OutcomeRevalidate, "", "")
 			identity, err := s.freshIdentity(s.ctx)
-			status, _ := ResponseFor(err)
-			switch {
-			case err == nil:
-				status = http.StatusOK
-			case errors.Is(err, errIdentityGone):
-				status = http.StatusUnauthorized
-			}
-			s.engine.registry.Observe(s.ctx, Outcome{Kind: OutcomeRevalidate, Identity: identity, Status: status, Err: err, Duration: time.Since(started)})
+			s.engine.observe(s.ctx, unit.outcome(auth.WithIdentity(s.ctx, identity), err))
 		}
 	}
 }
@@ -363,15 +397,23 @@ func (s *socket) rerunIdentity(ctx context.Context) (*auth.Identity, error) {
 
 // freshIdentity asks the IdentitySource inside a query slot (D6). A gone identity closes the
 // socket 4401 and returns errIdentityGone (D7); a changed one re-runs every subscription
-// under the new rights; a failure of the source keeps the last identity, and the next op,
-// re-run or tick asks again.
+// under the new rights; a failure or panic of the source keeps the last identity, and the
+// next op, re-run or tick asks again. Every call is numbered when it starts: an answer older
+// than the adopted one is dropped and the newer identity returned; a gone answer closes the
+// socket whatever its number.
 func (s *socket) freshIdentity(ctx context.Context) (*auth.Identity, error) {
-	release, err := s.engine.acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	identity, err := s.engine.options.IdentitySource.Identify(ctx, s.request)
-	release()
+	s.mutex.Lock()
+	s.identityIssued++
+	sequence := s.identityIssued
+	s.mutex.Unlock()
+	var identity *auth.Identity
+	err := s.engine.inSlot(ctx, func() error {
+		return recovering(func() error {
+			var identifyError error
+			identity, identifyError = s.engine.options.IdentitySource.Identify(ctx, s.request)
+			return identifyError
+		})
+	})
 	gone := (identity == nil && err == nil) || errors.Is(err, auth.ErrUnauthenticated) || errors.Is(err, auth.ErrForbidden)
 	switch {
 	case gone:
@@ -380,15 +422,21 @@ func (s *socket) freshIdentity(ctx context.Context) (*auth.Identity, error) {
 	case err != nil:
 		return nil, fmt.Errorf("livewire: re-validate the socket's identity: %w", err)
 	}
-	s.adopt(identity)
-	return identity, nil
+	return s.adopt(identity, sequence), nil
 }
 
-// adopt takes a validated identity; a changed one marks every subscription dirty.
-func (s *socket) adopt(identity *auth.Identity) {
+// adopt takes the identity of Identify call sequence unless a later call's was adopted
+// already, and returns the identity the socket acts as. A changed identity marks every
+// subscription dirty and moves the socket's owner count.
+func (s *socket) adopt(identity *auth.Identity, sequence uint64) *auth.Identity {
 	s.mutex.Lock()
+	if sequence < s.identityAdopted {
+		current := s.identity
+		s.mutex.Unlock()
+		return current
+	}
 	changed := !reflect.DeepEqual(s.identity, identity)
-	s.identity, s.identifiedAt = identity, time.Now()
+	s.identity, s.identifiedAt, s.identityAdopted = identity, time.Now(), sequence
 	var subscriptions []*subscription
 	if changed {
 		for _, liveSubscription := range s.subscriptions {
@@ -396,9 +444,13 @@ func (s *socket) adopt(identity *auth.Identity) {
 		}
 	}
 	s.mutex.Unlock()
+	if changed {
+		s.engine.migrateOwner(s, OwnerKey(identity))
+	}
 	for _, liveSubscription := range subscriptions {
 		liveSubscription.markDirty()
 	}
+	return identity
 }
 
 func (s *socket) lastIdentity() *auth.Identity {
@@ -411,10 +463,10 @@ func (s *socket) lastIdentity() *auth.Identity {
 func (s *socket) concerns(key string) bool {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	return ownerKeyOf(s.identity) == key || ownerKeyOf(s.identity.Real()) == key
+	return OwnerKey(s.identity) == key || OwnerKey(s.identity.Real()) == key
 }
 
-// respond answers a request; err nil is a success with status and payload.
+// respond answers a request with success, its status and payload.
 func (s *socket) respond(id string, status int, payload json.RawMessage) {
 	s.send(ResponseFrame{ID: id, OK: true, Status: status, Payload: payload})
 }
@@ -434,6 +486,10 @@ func (s *socket) send(frame ResponseFrame) {
 		encoded, _ = json.Marshal(ResponseFrame{ID: frame.ID, Status: status, Error: &body}) //nolint:errchkjson // an ErrorBody always marshals
 	}
 	s.enqueue(encoded)
+}
+
+func (s *socket) observe(unit unitOfWork, err error) {
+	s.engine.observe(s.ctx, unit.outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), err))
 }
 
 // writeError answers a refused upgrade with the one error body.

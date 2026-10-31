@@ -22,20 +22,23 @@ import (
 // Transactor are required; AllowedOrigins is required unless SameHostOnly says that only the
 // request's own host may open a socket (D9). ChangeFeed is optional: without one, a
 // subscription re-runs only when its socket's identity changes and, when its filter carries
-// a relative time, on the safety tick. FilterStore enables
-// stored filters (D13), IdempotencyStore the replay of mutations (D16), PresenceStore the
-// join and leave ops and the presence reads (D37); each is optional and its feature is off
-// without it.
+// a relative time, on the safety tick. FilterStore enables stored filters (D13),
+// IdempotencyStore the replay of mutations (D16), PresenceStore the join and leave ops and
+// the presence reads (D37); each is optional and its feature is off without it. The
+// engine's outcomes go to the registry's Observer (D49).
 //
 // The limits (D10) default when zero: SubscriptionsPerSocket 64, InFlightPerSocket 16,
-// QueuedBytesPerSocket 8 MiB, FrameBytes 64 KiB, QueryConcurrency 32; SocketsPerOwner 0 is
-// unlimited. The intervals default when zero: RevalidateInterval 60 s (D6, the cache of a
-// socket's identity for re-runs and the tick that re-validates every socket),
-// SafetyTickInterval 30 s (the re-run of time-dependent subscriptions), PresenceHeartbeat
-// 30 s and PresenceExpiry 90 s (D37), DeliveryBatchWait 100 ms (the longest a push waits
-// after its first change, so a burst leaves as one push per subscription) and RetryInterval
-// 1 s (the first backoff of a failed re-run or change feed, doubling up to 32 times it).
-// No value may be negative; PresenceExpiry must exceed PresenceHeartbeat.
+// PresencesPerSocket 64 (records one socket may join at once), FiltersPerSocket 64 (inline
+// filters one socket may register, D13), QueuedBytesPerSocket 8 MiB, FrameBytes 64 KiB,
+// QueryConcurrency 32 (D52); SocketsPerOwner 0 is unlimited. The intervals default when
+// zero: RevalidateInterval 60 s (D6, the cache of a socket's identity for re-runs and the
+// tick that re-validates every socket), SafetyTickInterval 30 s (the re-run of
+// time-dependent subscriptions), PresenceHeartbeat 30 s and PresenceExpiry 90 s (D37),
+// DeliveryBatchWait 100 ms (the longest a push waits after its first change, so a burst
+// leaves as one push per subscription), RetryInterval 1 s (the first backoff of a failed
+// re-run or change feed, doubling up to 32 times it) and WriteTimeout 10 s (a write the
+// client does not take in time closes its socket 1013). No value may be negative;
+// PresenceExpiry must exceed PresenceHeartbeat.
 type EngineOptions struct {
 	Registry               *Registry
 	ChangeFeed             ChangeFeed
@@ -48,6 +51,8 @@ type EngineOptions struct {
 	SameHostOnly           bool
 	SubscriptionsPerSocket int
 	InFlightPerSocket      int
+	PresencesPerSocket     int
+	FiltersPerSocket       int
 	QueuedBytesPerSocket   int
 	FrameBytes             int64
 	QueryConcurrency       int
@@ -58,11 +63,14 @@ type EngineOptions struct {
 	PresenceExpiry         time.Duration
 	DeliveryBatchWait      time.Duration
 	RetryInterval          time.Duration
+	WriteTimeout           time.Duration
 }
 
 const (
 	defaultSubscriptionsPerSocket = 64
 	defaultInFlightPerSocket      = 16
+	defaultPresencesPerSocket     = 64
+	defaultFiltersPerSocket       = 64
 	defaultQueuedBytesPerSocket   = 8 << 20
 	defaultFrameBytes             = 64 << 10
 	defaultQueryConcurrency       = 32
@@ -72,6 +80,7 @@ const (
 	defaultPresenceExpiry         = 90 * time.Second
 	defaultDeliveryBatchWait      = 100 * time.Millisecond
 	defaultRetryInterval          = time.Second
+	defaultWriteTimeout           = 10 * time.Second
 	// maximumRetryDoublings caps a backoff at RetryInterval << 5.
 	maximumRetryDoublings = 5
 )
@@ -85,13 +94,14 @@ type Engine struct {
 	registry *Registry
 	origins  []string
 	upgrader websocket.Upgrader
-	// queries bounds every read, identity check and write the engine starts on behalf of a
-	// socket, so a burst of sockets never takes the connections REST requests need.
+	clock    clock
+	// queries bounds the work the engine does for sockets (D52).
 	queries   chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
 	running   atomic.Bool
-	// lifetimes counts every admitted socket until its goroutines ended; Close waits for it.
+	// lifetimes counts every admitted socket until its goroutines ended and every Run until
+	// it returned; Close waits for both.
 	lifetimes sync.WaitGroup
 
 	mutex         sync.Mutex
@@ -122,6 +132,7 @@ func NewEngine(options *EngineOptions) (*Engine, error) {
 		options:       resolved,
 		registry:      resolved.Registry,
 		origins:       origins,
+		clock:         systemClock{},
 		queries:       make(chan struct{}, resolved.QueryConcurrency),
 		done:          make(chan struct{}),
 		sockets:       map[*socket]struct{}{},
@@ -137,10 +148,10 @@ func NewEngine(options *EngineOptions) (*Engine, error) {
 }
 
 func (o *EngineOptions) validate() error {
-	negative := o.SubscriptionsPerSocket < 0 || o.InFlightPerSocket < 0 || o.QueuedBytesPerSocket < 0 ||
-		o.FrameBytes < 0 || o.QueryConcurrency < 0 || o.SocketsPerOwner < 0 ||
-		o.RevalidateInterval < 0 || o.SafetyTickInterval < 0 || o.PresenceHeartbeat < 0 ||
-		o.PresenceExpiry < 0 || o.DeliveryBatchWait < 0 || o.RetryInterval < 0
+	negative := o.SubscriptionsPerSocket < 0 || o.InFlightPerSocket < 0 || o.PresencesPerSocket < 0 ||
+		o.FiltersPerSocket < 0 || o.QueuedBytesPerSocket < 0 || o.FrameBytes < 0 || o.QueryConcurrency < 0 ||
+		o.SocketsPerOwner < 0 || o.RevalidateInterval < 0 || o.SafetyTickInterval < 0 || o.PresenceHeartbeat < 0 ||
+		o.PresenceExpiry < 0 || o.DeliveryBatchWait < 0 || o.RetryInterval < 0 || o.WriteTimeout < 0
 	switch {
 	case o.Registry == nil:
 		return errors.New("livewire: EngineOptions.Registry is required")
@@ -163,6 +174,8 @@ func (o *EngineOptions) validate() error {
 func (o *EngineOptions) applyDefaults() {
 	o.SubscriptionsPerSocket = cmp.Or(o.SubscriptionsPerSocket, defaultSubscriptionsPerSocket)
 	o.InFlightPerSocket = cmp.Or(o.InFlightPerSocket, defaultInFlightPerSocket)
+	o.PresencesPerSocket = cmp.Or(o.PresencesPerSocket, defaultPresencesPerSocket)
+	o.FiltersPerSocket = cmp.Or(o.FiltersPerSocket, defaultFiltersPerSocket)
 	o.QueuedBytesPerSocket = cmp.Or(o.QueuedBytesPerSocket, defaultQueuedBytesPerSocket)
 	o.FrameBytes = cmp.Or(o.FrameBytes, defaultFrameBytes)
 	o.QueryConcurrency = cmp.Or(o.QueryConcurrency, defaultQueryConcurrency)
@@ -172,20 +185,28 @@ func (o *EngineOptions) applyDefaults() {
 	o.PresenceExpiry = cmp.Or(o.PresenceExpiry, defaultPresenceExpiry)
 	o.DeliveryBatchWait = cmp.Or(o.DeliveryBatchWait, defaultDeliveryBatchWait)
 	o.RetryInterval = cmp.Or(o.RetryInterval, defaultRetryInterval)
+	o.WriteTimeout = cmp.Or(o.WriteTimeout, defaultWriteTimeout)
 }
 
+var defaultPorts = map[string]string{"http": "80", "https": "443"}
+
 // normalizeOrigins checks every allowed origin is a bare http or https origin and returns
-// them as browsers send the Origin header: lower case scheme://host[:port].
+// them as browsers send the Origin header: lower case scheme://host[:port], the scheme's
+// default port dropped.
 func normalizeOrigins(origins []string) ([]string, error) {
 	normalized := make([]string, 0, len(origins))
 	for _, origin := range origins {
 		parsed, err := url.Parse(origin)
-		bareOrigin := err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" &&
+		bareOrigin := err == nil && defaultPorts[parsed.Scheme] != "" && parsed.Host != "" &&
 			(parsed.Path == "" || parsed.Path == "/") && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.User == nil
 		if !bareOrigin {
 			return nil, fmt.Errorf("livewire: the allowed origin %q is not scheme://host[:port] with http or https", origin)
 		}
-		normalized = append(normalized, strings.ToLower(parsed.Scheme+"://"+parsed.Host))
+		host := parsed.Host
+		if parsed.Port() == defaultPorts[parsed.Scheme] {
+			host = parsed.Hostname()
+		}
+		normalized = append(normalized, strings.ToLower(parsed.Scheme+"://"+host))
 	}
 	return normalized, nil
 }
@@ -195,15 +216,26 @@ var errEngineRunning = errors.New("livewire: the engine is already running")
 // Run consumes the change feed and drives the ticks until ctx ends or Close is called, and
 // returns nil then. Every successful connect of the feed, the first included, re-runs every
 // subscription with a snapshot (section 5); a feed that fails is restarted after a backoff
-// with jitter, from RetryInterval doubling up to 32 times it, reset by a successful connect.
-// The ticks re-validate every socket's identity (RevalidateInterval), re-run the
-// time-dependent subscriptions (SafetyTickInterval), and refresh and sweep presences
-// (PresenceHeartbeat, PresenceExpiry). Run returns an error when it is already running.
+// with jitter, from RetryInterval doubling up to 32 times it, reset by a successful connect,
+// and reported as an OutcomeFeed. The ticks re-validate every socket's identity
+// (RevalidateInterval), re-run the time-dependent subscriptions (SafetyTickInterval), and
+// refresh and sweep presences (PresenceHeartbeat, PresenceExpiry). Run returns an error when
+// it is already running; after Close it returns nil at once. Close waits for it.
 func (e *Engine) Run(ctx context.Context) error {
 	if !e.running.CompareAndSwap(false, true) {
 		return errEngineRunning
 	}
 	defer e.running.Store(false)
+	e.mutex.Lock()
+	closing := e.closing
+	if !closing {
+		e.lifetimes.Add(1)
+	}
+	e.mutex.Unlock()
+	if closing {
+		return nil
+	}
+	defer e.lifetimes.Done()
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	var feed sync.WaitGroup
@@ -222,7 +254,7 @@ func (e *Engine) consumeFeed(ctx context.Context) {
 	var failures atomic.Int64 // the feed may call onResync from a goroutine of its own
 	connected := func() {
 		failures.Store(0)
-		e.resync()
+		e.resynchronize()
 	}
 	for ctx.Err() == nil {
 		started := time.Now()
@@ -233,17 +265,17 @@ func (e *Engine) consumeFeed(ctx context.Context) {
 		if err == nil {
 			err = errors.New("livewire: the change feed returned before its context ended")
 		}
-		e.registry.Observe(ctx, Outcome{Kind: OutcomeFeed, Status: http.StatusInternalServerError, Err: err, Duration: time.Since(started)})
-		delay := backoff(e.options.RetryInterval, int(failures.Add(1)-1))
+		e.observe(ctx, Outcome{Kind: OutcomeFeed, Status: http.StatusInternalServerError, Err: err, Duration: time.Since(started)})
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-time.After(backoff(e.options.RetryInterval, int(failures.Add(1)-1))):
 		}
 	}
 }
 
-// tick runs the periodic work until ctx ends or the engine closes.
+// tick runs the periodic work until ctx ends or the engine closes; a panic in one tick's
+// work costs that tick.
 func (e *Engine) tick(ctx context.Context) {
 	revalidate := time.NewTicker(e.options.RevalidateInterval)
 	defer revalidate.Stop()
@@ -252,17 +284,21 @@ func (e *Engine) tick(ctx context.Context) {
 	presence := time.NewTicker(e.options.PresenceHeartbeat)
 	defer presence.Stop()
 	for {
+		var work func()
 		select {
 		case <-ctx.Done():
 			return
 		case <-e.done:
 			return
 		case <-revalidate.C:
-			e.RevalidateAll()
+			work = e.RevalidateAll
 		case <-safety.C:
-			e.markTimeDependent()
+			work = e.markTimeDependent
 		case <-presence.C:
-			e.refreshPresences(ctx)
+			work = func() { e.refreshPresences(ctx) }
+		}
+		if err := recovering(func() error { work(); return nil }); err != nil {
+			e.observe(ctx, Outcome{Kind: OutcomeHeartbeat, Status: http.StatusInternalServerError, Err: err})
 		}
 	}
 }
@@ -285,8 +321,8 @@ func recovering(work func() error) (err error) {
 }
 
 // Close ends every socket with CloseGoingAway, stops Run, refuses new sockets with 503 and
-// waits until every socket's goroutines ended or ctx is done, which it returns then. Close
-// may be called more than once.
+// waits until every socket's goroutines and Run ended or ctx is done, which it returns then.
+// Close may be called more than once.
 func (e *Engine) Close(ctx context.Context) error {
 	e.closeOnce.Do(func() { close(e.done) })
 	e.mutex.Lock()
@@ -295,7 +331,12 @@ func (e *Engine) Close(ctx context.Context) error {
 	e.mutex.Unlock()
 	var closing sync.WaitGroup
 	for _, clientSocket := range open {
-		closing.Go(func() { clientSocket.close(CloseGoingAway, "the server is shutting down") })
+		closing.Go(func() {
+			_ = recovering(func() error { // a panic here is already contained; the socket is closed or closing
+				clientSocket.close(CloseGoingAway, "the server is shutting down")
+				return nil
+			})
+		})
 	}
 	closing.Wait()
 	ended := make(chan struct{})
@@ -325,7 +366,7 @@ func (e *Engine) RevalidateAll() {
 }
 
 // RevalidateOwner is RevalidateAll for the sockets whose effective or real identity has the
-// owner key ("provider:subject", Owner.Key).
+// owner key (OwnerKey).
 func (e *Engine) RevalidateOwner(key string) {
 	e.mutex.Lock()
 	open := e.openSockets()
@@ -346,21 +387,26 @@ func (e *Engine) openSockets() []*socket {
 	return open
 }
 
-// acquire takes a query slot; the caller runs release when its work is done.
-func (e *Engine) acquire(ctx context.Context) (release func(), err error) {
+// inSlot runs work holding a query slot (D52), released whatever work does.
+func (e *Engine) inSlot(ctx context.Context, work func() error) error {
 	select {
 	case e.queries <- struct{}{}:
-		return func() { <-e.queries }, nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("livewire: wait for a query slot: %w", ctx.Err())
+		return fmt.Errorf("livewire: wait for a query slot: %w", ctx.Err())
 	}
+	defer func() { <-e.queries }()
+	return work()
 }
 
 // index makes a subscription reachable by the changes of its tables in its partition (D25)
-// and by the safety tick when it is time-dependent.
+// and by the safety tick when it is time-dependent. An ended subscription is left out: its
+// unindex may have run already.
 func (e *Engine) index(liveSubscription *subscription) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
+	if liveSubscription.isEnded() {
+		return
+	}
 	for _, table := range liveSubscription.tables {
 		partitions := e.byTable[table]
 		if partitions == nil {
@@ -401,13 +447,13 @@ func (e *Engine) route(change Change) {
 	e.mutex.Lock()
 	partitions := e.byTable[change.Table]
 	var reached []*subscription
-	for partition, subscriptions := range partitions {
-		if change.Partition != "" && partition != "" && partition != change.Partition {
-			continue
+	if change.Partition == "" {
+		for _, subscriptions := range partitions {
+			reached = appendSubscriptions(reached, subscriptions)
 		}
-		for liveSubscription := range subscriptions {
-			reached = append(reached, liveSubscription)
-		}
+	} else {
+		reached = appendSubscriptions(reached, partitions[change.Partition])
+		reached = appendSubscriptions(reached, partitions[""])
 	}
 	e.mutex.Unlock()
 	for _, liveSubscription := range reached {
@@ -415,33 +461,49 @@ func (e *Engine) route(change Change) {
 	}
 }
 
-// resync re-runs every subscription with a snapshot: the feed (re)connected and may have
-// missed changes.
-func (e *Engine) resync() {
+func appendSubscriptions(reached []*subscription, subscriptions map[*subscription]struct{}) []*subscription {
+	for liveSubscription := range subscriptions {
+		reached = append(reached, liveSubscription)
+	}
+	return reached
+}
+
+// resynchronize re-runs every subscription with a snapshot: the feed (re)connected and may
+// have missed changes.
+func (e *Engine) resynchronize() {
 	e.mutex.Lock()
 	var all []*subscription
 	for _, partitions := range e.byTable {
 		for _, subscriptions := range partitions {
-			for liveSubscription := range subscriptions {
-				all = append(all, liveSubscription)
-			}
+			all = appendSubscriptions(all, subscriptions)
 		}
 	}
 	e.mutex.Unlock()
 	for _, liveSubscription := range all {
-		liveSubscription.markResync()
+		liveSubscription.markResynchronize()
 	}
 }
 
 // markTimeDependent re-runs the subscriptions whose filter carries a relative time.
 func (e *Engine) markTimeDependent() {
 	e.mutex.Lock()
-	reached := make([]*subscription, 0, len(e.timeDependent))
-	for liveSubscription := range e.timeDependent {
-		reached = append(reached, liveSubscription)
-	}
+	reached := appendSubscriptions(nil, e.timeDependent)
 	e.mutex.Unlock()
 	for _, liveSubscription := range reached {
 		liveSubscription.markDirty()
 	}
+}
+
+// clock is the time the delivery batch waits on; the engine's tests replace it.
+type clock interface {
+	Now() time.Time
+	AfterFunc(delay time.Duration, work func()) func() bool
+}
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+
+func (systemClock) AfterFunc(delay time.Duration, work func()) func() bool {
+	return time.AfterFunc(delay, work).Stop
 }

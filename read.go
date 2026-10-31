@@ -5,18 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"reflect"
 	"strings"
-	"time"
-
-	"github.com/govengers/auth"
 
 	"github.com/govengers/livewire/query"
 )
 
 // ReadKind says which read of a declaration a request names. On the socket it is the
-// target's suffix after a dot: "parts" is the main read, "parts.item" the item read,
+// target's suffix after a dot (D46): "parts" is the main read, "parts.item" the item read,
 // "parts.distinct" the distinct read, "parts.presence" the presences on one record.
 type ReadKind string
 
@@ -29,7 +25,7 @@ const (
 )
 
 // ParameterPresenceKey is the parameter of a presence read, join and leave that names the
-// record (D37).
+// record (D37): the item key of a resource, any key within an object.
 const ParameterPresenceKey = "key"
 
 // PresenceTable is the table whose changes re-run presence subscriptions; the
@@ -56,24 +52,80 @@ type PresenceItem struct {
 // re-runs run too (D23): the target's static Check (D8), the parameters (a resource's
 // reserved ones, a stored filter resolved through the FilterStore, D13), the tenant (D42),
 // then in a read-only engine transaction (D45) the scope, the loader and the field redaction
-// (D39). The payload is the REST body (a ListResponse for lists, D14); it is answered with
-// 200. A refusal or failure is the error, answered through ResponseFor. Read reports an
+// (D39). A presence read first runs the record's own read under the caller (a resource's item
+// read for the key, an object's read), so Scope and ownership decide who sees who is there.
+// The payload is the REST body (a ListResponse for lists, D14); it is answered with 200. A
+// refusal or failure is the error, answered through ResponseFor. Read reports an
 // OutcomeRequest to the registry's Observer.
 func (e *Engine) Read(ctx context.Context, request ReadRequest) (json.RawMessage, error) {
 	unit := startUnit(OutcomeRequest, "", request.Target)
 	resolved, result, err := e.read(ctx, request)
-	e.registry.Observe(ctx, unit.readOutcome(ctx, resolved, err))
+	e.observe(ctx, unit.readOutcome(ctx, resolved, err))
 	if err != nil {
 		return nil, err
 	}
 	return result.payload, nil
 }
 
-// resolvedRead is a read past its static gate: the declaration, the decoded parameters and
-// the tenant.
+// readPlan is what a declaration and a read kind make of a read, decided in one place.
+type readPlan struct {
+	declaration Declaration
+	kind        ReadKind
+	resource    *Resource // the declaration when it is a resource
+	// answersList: the read answers a ListResponse, diffed by id when subscribed.
+	answersList bool
+	// typedParameters: the declaration's own parameters are decoded (lists and objects).
+	typedParameters bool
+	// readParameters: a resource's reserved parameters are read (its list and distinct reads).
+	readParameters bool
+}
+
+// planRead decides what the request reads; a name that is no declaration, or a kind the
+// declaration does not have, is 404. Presence needs a PresenceStore and a record read: a
+// resource with an item key, or an object.
+func (e *Engine) planRead(request ReadRequest) (*readPlan, error) {
+	declaration, ok := e.registry.Lookup(request.Target)
+	if !ok {
+		return nil, NotFound()
+	}
+	plan := &readPlan{declaration: declaration, kind: request.Kind}
+	plan.resource, _ = declaration.(*Resource)
+	switch declaration.Kind() {
+	case KindResource:
+		plan.answersList, plan.readParameters = true, true
+	case KindList:
+		plan.answersList, plan.typedParameters = true, true
+	case KindObject:
+		plan.typedParameters = true
+	case KindMutation, KindUpload:
+		return nil, NotFound()
+	}
+	readable := false
+	switch request.Kind {
+	case ReadMain:
+		readable = true
+	case ReadItem:
+		readable = plan.resource != nil && plan.resource.Item() != nil
+		plan.answersList, plan.readParameters = false, false
+	case ReadDistinct:
+		readable = plan.resource != nil && plan.resource.DistinctPath() != ""
+		plan.answersList = false
+	case ReadPresence:
+		hasRecordRead := declaration.Kind() == KindObject || (plan.resource != nil && plan.resource.Item() != nil)
+		readable = hasRecordRead && e.options.PresenceStore != nil
+		plan.answersList, plan.readParameters = true, false
+	}
+	if !readable {
+		return nil, NotFound()
+	}
+	return plan, nil
+}
+
+// resolvedRead is a read past its static gate: the plan, the decoded parameters and the
+// tenant.
 type resolvedRead struct {
 	request        ReadRequest
-	declaration    Declaration
+	plan           *readPlan
 	parameters     any             // a list's or object's decoded parameters
 	readParameters *ReadParameters // a resource's reserved parameters, the stored filter resolved
 	presenceKey    string
@@ -84,7 +136,6 @@ type resolvedRead struct {
 // subscription diffs.
 type readResult struct {
 	payload json.RawMessage
-	list    bool
 	items   json.RawMessage
 	total   int
 }
@@ -99,17 +150,18 @@ func (e *Engine) read(ctx context.Context, request ReadRequest) (*resolvedRead, 
 	return resolved, result, err
 }
 
-// resolve finds the declaration, runs its static check and decodes the parameters and the
-// tenant (D8: before anything is resolved against the database).
+// resolve plans the read, runs its static check and decodes the parameters and the tenant
+// (D8: before anything is resolved against the database), then a stored filter.
 func (e *Engine) resolve(ctx context.Context, request ReadRequest) (*resolvedRead, error) {
-	declaration, err := e.readDeclaration(request)
+	plan, err := e.planRead(request)
 	if err != nil {
 		return nil, err
 	}
-	if err := declaration.Check()(ctx); err != nil {
+	if err := plan.declaration.Check()(ctx); err != nil {
 		return nil, err
 	}
-	resolved := &resolvedRead{request: request, declaration: declaration}
+	request.Source = sourceOrEmpty(request.Source)
+	resolved := &resolvedRead{request: request, plan: plan}
 	if err := resolved.decode(); err != nil {
 		return nil, err
 	}
@@ -122,50 +174,21 @@ func (e *Engine) resolve(ctx context.Context, request ReadRequest) (*resolvedRea
 	return resolved, nil
 }
 
-// readDeclaration is the declaration a read names; anything else is 404.
-func (e *Engine) readDeclaration(request ReadRequest) (Declaration, error) {
-	declaration, ok := e.registry.Lookup(request.Target)
-	if !ok {
-		return nil, NotFound()
-	}
-	resource, isResource := declaration.(*Resource)
-	readable := false
-	switch request.Kind {
-	case ReadMain:
-		readable = isReadKind(declaration)
-	case ReadItem:
-		readable = isResource && resource.Item() != nil
-	case ReadDistinct:
-		readable = isResource && resource.DistinctPath() != ""
-	case ReadPresence:
-		readable = isReadKind(declaration) && e.options.PresenceStore != nil
-	}
-	if !readable {
-		return nil, NotFound()
-	}
-	return declaration, nil
-}
-
-func isReadKind(declaration Declaration) bool {
-	switch declaration.Kind() {
-	case KindResource, KindList, KindObject:
-		return true
-	default:
-		return false
-	}
-}
-
 func (r *resolvedRead) decode() error {
-	r.request.Source = sourceOrEmpty(r.request.Source)
 	source := r.request.Source
 	var err error
-	switch {
-	case r.request.Kind == ReadPresence:
+	if r.plan.typedParameters {
+		if r.parameters, err = r.plan.declaration.DecodeParameters(source); err != nil {
+			return err
+		}
+	}
+	if r.plan.readParameters {
+		if r.readParameters, err = ReadParametersFrom(source); err != nil {
+			return err
+		}
+	}
+	if r.plan.kind == ReadPresence {
 		r.presenceKey, err = presenceKeyFrom(source)
-	case r.declaration.Kind() == KindResource:
-		r.readParameters, err = ReadParametersFrom(source)
-	default:
-		r.parameters, err = r.declaration.DecodeParameters(source)
 	}
 	return err
 }
@@ -209,21 +232,34 @@ func (e *Engine) resolveStoredFilter(ctx context.Context, resolved *resolvedRead
 	}
 	stored, err := e.options.FilterStore.Get(ctx, owner, parameters.FilterID)
 	if err != nil {
-		return err
+		return fmt.Errorf("livewire: the stored filter %q of %s: %w", parameters.FilterID, resolved.request.Target, err)
 	}
-	if stored.Resource != resolved.declaration.Name() {
+	if stored.Resource != resolved.request.Target {
 		return NotFound()
 	}
 	parameters.Filter = stored.Document
 	return nil
 }
 
-// load runs the loader of a resolved read in a read-only engine transaction (D45).
+// load runs a resolved read in a read-only engine transaction (D45). A presence read runs
+// its record read there, then lists the presences from the PresenceStore outside it (D50).
 func (e *Engine) load(ctx context.Context, resolved *resolvedRead) (*readResult, error) {
 	ctx = WithTenant(ctx, resolved.tenant)
-	if resolved.request.Kind == ReadPresence {
-		return e.loadPresence(ctx, resolved) // the presence store keeps its own rows, outside the app's transaction
+	result, err := e.inReadTransaction(ctx, resolved, loadDeclaration)
+	if err != nil || resolved.plan.kind != ReadPresence {
+		return result, err
 	}
+	return e.loadPresence(ctx, resolved)
+}
+
+// checkRecord runs the record read of a presence operation under the caller: a record the
+// caller may not read is refused with the read's own error.
+func (e *Engine) checkRecord(ctx context.Context, resolved *resolvedRead) error {
+	_, err := e.inReadTransaction(WithTenant(ctx, resolved.tenant), resolved, loadDeclaration)
+	return err
+}
+
+func (e *Engine) inReadTransaction(ctx context.Context, resolved *resolvedRead, run func(ctx context.Context, resolved *resolvedRead) (*readResult, error)) (*readResult, error) {
 	transaction, err := e.options.Transactor.Begin(ctx, TransactionDetails{Tenant: resolved.tenant, ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("livewire: begin the read transaction of %q: %w", resolved.request.Target, err)
@@ -231,7 +267,7 @@ func (e *Engine) load(ctx context.Context, resolved *resolvedRead) (*readResult,
 	var result *readResult
 	err = recovering(func() error {
 		var loadError error
-		result, loadError = loadDeclaration(WithTransaction(ctx, transaction.Handle()), resolved)
+		result, loadError = run(WithTransaction(ctx, transaction.Handle()), resolved)
 		return loadError
 	})
 	if err != nil {
@@ -243,16 +279,29 @@ func (e *Engine) load(ctx context.Context, resolved *resolvedRead) (*readResult,
 	return result, nil
 }
 
+// loadDeclaration runs the loader the plan names; for a presence read that is the record's
+// read, whose answer only gates the presences.
 func loadDeclaration(ctx context.Context, resolved *resolvedRead) (*readResult, error) {
-	switch declaration := resolved.declaration.(type) {
+	plan := resolved.plan
+	switch declaration := plan.declaration.(type) {
 	case *Resource:
-		return loadResource(ctx, declaration, resolved)
+		switch plan.kind {
+		case ReadItem:
+			return loadItem(ctx, declaration, resolved.request.Source)
+		case ReadPresence:
+			return loadItem(ctx, declaration, MapSource{declaration.Item().Parameter: resolved.presenceKey})
+		case ReadDistinct:
+			return loadDistinct(ctx, declaration, resolved.readParameters)
+		case ReadMain:
+		}
+		return loadPage(ctx, declaration, resolved.readParameters)
 	case *List:
 		items, err := declaration.Load(ctx, resolved.parameters)
 		if err != nil {
 			return nil, err
 		}
-		return listResult(ctx, declaration.Fields(), items)
+		count := reflect.ValueOf(items).Len() // the loaders of a List return a slice
+		return pageResult(ctx, declaration.Fields(), items, query.Page{Limit: count}, count)
 	case *Object:
 		item, err := declaration.Load(ctx, resolved.parameters)
 		if err != nil {
@@ -264,39 +313,44 @@ func loadDeclaration(ctx context.Context, resolved *resolvedRead) (*readResult, 
 	}
 }
 
-func loadResource(ctx context.Context, resource *Resource, resolved *resolvedRead) (*readResult, error) {
-	switch resolved.request.Kind {
-	case ReadItem:
-		listQuery, err := resource.ItemQuery(ctx, resolved.request.Source)
-		if err != nil {
-			return nil, err
-		}
-		item, err := resource.LoadItem(ctx, listQuery)
-		if err != nil {
-			return nil, err
-		}
-		return itemResult(ctx, resource.Fields(), item)
-	case ReadDistinct:
-		listQuery, field, err := resource.DistinctQuery(ctx, resolved.readParameters)
-		if err != nil {
-			return nil, err
-		}
-		values, err := resource.LoadDistinct(ctx, field.Name, listQuery)
-		if err != nil {
-			return nil, err
-		}
-		return marshaledResult(values)
-	default:
-		listQuery, err := resource.ListQuery(ctx, resolved.readParameters)
-		if err != nil {
-			return nil, err
-		}
-		items, total, err := resource.LoadList(ctx, listQuery)
-		if err != nil {
-			return nil, err
-		}
-		return pageResult(ctx, resource.Fields(), items, query.Page{Limit: listQuery.Limit, Offset: listQuery.Offset}, total)
+func loadItem(ctx context.Context, resource *Resource, source ParameterSource) (*readResult, error) {
+	listQuery, err := resource.ItemQuery(ctx, source)
+	if err != nil {
+		return nil, err
 	}
+	item, err := resource.LoadItem(ctx, listQuery)
+	if err != nil {
+		return nil, err
+	}
+	return itemResult(ctx, resource.Fields(), item)
+}
+
+func loadDistinct(ctx context.Context, resource *Resource, parameters *ReadParameters) (*readResult, error) {
+	listQuery, field, err := resource.DistinctQuery(ctx, parameters)
+	if err != nil {
+		return nil, err
+	}
+	values, err := resource.LoadDistinct(ctx, field.Name, listQuery)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("livewire: marshal the distinct values: %w", err)
+	}
+	return &readResult{payload: payload}, nil
+}
+
+func loadPage(ctx context.Context, resource *Resource, parameters *ReadParameters) (*readResult, error) {
+	listQuery, err := resource.ListQuery(ctx, parameters)
+	if err != nil {
+		return nil, err
+	}
+	items, total, err := resource.LoadList(ctx, listQuery)
+	if err != nil {
+		return nil, err
+	}
+	return pageResult(ctx, resource.Fields(), items, query.Page{Limit: listQuery.Limit, Offset: listQuery.Offset}, total)
 }
 
 // listBody is ListResponse with the items already marshaled and redacted.
@@ -305,12 +359,6 @@ type listBody struct {
 	Offset int             `json:"offset"`
 	Total  int             `json:"total"`
 	Items  json.RawMessage `json:"items"`
-}
-
-// listResult answers every item a typed-parameters list loaded: one page of all of them.
-func listResult(ctx context.Context, fields query.Fields, items any) (*readResult, error) {
-	count := reflect.ValueOf(items).Len() // the loaders of a List return a slice
-	return pageResult(ctx, fields, items, query.Page{Limit: count}, count)
 }
 
 func pageResult(ctx context.Context, fields query.Fields, items any, page query.Page, total int) (*readResult, error) {
@@ -326,7 +374,7 @@ func pageResult(ctx context.Context, fields query.Fields, items any, page query.
 	if err != nil {
 		return nil, fmt.Errorf("livewire: marshal the list: %w", err)
 	}
-	return &readResult{payload: payload, list: true, items: redacted, total: total}, nil
+	return &readResult{payload: payload, items: redacted, total: total}, nil
 }
 
 func itemResult(ctx context.Context, fields query.Fields, item any) (*readResult, error) {
@@ -341,19 +389,16 @@ func itemResult(ctx context.Context, fields query.Fields, item any) (*readResult
 	return &readResult{payload: redacted}, nil
 }
 
-func marshaledResult(value any) (*readResult, error) {
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("livewire: marshal the answer: %w", err)
-	}
-	return &readResult{payload: payload}, nil
-}
-
 // loadPresence answers the presences on one record of the declaration (D37).
 func (e *Engine) loadPresence(ctx context.Context, resolved *resolvedRead) (*readResult, error) {
-	presences, err := e.options.PresenceStore.List(ctx, resolved.tenant, resolved.declaration.Name(), resolved.presenceKey)
+	var presences []Presence
+	err := recovering(func() error {
+		var listError error
+		presences, listError = e.options.PresenceStore.List(ctx, resolved.tenant, resolved.request.Target, resolved.presenceKey)
+		return listError
+	})
 	if err != nil {
-		return nil, fmt.Errorf("livewire: list the presences on %s %q: %w", resolved.declaration.Name(), resolved.presenceKey, err)
+		return nil, fmt.Errorf("livewire: list the presences on %s %q: %w", resolved.request.Target, resolved.presenceKey, err)
 	}
 	items := make([]PresenceItem, 0, len(presences))
 	for _, presence := range presences {
@@ -366,41 +411,8 @@ func (e *Engine) loadPresence(ctx context.Context, resolved *resolvedRead) (*rea
 	return pageResult(ctx, nil, items, query.Page{Limit: len(items)}, len(items))
 }
 
-// unitOfWork is one unit of work the engine reports to the Observer (D4, D30).
-type unitOfWork struct {
-	kind         OutcomeKind
-	operation    Operation
-	target       string
-	subscription string
-	started      time.Time
-}
-
-func startUnit(kind OutcomeKind, operation Operation, target string) unitOfWork {
-	return unitOfWork{kind: kind, operation: operation, target: target, started: time.Now()}
-}
-
-// outcome reports the unit with the status the error answers, 200 without one.
-func (u unitOfWork) outcome(ctx context.Context, err error) Outcome {
-	outcome := Outcome{
-		Kind: u.kind, Operation: u.operation, Target: u.target, Subscription: u.subscription,
-		Identity: auth.IdentityFrom(ctx), Tenant: TenantFrom(ctx), Status: http.StatusOK, Err: err, Duration: time.Since(u.started),
-	}
-	if err != nil {
-		outcome.Status, _ = ResponseFor(err)
-	}
-	return outcome
-}
-
-// readOutcome is outcome with what the read resolved; resolved is nil when it failed before.
-func (u unitOfWork) readOutcome(ctx context.Context, resolved *resolvedRead, err error) Outcome {
-	outcome := u.outcome(ctx, err)
-	if resolved != nil {
-		outcome.Tenant, outcome.Parameters = resolved.tenant, resolved.parameters
-	}
-	return outcome
-}
-
-// parseTarget splits a socket target into the declaration's name and the read kind.
+// parseTarget splits a socket target at its first dot: the declaration's name before it, the
+// ReadKind after it (D46); an unknown kind plans as 404.
 func parseTarget(target string) (string, ReadKind) {
 	name, kind, _ := strings.Cut(target, ".")
 	return name, ReadKind(kind)

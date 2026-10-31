@@ -31,7 +31,17 @@ func OwnerOf(ctx context.Context) (Owner, bool) {
 	if identity == nil {
 		return Owner{}, false
 	}
-	return Owner{Key: identity.Provider + ":" + identity.Subject, Tenant: TenantFrom(ctx)}, true
+	return Owner{Key: OwnerKey(identity), Tenant: TenantFrom(ctx)}, true
+}
+
+// OwnerKey is the key an identity owns rows, sockets and stored filters under:
+// "provider:subject". Engine.RevalidateOwner and SocketsPerOwner take the same key; a nil
+// identity has the key "".
+func OwnerKey(identity *auth.Identity) string {
+	if identity == nil {
+		return ""
+	}
+	return identity.Provider + ":" + identity.Subject
 }
 
 // ChangeOperation is what happened to a row.
