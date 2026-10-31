@@ -17,10 +17,13 @@ const (
 	OperationPing        Operation = "ping"
 )
 
-// RequestFrame is one client request on the socket. Parameters are the target's parameters
-// by name as a REST query string would carry them (a list parameter is one comma-separated
-// value); Body is the mutation body of a call or the calls of a batch; IdempotencyKey is the
-// Idempotency-Key of a call or batch (D16).
+// RequestFrame is one client request on the socket. Target names the declaration of a read
+// with the read kind after a dot ("parts", "parts.item", "parts.distinct", "parts.presence";
+// ReadKind), the mutation of a call, the declaration of a join or leave, and the
+// subscription of an unsubscribe. Parameters are the target's parameters by name as a REST
+// query string would carry them (a list parameter is one comma-separated value); Body is the
+// mutation body of a call, the calls of a batch (a JSON array of BatchCall) or the state of
+// a join; IdempotencyKey is the Idempotency-Key of a call or batch (D16).
 type RequestFrame struct {
 	ID             string            `json:"id"`
 	Operation      Operation         `json:"op"`
