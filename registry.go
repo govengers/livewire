@@ -51,7 +51,7 @@ func NewRegistry(options *RegistryOptions) (*Registry, error) {
 
 // Add registers declarations in order. It returns the first mistake it finds: a nil or
 // wrapped declaration, one that failed its own validation or belongs to another registry, the
-// reserved name "batch" (the namespace of batch Idempotency-Keys, D33), a duplicate name, a
+// reserved name "batch" (the target of a batch's outcomes, D33), a duplicate name, a
 // duplicate method and route pattern (placeholder names aside; a resource's item and
 // distinct routes count), a mutation whose Resource or Effect target is not registered by
 // the end of the call. Nothing is added and no declaration is changed when any
@@ -144,7 +144,7 @@ func (s *staging) stage(declaration Declaration) error {
 	case shared.registry != nil && shared.registry != s.registry:
 		return fmt.Errorf("livewire: %s %q is registered with another registry", kind, name)
 	case name == batchMutation:
-		return fmt.Errorf("livewire: %s %q: the name is reserved: a batch's Idempotency-Key is reserved under it (D33)", kind, name)
+		return fmt.Errorf("livewire: %s %q: the name is reserved: a batch's outcomes carry it as their target (D33)", kind, name)
 	}
 	if _, exists := s.byName[name]; exists {
 		return fmt.Errorf("livewire: %s %q: the name is already registered", kind, name)

@@ -408,16 +408,35 @@ func (e *Engine) inSlot(ctx context.Context, work func() error) error {
 		return fmt.Errorf("livewire: wait for a query slot: %w", ctx.Err())
 	}
 	defer func() { <-e.queries }()
+	if err := ctx.Err(); err != nil { // a slot and the cancellation were both ready; the work is over
+		return fmt.Errorf("livewire: wait for a query slot: %w", err)
+	}
 	return work()
 }
 
 // index makes a subscription reachable by the changes of each of its tables in that
-// table's partition (D25)
-// and by the safety tick when it is time-dependent. An ended subscription is left out: its
-// unindex may have run already.
+// table's partition (D25) and by the safety tick when it is time-dependent. An ended
+// subscription is left out: its unindex may have run already.
 func (e *Engine) index(liveSubscription *subscription) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
+	e.indexLocked(liveSubscription)
+}
+
+// repartition moves a subscription's declaration tables to another partition, the presence
+// table staying in the tenant; the next change of the new partition reaches it.
+func (e *Engine) repartition(liveSubscription *subscription, tables []string, partition string) {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+	e.unindexLocked(liveSubscription)
+	for _, table := range tables {
+		liveSubscription.partitions[table] = partition
+	}
+	e.indexLocked(liveSubscription)
+}
+
+// indexLocked is index; e.mutex is held.
+func (e *Engine) indexLocked(liveSubscription *subscription) {
 	if liveSubscription.isEnded() {
 		return
 	}
@@ -441,6 +460,11 @@ func (e *Engine) index(liveSubscription *subscription) {
 func (e *Engine) unindex(liveSubscription *subscription) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
+	e.unindexLocked(liveSubscription)
+}
+
+// unindexLocked is unindex; e.mutex is held.
+func (e *Engine) unindexLocked(liveSubscription *subscription) {
 	for table, partition := range liveSubscription.partitions {
 		partitions := e.byTable[table]
 		delete(partitions[partition], liveSubscription)

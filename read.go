@@ -206,7 +206,6 @@ func (r *resolvedRead) decode() error {
 	return err
 }
 
-// sourceOrEmpty is source, or no parameters for nil.
 func sourceOrEmpty(source ParameterSource) ParameterSource {
 	if source == nil {
 		return MapSource{}

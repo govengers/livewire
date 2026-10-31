@@ -64,9 +64,9 @@ type BatchResult struct {
 }
 
 const (
-	// maximumBatchCalls bounds the calls of one batch.
 	maximumBatchCalls = 100
-	// batchMutation is the name a batch's Idempotency-Key is reserved under.
+	// batchMutation is the target of a batch's outcomes and the prefix of the name its
+	// Idempotency-Key is reserved under (batchReservation).
 	batchMutation = "batch"
 )
 

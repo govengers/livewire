@@ -29,11 +29,14 @@ type subscription struct {
 	socket *socket
 	// request is what every re-run reads: a stored or inline filter resolved at subscribe
 	// travels inline, so a re-run never asks the FilterStore.
-	request       ReadRequest
-	tenant        string // resolved at subscribe; a re-run under another tenant ends it
-	list          bool
-	presence      bool
-	partitions    map[string]string // the partition of each table (D25)
+	request  ReadRequest
+	tenant   string // resolved at subscribe; a re-run under another tenant ends it
+	list     bool
+	presence bool
+	// partitions is the partition of each table (D25), guarded by engine.mutex; partition is
+	// what the declaration's resolver last named, read and written by re-runs only.
+	partitions    map[string]string
+	partition     string
 	timeDependent bool
 	//nolint:containedctx // the CON-002 exception of the repository: the subscription's lifetime, cancelled by end
 	ctx    context.Context
@@ -203,10 +206,7 @@ func (s *socket) newSubscription(ctx context.Context, resolved *resolvedRead) (*
 	if err != nil {
 		return nil, err
 	}
-	partition := resolved.tenant
-	if declaration, ok := plan.declaration.(partitioned); ok && declaration.Partition() != nil {
-		partition = declaration.Partition()(WithTenant(ctx, resolved.tenant), resolved.parameters)
-	}
+	partition := partitionOf(ctx, resolved)
 	partitions := map[string]string{}
 	for _, table := range plan.declaration.Tables() {
 		partitions[table] = partition
@@ -217,9 +217,19 @@ func (s *socket) newSubscription(ctx context.Context, resolved *resolvedRead) (*
 	request := resolved.request
 	request.Source = rerunSource(resolved)
 	return &subscription{
-		socket: s, request: request, tenant: resolved.tenant, partitions: partitions, presence: presence,
+		socket: s, request: request, tenant: resolved.tenant, partitions: partitions, partition: partition, presence: presence,
 		timeDependent: timeDependent, list: plan.answersList, dirty: make(chan struct{}, 1),
 	}, nil
+}
+
+// partitionOf is the partition of a read's declaration tables: its resolver's, or the
+// tenant (D25). A resolver may follow the identity in ctx, so re-runs ask it again.
+func partitionOf(ctx context.Context, resolved *resolvedRead) string {
+	declaration, ok := resolved.plan.declaration.(partitioned)
+	if !ok || declaration.Partition() == nil {
+		return resolved.tenant
+	}
+	return declaration.Partition()(WithTenant(ctx, resolved.tenant), resolved.parameters)
 }
 
 // rerunSource is the subscription's parameters with a stored filter replaced by its document
@@ -461,6 +471,9 @@ func (s *subscription) rerun() {
 // adopt between the marks and the identity, or a fresh identity the expired cache fetched,
 // is no reason to skip it.
 func (s *subscription) rerunWith(marks rerunMarks) {
+	if s.isOver() {
+		return // ended while a mark was pending: nothing runs for it
+	}
 	unit := startUnit(OutcomeRerun, "", s.request.Target)
 	unit.subscription = s.id
 	ctx := s.ctx
@@ -492,18 +505,27 @@ func (s *subscription) rerunWith(marks rerunMarks) {
 	s.socket.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
 }
 
-// read resolves and loads the subscription's read; a presence re-run without a record mark
-// lists the presences without the record read.
+// read resolves and loads the subscription's read; a declaration partition that moved (a
+// resolver following the identity) re-indexes the subscription first, and a presence re-run
+// without a record mark lists the presences without the record read.
 func (s *subscription) read(ctx context.Context, recordDue bool) (*resolvedRead, *view, error) {
 	var resolved *resolvedRead
 	var next *view
 	err := s.socket.engine.inSlot(ctx, func() error {
+		if s.isOver() {
+			return errSocketClosed
+		}
 		var err error
 		if resolved, err = s.socket.engine.resolve(ctx, s.request); err != nil {
 			return err
 		}
 		if resolved.tenant != s.tenant {
 			return errTenantChanged
+		}
+		if partition := partitionOf(ctx, resolved); partition != s.partition {
+			// re-indexed before the load, so a change in the new partition during it is not lost
+			s.socket.engine.repartition(s, resolved.plan.declaration.Tables(), partition)
+			s.partition = partition
 		}
 		load := s.socket.engine.load
 		if s.presence && !recordDue {
@@ -517,6 +539,13 @@ func (s *subscription) read(ctx context.Context, recordDue bool) (*resolvedRead,
 		return err
 	})
 	return resolved, next, err
+}
+
+// isOver reports whether the subscription or its socket ended. The socket's context is asked
+// too: its cancellation reaches the subscriptions one after the other, and a slot freed by
+// an early one must not start the work of a later one.
+func (s *subscription) isOver() bool {
+	return s.ctx.Err() != nil || s.socket.ctx.Err() != nil
 }
 
 func (s *subscription) recordReadIdentity() *auth.Identity {
