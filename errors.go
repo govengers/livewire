@@ -1,8 +1,10 @@
 package livewire
 
 import (
+	"errors"
 	"maps"
 	"net/http"
+	"reflect"
 
 	"github.com/govengers/auth"
 
@@ -39,17 +41,28 @@ type ErrorBody struct {
 	Fields  map[string]string `json:"fields,omitempty"`
 }
 
-// Error is a refusal the core or a handler answers with its Status and Body. Match it with
-// errors.As; build it with the constructors below.
+// Error is a refusal the core or a handler answers with its status and body. Only the
+// constructors below build one, so the code is from the closed set and the message is the
+// code's fixed text. Match it with errors.As.
 type Error struct {
-	Status int
-	Body   ErrorBody
+	status int
+	body   ErrorBody
+}
+
+// Status is the HTTP status of the refusal.
+func (e *Error) Status() int { return e.status }
+
+// Body is the error body; the result is the caller's copy.
+func (e *Error) Body() ErrorBody {
+	body := e.body
+	body.Fields = maps.Clone(e.body.Fields)
+	return body
 }
 
 func (e *Error) Error() string {
-	text := string(e.Body.Code) + ": " + e.Body.Message
-	for _, name := range sortedKeys(e.Body.Fields) {
-		text += " (" + name + ": " + e.Body.Fields[name] + ")"
+	text := string(e.body.Code) + ": " + e.body.Message
+	for _, name := range sortedKeys(e.body.Fields) {
+		text += " (" + name + ": " + e.body.Fields[name] + ")"
 	}
 	return text
 }
@@ -88,8 +101,8 @@ func ForbiddenField(name string) *Error {
 // known kind in the chain decides, so a refusal that wraps a cause answers as the refusal:
 // a *Error answers as it is; a *query.Error answers 400 with its code and fields; an
 // *auth.Error or a bare auth sentinel answers its kind's status with the kind's code from
-// the closed set (a custom auth code is dropped); anything else is a 500 with the code
-// internal and no text of the cause.
+// the closed set (a custom auth code is dropped); anything else, a nil *Error included, is a
+// 500 with the code internal and no text of the cause.
 func ResponseFor(err error) (int, ErrorBody) {
 	for current := range errorChain(err) {
 		if status, body, ok := responseForOne(current); ok {
@@ -103,32 +116,47 @@ func ResponseFor(err error) (int, ErrorBody) {
 func responseForOne(err error) (int, ErrorBody, bool) {
 	switch typed := err.(type) { //nolint:errorlint // one node of the chain, not the chain: errors.As would look past it
 	case *Error:
-		return typed.Status, typed.Body, true
+		if typed == nil {
+			return 0, ErrorBody{}, false
+		}
+		return typed.status, typed.Body(), true
 	case *query.Error:
+		if typed == nil {
+			return 0, ErrorBody{}, false
+		}
 		return http.StatusBadRequest, ErrorBody{Code: Code(typed.Code), Message: typed.Message, Fields: typed.Fields}, true
 	case *auth.Error:
+		if typed == nil {
+			return 0, ErrorBody{}, false
+		}
 		return authResponse(typed.Kind)
 	}
-	if _, isKind := authCodes[err]; isKind {
+	if isLeaf(err) {
 		return authResponse(err)
 	}
 	return 0, ErrorBody{}, false
 }
 
-var authCodes = map[error]Code{
-	auth.ErrUnauthenticated: CodeUnauthenticated,
-	auth.ErrForbidden:       CodeForbidden,
-	auth.ErrInvalidRequest:  CodeInvalidRequest,
-	auth.ErrConflict:        CodeConflict,
+var authCodes = []struct {
+	kind error
+	code Code
+}{
+	{auth.ErrUnauthenticated, CodeUnauthenticated},
+	{auth.ErrForbidden, CodeForbidden},
+	{auth.ErrInvalidRequest, CodeInvalidRequest},
+	{auth.ErrConflict, CodeConflict},
 }
 
-func authResponse(kind error) (int, ErrorBody, bool) {
-	code, known := authCodes[kind]
-	if !known {
-		return 0, ErrorBody{}, false
+// authResponse answers the auth kind err is; errors.Is never hashes or compares a value of
+// a non-comparable type, so a slice-typed error is safe here.
+func authResponse(err error) (int, ErrorBody, bool) {
+	for _, known := range authCodes {
+		if errors.Is(err, known.kind) {
+			status, response := auth.ResponseFor(known.kind)
+			return status, ErrorBody{Code: known.code, Message: response.Message}, true
+		}
 	}
-	status, response := auth.ResponseFor(kind)
-	return status, ErrorBody{Code: code, Message: response.Message}, true
+	return 0, ErrorBody{}, false
 }
 
 // errorChain walks the error tree outermost first, depth first, like errors.As does.
@@ -145,6 +173,9 @@ func walkErrors(err error, yield func(error) bool) bool {
 	if !yield(err) {
 		return false
 	}
+	if isNilPointer(err) {
+		return true // a typed nil has nothing to unwrap and its Unwrap may dereference itself
+	}
 	switch unwrapper := err.(type) { //nolint:errorlint // this is the unwrapping itself
 	case interface{ Unwrap() error }:
 		return walkErrors(unwrapper.Unwrap(), yield)
@@ -156,6 +187,22 @@ func walkErrors(err error, yield func(error) bool) bool {
 		}
 	}
 	return true
+}
+
+// isLeaf reports whether err wraps nothing, so matching it is matching the node itself and
+// not a cause the walk visits later.
+func isLeaf(err error) bool {
+	switch err.(type) { //nolint:errorlint // asks the node, not the chain
+	case interface{ Unwrap() error }, interface{ Unwrap() []error }:
+		return false
+	default:
+		return true
+	}
+}
+
+func isNilPointer(err error) bool {
+	value := reflect.ValueOf(err)
+	return value.Kind() == reflect.Pointer && value.IsNil()
 }
 
 var messages = map[Code]string{
@@ -171,7 +218,7 @@ func newError(status int, code Code, fields map[string]string) *Error {
 	if len(fields) > 0 {
 		body.Fields = maps.Clone(fields)
 	}
-	return &Error{Status: status, Body: body}
+	return &Error{status: status, body: body}
 }
 
 func invalidParameter(name, message string) *Error {

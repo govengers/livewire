@@ -78,8 +78,8 @@ type parameterField struct {
 	index []int
 }
 
-// parameterSpec is a compiled parameters struct: decode fills a new value of its type.
-type parameterSpec struct {
+// parameterSpecification is a compiled parameters struct: decode fills a new value of its type.
+type parameterSpecification struct {
 	parametersType reflect.Type
 	fields         []parameterField
 }
@@ -87,11 +87,11 @@ type parameterSpec struct {
 // compileParameters validates a parameters struct and the path it serves: every tagged
 // field has a supported type, every `{name}` of the path has a path field and the other way
 // round. The error is a declaration mistake.
-func compileParameters(parametersType reflect.Type, path string) (*parameterSpec, error) {
+func compileParameters(parametersType reflect.Type, path string) (*parameterSpecification, error) {
 	if parametersType.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("parameters type %s is not a struct", parametersType)
 	}
-	specification := &parameterSpec{parametersType: parametersType}
+	specification := &parameterSpecification{parametersType: parametersType}
 	if err := specification.collect(parametersType, nil); err != nil {
 		return nil, err
 	}
@@ -115,7 +115,7 @@ func compileParameters(parametersType reflect.Type, path string) (*parameterSpec
 // decode fills a new parameters value from source. A missing or empty path parameter, a
 // repeated scalar parameter and a value of the wrong form answer Invalid naming the
 // parameter; a missing query parameter leaves its field zero.
-func (s *parameterSpec) decode(source ParameterSource) (any, error) {
+func (s *parameterSpecification) decode(source ParameterSource) (any, error) {
 	parameters := reflect.New(s.parametersType)
 	for _, field := range s.fields {
 		values, err := readValues(source, field.Parameter)
@@ -138,7 +138,7 @@ func (s *parameterSpec) decode(source ParameterSource) (any, error) {
 	return parameters.Interface(), nil
 }
 
-func (s *parameterSpec) parameters() []Parameter {
+func (s *parameterSpecification) parameters() []Parameter {
 	parameters := make([]Parameter, 0, len(s.fields))
 	for _, field := range s.fields {
 		parameter := field.Parameter
@@ -148,7 +148,7 @@ func (s *parameterSpec) parameters() []Parameter {
 	return parameters
 }
 
-func (s *parameterSpec) collect(structType reflect.Type, prefix []int) error {
+func (s *parameterSpecification) collect(structType reflect.Type, prefix []int) error {
 	for position := range structType.NumField() {
 		field := structType.Field(position)
 		index := append(slices.Clone(prefix), position)
@@ -173,7 +173,7 @@ func (s *parameterSpec) collect(structType reflect.Type, prefix []int) error {
 
 // collectEmbedded flattens an embedded struct by value; an embedded pointer is refused
 // because its fields could not be decoded into a nil pointer.
-func (s *parameterSpec) collectEmbedded(field reflect.StructField, index []int) error {
+func (s *parameterSpecification) collectEmbedded(field reflect.StructField, index []int) error {
 	if !field.Anonymous {
 		return nil
 	}
@@ -187,7 +187,7 @@ func (s *parameterSpec) collectEmbedded(field reflect.StructField, index []int) 
 	}
 }
 
-func (s *parameterSpec) lookup(name string) *parameterField {
+func (s *parameterSpecification) lookup(name string) *parameterField {
 	for position := range s.fields {
 		if s.fields[position].Name == name {
 			return &s.fields[position]
@@ -196,7 +196,7 @@ func (s *parameterSpec) lookup(name string) *parameterField {
 	return nil
 }
 
-func (s *parameterSpec) hasPath(name string) bool {
+func (s *parameterSpecification) hasPath(name string) bool {
 	field := s.lookup(name)
 	return field != nil && field.In == InPath
 }
@@ -232,8 +232,12 @@ func describeParameter(field reflect.StructField, location ParameterIn, name str
 		parameter.List = true
 		scalar = scalar.Elem()
 	}
-	scalar = unwrapPointer(scalar)
+	if scalar.Kind() == reflect.Pointer {
+		scalar = scalar.Elem()
+	}
 	switch {
+	case scalar.Kind() == reflect.Pointer:
+		return parameter, fmt.Errorf("parameter %q has the type %s; one pointer level is supported", name, field.Type)
 	case !supportedParameterType(scalar):
 		return parameter, fmt.Errorf("parameter %q has the unsupported type %s", name, field.Type)
 	case parameter.Enum != nil && scalar.Kind() != reflect.String:

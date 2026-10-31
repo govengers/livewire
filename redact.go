@@ -11,9 +11,9 @@ import (
 
 // RedactItems strips the fields whose Read check refuses the identity in ctx from every item
 // of raw, a marshaled JSON array of objects (D39). Fields that are visible or absent are left
-// alone; a raw value without guarded fields is returned as it is, otherwise the result is
-// re-marshaled with its keys sorted. Anything but an array of objects is an error, so a
-// wrong caller fails instead of leaking.
+// alone. When no field is guarded for the identity, raw is returned as it is and unchecked;
+// otherwise the result is re-marshaled with its keys sorted and anything but an array of
+// objects is an error, so a wrong caller fails instead of leaking.
 func RedactItems(ctx context.Context, fields query.Fields, raw json.RawMessage) (json.RawMessage, error) {
 	hidden := hiddenFields(ctx, fields)
 	if len(hidden) == 0 {
@@ -34,7 +34,8 @@ func RedactItems(ctx context.Context, fields query.Fields, raw json.RawMessage) 
 	return marshalRedacted(items)
 }
 
-// RedactItem is RedactItems for one marshaled object.
+// RedactItem is RedactItems for one marshaled object: unchecked when nothing is guarded for
+// the identity, otherwise anything but an object is an error.
 func RedactItem(ctx context.Context, fields query.Fields, raw json.RawMessage) (json.RawMessage, error) {
 	hidden := hiddenFields(ctx, fields)
 	if len(hidden) == 0 {

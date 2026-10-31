@@ -29,6 +29,7 @@ type ListOptions[Item, Parameters any] struct {
 // typed parameters; it has no filter, sort or page of its own.
 type List struct {
 	signature
+	liveness
 	itemType reflect.Type
 	guarded  query.Fields
 	load     func(ctx context.Context, parameters any) (any, error)
@@ -108,6 +109,7 @@ type ObjectOptions[Item, Parameters any] struct {
 // Object is a read that answers one item for the typed parameters.
 type Object struct {
 	signature
+	liveness
 	itemType reflect.Type
 	guarded  query.Fields
 	load     func(ctx context.Context, parameters any) (any, error)

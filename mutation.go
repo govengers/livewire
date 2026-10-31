@@ -62,7 +62,8 @@ func Upserts(target string) Effect { return Effect{Kind: EffectUpserts, Target: 
 func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: target} }
 
 // MutationOptions declares a write. Check and Handle are required. Status is the success
-// status (default 200, or 204 for a NoContent response, which allows no other). ClientID
+// status (default 200; a NoContent response defaults to 204 and may set another 2xx, 204 with
+// a response body is refused). ClientID
 // accepts a client-generated `id` in the body of a create (POST, D18); the body of any other
 // method may carry an id and the handler judges it. Resource names a registered resource
 // whose field Write checks apply to the body by JSON name (D39); FieldChecks adds a check per
@@ -126,13 +127,10 @@ func NewMutation[Parameters, Request, Response any](name, method, path string, o
 	}
 	if mutation.HasBody() {
 		mutation.validate = validator.New(validator.WithRequiredStructEnabled())
-		mutation.validate.RegisterTagNameFunc(func(field reflect.StructField) string {
-			name, _ := jsonName(field)
-			return name
-		})
 	}
 	mutation.compileParameters(mutation.parametersType)
 	mutation.failWith(mutation.validateDeclaration(options.Status))
+	mutation.failWith(mutation.preflightValidateTags())
 	return mutation
 }
 
@@ -172,8 +170,9 @@ func (m *Mutation) Effect() Effect { return m.effect }
 // does not accept, or of the wrong form or version, is 400 naming "id" (D18); a field whose
 // write check refuses is 403 forbidden_field (D39); a body that fails its `validate` tags is
 // 400 naming each field with the failed tag. Every text in the response is fixed; the cause
-// of a decoding failure stays on the server. A mutation without a body refuses a non-empty
-// raw.
+// of a decoding failure stays on the server. A member that repeats in an object is taken
+// last-wins, as encoding/json does, for the checks and the decode alike. A mutation without
+// a body refuses a non-empty raw.
 func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 	body := reflect.New(m.requestType).Interface()
 	if !m.HasBody() {
@@ -198,7 +197,7 @@ func (m *Mutation) DecodeBody(ctx context.Context, raw []byte) (any, error) {
 		return nil, err
 	}
 	if err := m.validate.StructCtx(ctx, body); err != nil {
-		return nil, validationError(err)
+		return nil, m.validationError(err)
 	}
 	return body, nil
 }
@@ -245,6 +244,25 @@ func (m *Mutation) validateDeclaration(status int) error {
 	return m.validateFieldChecks()
 }
 
+// preflightValidateTags runs the validator once over a zero body: the validator parses tags
+// lazily and panics on a tag it cannot parse, which must be an Add error (D44), never a
+// request-time panic. The zero body's own validation failures are not the question here.
+func (m *Mutation) preflightValidateTags() (err error) {
+	if m.validate == nil || m.requestType.Kind() != reflect.Struct {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("the validate tags of %s cannot be parsed: %v", m.requestType, recovered)
+		}
+	}()
+	var failures validator.ValidationErrors
+	if err := m.validate.Struct(reflect.New(m.requestType).Interface()); err != nil && !errors.As(err, &failures) {
+		return fmt.Errorf("the validate tags of %s cannot be used: %w", m.requestType, err)
+	}
+	return nil
+}
+
 func (m *Mutation) validateFieldChecks() error {
 	for _, name := range sortedKeys(m.fieldChecks) {
 		if m.fieldChecks[name] == nil {
@@ -289,9 +307,9 @@ func (m *Mutation) presentFields(raw []byte) (map[string]json.RawMessage, error)
 	var present map[string]json.RawMessage
 	var typeError *json.UnmarshalTypeError
 	err := json.Unmarshal(raw, &present)
-	notObject := errors.As(err, &typeError) || (err == nil && present == nil)
+	isObject := err == nil && present != nil
 	switch {
-	case notObject:
+	case errors.As(err, &typeError), err == nil && !isObject:
 		return nil, invalidParameter("body", "must be an object")
 	case err != nil:
 		return nil, invalidParameter("body", "must be valid JSON")
@@ -379,14 +397,34 @@ func unknownNested(raw json.RawMessage, fieldType reflect.Type, path string) (st
 		}
 		return unknownField(nested, fieldType, path+".")
 	case fieldType.Kind() == reflect.Slice || fieldType.Kind() == reflect.Array:
-		var elements []json.RawMessage
-		if json.Unmarshal(raw, &elements) != nil {
-			return "", false
+		return unknownInElements(raw, fieldType.Elem(), path)
+	case fieldType.Kind() == reflect.Map && fieldType.Key().Kind() == reflect.String:
+		return unknownInEntries(raw, fieldType.Elem(), path)
+	}
+	return "", false
+}
+
+func unknownInElements(raw json.RawMessage, elementType reflect.Type, path string) (string, bool) {
+	var elements []json.RawMessage
+	if json.Unmarshal(raw, &elements) != nil {
+		return "", false
+	}
+	for position, element := range elements {
+		if nestedPath, unknown := unknownNested(element, elementType, fmt.Sprintf("%s[%d]", path, position)); unknown {
+			return nestedPath, true
 		}
-		for position, element := range elements {
-			if nestedPath, unknown := unknownNested(element, fieldType.Elem(), fmt.Sprintf("%s[%d]", path, position)); unknown {
-				return nestedPath, true
-			}
+	}
+	return "", false
+}
+
+func unknownInEntries(raw json.RawMessage, valueType reflect.Type, path string) (string, bool) {
+	var entries map[string]json.RawMessage
+	if json.Unmarshal(raw, &entries) != nil {
+		return "", false
+	}
+	for _, key := range sortedKeys(entries) {
+		if nestedPath, unknown := unknownNested(entries[key], valueType, path+"."+key); unknown {
+			return nestedPath, true
 		}
 	}
 	return "", false
@@ -408,17 +446,50 @@ func bodyError(err error) *Error {
 }
 
 // validationError maps the failed tags to the fields by JSON path.
-func validationError(err error) error {
+func (m *Mutation) validationError(err error) error {
 	var failures validator.ValidationErrors
 	if !errors.As(err, &failures) {
 		return fmt.Errorf("livewire: validate the body: %w", err)
 	}
 	fields := make(map[string]string, len(failures))
 	for _, failure := range failures {
-		_, path, _ := strings.Cut(failure.Namespace(), ".")
-		fields[path] = failure.Tag()
+		fields[jsonPathOf(m.requestType, failure.StructNamespace())] = failure.Tag()
 	}
 	return Invalid(fields)
+}
+
+// jsonPathOf translates the validator's Go namespace ("createPart.Nested.Note",
+// "audited.createPart.Secret", "order.Lines[1].SKU", "settings.Flags[key]") to the body's
+// JSON path: the root type is dropped, embedded structs contribute no segment, every other
+// field its JSON name, and the index or key suffixes stay.
+func jsonPathOf(rootType reflect.Type, structNamespace string) string {
+	_, remainder, _ := strings.Cut(structNamespace, ".")
+	var path []string
+	currentType := unwrapPointer(rootType)
+	for segment := range strings.SplitSeq(remainder, ".") {
+		goName, suffix := splitIndexSuffix(segment)
+		field, ok := currentType.FieldByName(goName)
+		if !ok {
+			return remainder // the namespace does not follow the type; report it as it is
+		}
+		if !field.Anonymous {
+			name, _ := jsonName(field)
+			path = append(path, name+suffix)
+		}
+		currentType = unwrapPointer(field.Type)
+		for currentType.Kind() == reflect.Slice || currentType.Kind() == reflect.Array || currentType.Kind() == reflect.Map {
+			currentType = unwrapPointer(currentType.Elem())
+		}
+	}
+	return strings.Join(path, ".")
+}
+
+// splitIndexSuffix separates "Lines[1]" into "Lines" and "[1]".
+func splitIndexSuffix(segment string) (name, suffix string) {
+	if open := strings.IndexByte(segment, '['); open >= 0 {
+		return segment[:open], segment[open:]
+	}
+	return segment, ""
 }
 
 func sortedKeys[Value any](values map[string]Value) []string {

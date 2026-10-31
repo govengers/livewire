@@ -39,6 +39,7 @@ func TestUploadDeclarationErrors(t *testing.T) {
 		{name: "no content types", change: func(options *livewire.UploadOptions[partID, attachment]) { options.ContentTypes = nil }, want: "ContentTypes is required"},
 		{name: "no size limit", change: func(options *livewire.UploadOptions[partID, attachment]) { options.MaximumBytes = 0 }, want: "MaximumBytes must be positive"},
 		{name: "bad status", change: func(options *livewire.UploadOptions[partID, attachment]) { options.Status = http.StatusFound }, want: "not a success status"},
+		{name: "204", change: func(options *livewire.UploadOptions[partID, attachment]) { options.Status = http.StatusNoContent }, want: "204 cannot carry the response body"},
 		{name: "content type with parameters", change: func(options *livewire.UploadOptions[partID, attachment]) {
 			options.ContentTypes = []string{"text/plain; charset=utf-8"}
 		}, want: "not a plain media type"},
@@ -80,6 +81,7 @@ func TestUpload(t *testing.T) {
 
 	parameters, err := upload.DecodeParameters(livewire.MapSource{"id": "3f7b2c10-9e1d-4a6b-8c2f-1a2b3c4d5e6f"})
 	require.NoError(t, err)
+	options.Handle = nil
 	response, err := upload.Handle(userContext(), parameters, &livewire.File{ContentType: "image/png", Size: 3, Body: strings.NewReader("png"), Filename: "a.png"})
 	require.NoError(t, err)
 	require.Equal(t, &attachment{Name: "a.png"}, response)

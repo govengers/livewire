@@ -132,30 +132,41 @@ func (s *staging) stage(declaration Declaration) error {
 	if isNilDeclaration(declaration) {
 		return errors.New("livewire: a nil declaration was added")
 	}
-	if declaration.declaration() != declaration {
+	if unwrapped, ok := unwrapDeclaration(declaration); !ok || unwrapped != declaration {
 		return fmt.Errorf("livewire: %T wraps a declaration; add the declaration itself", declaration)
 	}
 	name, kind := declaration.Name(), declaration.Kind()
-	declared := declaration.shared()
+	shared := declaration.shared()
 	switch {
-	case declared.err != nil:
-		return fmt.Errorf("livewire: %s %q: %w", kind, name, declared.err)
-	case declared.registry != nil && declared.registry != s.registry:
+	case shared.err != nil:
+		return fmt.Errorf("livewire: %s %q: %w", kind, name, shared.err)
+	case shared.registry != nil && shared.registry != s.registry:
 		return fmt.Errorf("livewire: %s %q is registered with another registry", kind, name)
 	}
 	if _, exists := s.byName[name]; exists {
 		return fmt.Errorf("livewire: %s %q: the name is already registered", kind, name)
 	}
-	for _, declared := range declaration.routes() {
-		pattern := declared.pattern()
+	for _, declaredRoute := range declaration.routes() {
+		pattern := declaredRoute.pattern()
 		if other, exists := s.byRoute[pattern]; exists {
-			return fmt.Errorf("livewire: %s %q: the route %s is already registered by %q", kind, name, declared, other.Name())
+			return fmt.Errorf("livewire: %s %q: the route %s is already registered by %q", kind, name, declaredRoute, other.Name())
 		}
 		s.byRoute[pattern] = declaration
 	}
 	s.byName[name] = declaration
 	s.declarations = append(s.declarations, declaration)
 	return nil
+}
+
+// unwrapDeclaration asks the declaration for itself; a wrapper around a nil declaration
+// panics in the promoted call, which is reported as not a declaration.
+func unwrapDeclaration(declaration Declaration) (unwrapped Declaration, ok bool) {
+	defer func() {
+		if recover() != nil {
+			unwrapped, ok = nil, false
+		}
+	}()
+	return declaration.declaration(), true
 }
 
 func (s *staging) bind(declaration Declaration) error {
@@ -170,12 +181,30 @@ func (s *staging) bind(declaration Declaration) error {
 		}
 		s.writeChecks[mutation] = mutation.writeChecksFor(resource.fields)
 	}
-	if mutation.effect.Kind != "" {
-		switch s.byName[mutation.effect.Target].(type) {
-		case *Resource, *List:
-		default:
-			return fmt.Errorf("livewire: mutation %q: Effect target %q is not a registered list", mutation.name, mutation.effect.Target)
-		}
+	return s.bindEffect(mutation)
+}
+
+// bindEffect checks the optimistic effect (D36) against the registry: the target is a live
+// list, Upserts has a response to upsert, Removes has the `id` path parameter to remove by.
+func (s *staging) bindEffect(mutation *Mutation) error {
+	effect := mutation.effect
+	if effect.Kind == "" {
+		return nil
+	}
+	target, ok := s.byName[effect.Target]
+	switch target.(type) {
+	case *Resource, *List:
+	default:
+		return fmt.Errorf("livewire: mutation %q: Effect target %q is not a registered list", mutation.name, effect.Target)
+	}
+	liveTarget := ok && target.shared().live()
+	switch {
+	case !liveTarget:
+		return fmt.Errorf("livewire: mutation %q: Effect target %q is not live (no Tables)", mutation.name, effect.Target)
+	case effect.Kind == EffectUpserts && !mutation.HasContent():
+		return fmt.Errorf("livewire: mutation %q: Upserts needs a response to upsert, not NoContent", mutation.name)
+	case effect.Kind == EffectRemoves && !mutation.hasPathParameter(keyFieldJSON):
+		return fmt.Errorf("livewire: mutation %q: Removes needs the path parameter %q to remove by", mutation.name, keyFieldJSON)
 	}
 	return nil
 }

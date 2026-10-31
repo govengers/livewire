@@ -10,16 +10,17 @@ const (
 	tenantKey
 )
 
-// WithTransaction returns a copy of ctx carrying the query handle of the engine's transaction
-// (Transaction.Handle); the engine calls it before a handler runs (D31). Only the engine
-// holds the Transaction itself, so a handler cannot commit or roll back.
+// WithTransaction returns a copy of ctx carrying the query-only handle of the engine's
+// transaction (Transaction.Handle); the engine calls it for every unit of work, reads
+// included (D45), before a loader or handler runs. Only the engine holds the Transaction
+// itself, so nothing in the context can commit or roll back.
 func WithTransaction(ctx context.Context, handle any) context.Context {
 	return context.WithValue(ctx, transactionKey, handle)
 }
 
-// TransactionFrom returns the query handle of the mutation transaction in ctx, or nil outside
-// a mutation, so a repository falls back to its pool. Its type is the adapter's: for
-// postgresadapter a pgx.Tx, which `postgresadapter.TransactionFrom(ctx)` returns typed.
+// TransactionFrom returns the query-only handle of the engine transaction in ctx, or nil
+// outside an engine unit of work, so a repository falls back to its pool. Its type is the
+// adapter's: postgresadapter.TransactionFrom(ctx) types it as sqlc's DBTX (D45).
 func TransactionFrom(ctx context.Context) any {
 	return ctx.Value(transactionKey)
 }

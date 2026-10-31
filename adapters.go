@@ -23,14 +23,15 @@ type Owner struct {
 	Tenant string
 }
 
-// OwnerOf is the owner of the identity in ctx under the tenant in ctx (TenantFrom); the key
-// is "" without an identity.
-func OwnerOf(ctx context.Context) Owner {
-	owner := Owner{Tenant: TenantFrom(ctx)}
-	if identity := auth.IdentityFrom(ctx); identity != nil {
-		owner.Key = identity.Provider + ":" + identity.Subject
+// OwnerOf is the owner of the identity in ctx under the tenant in ctx (TenantFrom). Without
+// an identity there is no owner (false): the engine then skips idempotency and stored
+// filters, so anonymous callers never share a namespace (D16).
+func OwnerOf(ctx context.Context) (Owner, bool) {
+	identity := auth.IdentityFrom(ctx)
+	if identity == nil {
+		return Owner{}, false
 	}
-	return owner
+	return Owner{Key: identity.Provider + ":" + identity.Subject, Tenant: TenantFrom(ctx)}, true
 }
 
 // ChangeOperation is what happened to a row.
@@ -72,23 +73,25 @@ type IdentitySource interface {
 	Identify(ctx context.Context, request *http.Request) (*auth.Identity, error)
 }
 
-// Transaction is an engine transaction (D31, D42) as the core sees it. Only the engine holds
-// it: exactly one of Commit and Rollback is called, once. Handle is the adapter's query
-// handle (a pgx.Tx for postgresadapter) that the engine puts into the handler's context
-// (WithTransaction) so repositories run in the transaction without being able to end it.
+// Transaction is an engine transaction (D31, D42, D45) as the core sees it. Only the engine
+// holds it: exactly one of Commit and Rollback is called, once. Handle is the query-only
+// value the engine puts into the unit of work's context (WithTransaction): a value that can
+// run statements in the transaction but has no Commit or Rollback (postgresadapter hands
+// out sqlc's DBTX method set, never the pgx.Tx), so a handler or loader cannot end the
+// engine's transaction.
 type Transaction interface {
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
 	Handle() any
 }
 
-// TransactionInfo is what a transaction records for the triggers and policies (D31, D32,
+// TransactionDetails is what a transaction records for the triggers and policies (D31, D32,
 // D42): the tenant (SET LOCAL livewire.tenant, "" with a single tenant), the effective
 // identity (its Real() is the real actor), the mutation's name and decoded parameters and
 // the request id (SET LOCAL livewire.actor). ReadOnly marks the REPEATABLE READ READ ONLY
-// transaction of a read (ListPage): it carries the tenant and no actor; Mutation is empty
-// then and for a batch's outer transaction.
-type TransactionInfo struct {
+// transaction of a read (D45: every engine unit of work has one): it carries the tenant and
+// no actor; Mutation is empty then and for a batch's outer transaction.
+type TransactionDetails struct {
 	Tenant     string
 	Identity   *auth.Identity
 	Mutation   string
@@ -98,10 +101,10 @@ type TransactionInfo struct {
 }
 
 // Transactor begins an engine transaction (D31, D42). The implementation sets the tenant and,
-// for a write, the actor of transactionInfo (SET LOCAL) before it returns, so triggers and
+// for a write, the actor of transactionDetails (SET LOCAL) before it returns, so triggers and
 // Row Level Security policies see them.
 type Transactor interface {
-	Begin(ctx context.Context, transactionInfo TransactionInfo) (Transaction, error)
+	Begin(ctx context.Context, transactionDetails TransactionDetails) (Transaction, error)
 }
 
 // StoredFilter is a filter document a client stored for a resource (D13). Context is the
@@ -178,8 +181,8 @@ type Presence struct {
 type PresenceStore interface {
 	// Join inserts or updates the socket's presence on the record.
 	Join(ctx context.Context, presence *Presence) error
-	// Leave removes the socket's presence on the record; an absent one is no error.
-	Leave(ctx context.Context, socket, target, key string) error
+	// Leave removes the socket's presence on the tenant's record; an absent one is no error.
+	Leave(ctx context.Context, tenant, socket, target, key string) error
 	// Heartbeat refreshes UpdatedAt of every presence of the socket.
 	Heartbeat(ctx context.Context, socket string) error
 	// List returns the presences on a record of the tenant.

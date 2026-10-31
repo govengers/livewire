@@ -119,6 +119,8 @@ func (u *Upload) validate(status int) error {
 		return errors.New("MaximumBytes must be positive")
 	case status != 0 && !isSuccessStatus(status):
 		return fmt.Errorf("Status %d is not a success status", status)
+	case status == http.StatusNoContent:
+		return errors.New("Status 204 cannot carry the response body: an upload answers JSON")
 	}
 	for _, contentType := range u.contentTypes {
 		if !isPlainMediaType(contentType) {

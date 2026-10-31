@@ -113,6 +113,7 @@ type ResourceOptions[Item any] struct {
 // take the reserved parameters.
 type Resource struct {
 	signature
+	liveness
 	itemType        reflect.Type
 	fields          query.Fields
 	defaultSort     []query.SortTerm
@@ -363,13 +364,48 @@ func (r *Resource) validate(maximumLimit, distinctMaximum int) error {
 	if err := r.validateItem(); err != nil {
 		return err
 	}
-	if len(r.tables) > 0 {
+	if err := r.validateGuardedFields(); err != nil {
+		return err
+	}
+	if r.live() {
 		if err := requireJSONField(r.itemType, keyFieldJSON, liveListNeedsID); err != nil {
+			return err
+		}
+	}
+	if r.cursor {
+		if err := r.validateCursorID(); err != nil {
 			return err
 		}
 	}
 	if r.versioned {
 		return requireJSONField(r.itemType, "version", "a versioned resource exposes it, D34")
+	}
+	return nil
+}
+
+// validateGuardedFields checks that every field with a column check names a JSON key of the
+// item, so redaction can strip it; a guard on a name the item never marshals would strip
+// nothing (D39).
+func (r *Resource) validateGuardedFields() error {
+	for _, field := range r.fields {
+		guarded := field.Read != nil || field.Write != nil
+		if !guarded {
+			continue
+		}
+		if err := requireJSONField(r.itemType, field.Name, "a guarded field is redacted by it"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCursorID checks the cursor contract of the query package: the cursor carries the
+// row's id as a uuid, so a resource that pages by cursor declares a uuid field "id".
+func (r *Resource) validateCursorID() error {
+	field, ok := r.fields.Lookup(keyFieldJSON)
+	uuidID := ok && field.Type == query.TypeUUID
+	if !uuidID {
+		return errors.New(`Cursor needs a field "id" of type uuid: the cursor carries the row's id as a uuid`)
 	}
 	return nil
 }
@@ -448,6 +484,9 @@ func (r *Resource) parse(parameters *ReadParameters, maximumLimit int) (*parsedR
 		return nil, err
 	}
 	if parsed.page, err = r.parsePage(parameters, maximumLimit); err != nil {
+		return nil, err
+	}
+	if err := cursorMatchesSort(parsed.page.After, parsed.sort); err != nil {
 		return nil, err
 	}
 	if parsed.document != nil {
@@ -529,6 +568,15 @@ func (r *Resource) compile(ctx context.Context, parsed *parsedRead) (*query.List
 	}
 	listQuery.CountCap = r.countCap
 	return listQuery, nil
+}
+
+// cursorMatchesSort refuses a cursor taken under another sort while the request is parsed,
+// before any guard or scope runs; query.Compile would refuse it too, but later.
+func cursorMatchesSort(cursor *query.Cursor, sort []query.SortTerm) error {
+	if cursor == nil || slices.Equal(cursor.Sort, sort) {
+		return nil
+	}
+	return &query.Error{Code: query.CodeInvalidCursor, Message: "the cursor is not valid for this sort", Fields: map[string]string{ParameterAfter: "taken under another sort"}}
 }
 
 // itemValue types the item key's path value for the filter document.

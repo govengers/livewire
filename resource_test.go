@@ -47,6 +47,16 @@ func TestResourceDeclarationErrors(t *testing.T) {
 			options.Fields = append(options.Fields, query.Field{Name: "sku", Type: query.TypeString, SQL: "parts.sku", Filter: true})
 			options.Item.Field = "sku"
 		}, want: `no JSON field "sku"`},
+		{name: "guarded field not in the item type", change: func(options *livewire.ResourceOptions[part]) {
+			options.Fields = append(options.Fields, query.Field{Name: "secretValue", Type: query.TypeString, SQL: "parts.secret", Read: authorization.IsAdmin()})
+		}, want: `no JSON field "secretValue" (a guarded field is redacted by it)`},
+		{name: "write-guarded field not in the item type", change: func(options *livewire.ResourceOptions[part]) {
+			options.Fields = append(options.Fields, query.Field{Name: "cost", Type: query.TypeFloat, SQL: "parts.cost", Write: authorization.IsAdmin()})
+		}, want: `no JSON field "cost"`},
+		{name: "cursor without a uuid id", change: func(options *livewire.ResourceOptions[part]) {
+			options.Cursor = true
+			options.Fields[0] = query.Field{Name: "id", Type: query.TypeInteger, SQL: "parts.number", Filter: true, Sort: true}
+		}, want: `Cursor needs a field "id" of type uuid`},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -284,6 +294,26 @@ func TestResourceListQueryCursor(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, secondPage.Cursor)
 	})
+}
+
+func TestResourceCursorMismatchIsRefusedBeforeGuardsAndScope(t *testing.T) {
+	options := partOptions()
+	options.Cursor = true
+	scopeCalls := 0
+	options.Scope = func(context.Context) (query.Predicate, error) {
+		scopeCalls++
+		return func(builder *query.Builder) { builder.WriteString("TRUE") }, nil
+	}
+	resource := newParts(t, options)
+	underID, err := resource.ListQuery(adminContext(), &livewire.ReadParameters{Sort: "id"})
+	require.NoError(t, err)
+	require.Equal(t, 1, scopeCalls)
+	after, err := underID.NextCursor([]any{"3f7b2c10-9e1d-4a6b-8c2f-1a2b3c4d5e6f"}, "3f7b2c10-9e1d-4a6b-8c2f-1a2b3c4d5e6f").Encode()
+	require.NoError(t, err)
+
+	_, err = resource.ListQuery(userContext(), &livewire.ReadParameters{Sort: "secret", After: after})
+	requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidCursor, "after")
+	require.Equal(t, 1, scopeCalls, "an invalid request never runs the scope")
 }
 
 func TestResourceListQueryScopeError(t *testing.T) {

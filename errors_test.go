@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/govengers/auth"
 	"github.com/govengers/auth/authorization"
 	"github.com/stretchr/testify/require"
@@ -50,6 +51,12 @@ func TestResponseFor(t *testing.T) {
 		{name: "core error wrapping a refusal answers the core error", err: fmt.Errorf("%w: %w", livewire.NotFound(), auth.ErrForbidden), status: http.StatusNotFound, code: livewire.CodeNotFound},
 		{name: "query error wrapping a refusal answers the query error", err: fmt.Errorf("%w (%w)", queryError, auth.ErrForbidden), status: http.StatusBadRequest, code: livewire.CodeInvalidSort, wantFields: sortField},
 		{name: "unknown error", err: errors.New("pq: connection refused to 10.0.0.1"), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "non-comparable error", err: validator.ValidationErrors{}, status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "wrapped non-comparable error", err: fmt.Errorf("validate: %w", validator.ValidationErrors{}), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "typed nil core error", err: (*livewire.Error)(nil), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "wrapped typed nil core error", err: fmt.Errorf("load: %w", (*livewire.Error)(nil)), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "typed nil query error", err: (*query.Error)(nil), status: http.StatusInternalServerError, code: livewire.CodeInternal},
+		{name: "typed nil auth error", err: (*auth.Error)(nil), status: http.StatusInternalServerError, code: livewire.CodeInternal},
 		{name: "nil", err: nil, status: http.StatusInternalServerError, code: livewire.CodeInternal},
 	}
 	for _, testCase := range testCases {
@@ -75,7 +82,7 @@ func TestInvalidCopiesFields(t *testing.T) {
 	fields := map[string]string{"name": "required"}
 	err := livewire.Invalid(fields)
 	fields["name"] = "changed"
-	require.Equal(t, "required", err.Body.Fields["name"])
+	require.Equal(t, "required", err.Body().Fields["name"])
 }
 
 func TestErrorBodyJSON(t *testing.T) {

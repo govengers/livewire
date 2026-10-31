@@ -34,8 +34,108 @@ type createPart struct {
 	Nested   struct {
 		Note string `json:"note" validate:"max=5"`
 	} `json:"nested"`
-	Lines []partLine `json:"lines,omitempty" validate:"dive"`
-	Leaky *leaky     `json:"leaky,omitempty"`
+	Lines      []partLine `json:"lines,omitempty" validate:"dive"`
+	Leaky      *leaky     `json:"leaky,omitempty"`
+	Attributes map[string]*struct {
+		Note string `json:"note"`
+	} `json:"attributes,omitempty"`
+}
+
+func TestMutationRefusesUnparseableValidateTags(t *testing.T) {
+	type typo struct {
+		Name string `json:"name" validate:"reqd"`
+	}
+	type badArgument struct {
+		Count int `json:"count" validate:"min=abc"`
+	}
+	type misplacedDive struct {
+		Name string `json:"name" validate:"dive"`
+	}
+	declare := func(declaration livewire.Declaration) error { return addError(t, declaration) }
+	require.ErrorContains(t, declare(livewire.NewMutation("a", http.MethodPost, "/a", &livewire.MutationOptions[livewire.NoParameters, typo, livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *typo) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})), "validate tags")
+	require.ErrorContains(t, declare(livewire.NewMutation("b", http.MethodPost, "/b", &livewire.MutationOptions[livewire.NoParameters, badArgument, livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *badArgument) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})), "validate tags")
+	require.ErrorContains(t, declare(livewire.NewMutation("c", http.MethodPost, "/c", &livewire.MutationOptions[livewire.NoParameters, misplacedDive, livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *misplacedDive) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})), "validate tags")
+}
+
+// Line is exported because encoding/json refuses to allocate an embedded pointer to an unexported struct.
+type Line struct {
+	SKU      string `json:"sku"`
+	Quantity int    `json:"quantity" validate:"min=1"`
+}
+
+type pointerEmbedding struct {
+	*Line
+	Note string `json:"note" validate:"max=3"`
+}
+
+type generic[Value any] struct {
+	Value  Value      `json:"value"`
+	Nested *partLine  `json:"nested"`
+	Many   []partLine `json:"many" validate:"dive"`
+}
+
+func TestMutationValidationPaths(t *testing.T) {
+	type audited struct {
+		createPart
+		Reason string `json:"reason" validate:"required"`
+	}
+	auditedMutation := livewire.NewMutation("a", http.MethodPost, "/a", &livewire.MutationOptions[livewire.NoParameters, audited, livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *audited) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})
+	pointerMutation := livewire.NewMutation("b", http.MethodPost, "/b", &livewire.MutationOptions[livewire.NoParameters, pointerEmbedding, livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *pointerEmbedding) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})
+	genericMutation := livewire.NewMutation("c", http.MethodPost, "/c", &livewire.MutationOptions[livewire.NoParameters, generic[string], livewire.NoContent]{
+		Check: authorization.IsUser(),
+		Handle: func(context.Context, *livewire.NoParameters, *generic[string]) (*livewire.NoContent, error) {
+			return &livewire.NoContent{}, nil
+		},
+	})
+	require.NoError(t, addError(t, auditedMutation, pointerMutation, genericMutation))
+
+	_, err := auditedMutation.DecodeBody(userContext(), []byte(`{"nested":{"note":"too long"},"type":"screw"}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "reason")
+	require.Equal(t, map[string]string{"reason": "required", "nested.note": "max", "type": "oneof"}, fields, "embedded value struct adds no segment")
+
+	_, err = pointerMutation.DecodeBody(userContext(), []byte(`{"sku":"a","quantity":0,"note":"long"}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "note")
+	require.Equal(t, map[string]string{"note": "max", "quantity": "min"}, fields, "embedded pointer struct adds no segment")
+
+	_, err = genericMutation.DecodeBody(userContext(), []byte(`{"value":"v","nested":{"sku":"a","quantity":0},"many":[{"sku":"b","quantity":1},{"sku":"c","quantity":0}]}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "nested.quantity")
+	require.Equal(t, map[string]string{"nested.quantity": "min", "many[1].quantity": "min"}, fields, "generic root type is dropped")
+}
+
+func TestMutationUnknownFieldInsideMapValuesAndDuplicateMembers(t *testing.T) {
+	mutation := newCreatePart(t, createOptions())
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"attributes":{"color":{"note":"n","nope":1}}}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "attributes.color.nope")
+	require.Equal(t, "unknown field", fields["attributes.color.nope"])
+
+	body, err := mutation.DecodeBody(userContext(), []byte(`{"name":"first","name":"last"}`))
+	require.NoError(t, err)
+	require.Equal(t, "last", body.(*createPart).Name, "a repeated member is taken last-wins")
 }
 
 type partID struct {

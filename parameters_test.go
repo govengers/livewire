@@ -39,11 +39,11 @@ type everyParameter struct {
 	unexposed string //nolint:unused // the decoder must skip an untagged unexported field
 }
 
-func stats[Params any](t *testing.T, path string) *livewire.List {
+func stats[Parameters any](t *testing.T, path string) *livewire.List {
 	t.Helper()
-	list := livewire.NewList("stats", path, &livewire.ListOptions[part, Params]{
+	list := livewire.NewList("stats", path, &livewire.ListOptions[part, Parameters]{
 		Read: authorization.IsUser(),
-		Load: func(context.Context, *Params) ([]part, error) { return nil, nil },
+		Load: func(context.Context, *Parameters) ([]part, error) { return nil, nil },
 	})
 	return list
 }
@@ -193,6 +193,9 @@ func TestParameterDeclarationErrors(t *testing.T) {
 	type embeddedPointerPath struct {
 		*withID
 	}
+	type doublePointer struct {
+		Limit **int `query:"limit"`
+	}
 
 	testCases := []struct {
 		name string
@@ -209,6 +212,7 @@ func TestParameterDeclarationErrors(t *testing.T) {
 		{name: "declared twice", list: stats[duplicate](t, "/stats/{name}"), want: "declared twice"},
 		{name: "embedded pointer with query fields", list: stats[embeddedPointerQuery](t, "/stats"), want: "embed parameters structs by value"},
 		{name: "embedded pointer with a path field", list: stats[embeddedPointerPath](t, "/stats/{id}"), want: "embed parameters structs by value"},
+		{name: "two pointer levels", list: stats[doublePointer](t, "/stats"), want: "one pointer level is supported"},
 		{name: "placeholder without field", list: stats[livewire.NoParameters](t, "/stats/{id}"), want: "no field tagged path:\"id\""},
 		{name: "field without placeholder", list: stats[withID](t, "/stats"), want: "is not in the path"},
 		{name: "no leading slash", list: stats[livewire.NoParameters](t, "stats"), want: "does not start with a slash"},

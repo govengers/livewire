@@ -24,6 +24,8 @@ func TestNewListStateRefusesUnusableIDs(t *testing.T) {
 		{name: "item not an object", raw: `["a"]`, want: "has no id"},
 		{name: "duplicate string ids", raw: `[{"id":"a"},{"id":"a","v":2}]`, want: `two list items carry the id "a"`},
 		{name: "number and string collide", raw: `[{"id":1},{"id":"1"}]`, want: `two list items carry the id "1"`},
+		{name: "number spellings collide", raw: `[{"id":1},{"id":1.0}]`, want: `two list items carry the id "1"`},
+		{name: "exponent spelling collides", raw: `[{"id":1},{"id":1e0}]`, want: `two list items carry the id "1"`},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {

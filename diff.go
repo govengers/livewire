@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 )
 
 // ListState is what a list subscription last pushed (the engine keeps one per list
@@ -82,22 +83,24 @@ func (s *ListState) ChangesSince(previous *ListState) *ListChange {
 	return changes
 }
 
-// itemID is the item's id as the key of the list: a JSON string as it is, a JSON number as
-// its text.
+// itemID is the item's id as the key of the list: a JSON string as it is, a JSON number in
+// its canonical spelling (1, 1.0 and 1e0 are one id, as a JavaScript client sees them).
 func itemID(item json.RawMessage) (string, error) {
 	var keyed struct {
 		ID json.RawMessage `json:"id"`
 	}
-	if err := json.Unmarshal(item, &keyed); err != nil || len(keyed.ID) == 0 || bytes.Equal(keyed.ID, []byte("null")) {
+	err := json.Unmarshal(item, &keyed)
+	missing := err != nil || len(keyed.ID) == 0 || bytes.Equal(keyed.ID, []byte("null"))
+	if missing {
 		return "", fmt.Errorf("livewire: a list item has no id: %s", item)
 	}
 	var text string
 	if err := json.Unmarshal(keyed.ID, &text); err == nil {
 		return text, nil
 	}
-	var number json.Number
+	var number float64
 	if err := json.Unmarshal(keyed.ID, &number); err == nil {
-		return number.String(), nil
+		return strconv.FormatFloat(number, 'g', -1, 64), nil
 	}
 	return "", fmt.Errorf("livewire: a list item's id is neither a string nor a number: %s", keyed.ID)
 }

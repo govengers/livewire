@@ -71,6 +71,32 @@ type mutualB struct {
 	B string `json:"b"`
 }
 
+type diamondBase struct {
+	Shared string `json:"shared"`
+}
+
+type diamondLeft struct {
+	diamondBase
+	Left string `json:"left"`
+}
+
+type diamondRight struct {
+	diamondBase
+	Right string `json:"right"`
+}
+
+// diamond reaches diamondBase twice on level 2: encoding/json cancels its fields.
+type diamond struct {
+	diamondLeft
+	diamondRight
+}
+
+// shallowDiamond reaches diamondBase on level 1 and again on level 2: the shallow one wins.
+type shallowDiamond struct {
+	diamondLeft
+	diamondBase
+}
+
 type skipped struct {
 	Hidden   string `json:"-"`
 	Exported string
@@ -90,6 +116,8 @@ func TestJSONFieldsOfMatchesEncodingJSON(t *testing.T) {
 		{name: "recursive embedding ends", value: recursive{ID: "r"}},
 		{name: "mutually recursive embedding ends", value: mutualA{A: "a", mutualB: &mutualB{B: "b"}}},
 		{name: "skipped and unexported fields", value: skipped{Exported: "e"}},
+		{name: "diamond cancels the shared field", value: diamond{diamondLeft: diamondLeft{Left: "l"}, diamondRight: diamondRight{Right: "r"}}},
+		{name: "shallow occurrence wins the diamond", value: shallowDiamond{diamondBase: diamondBase{Shared: "s"}}},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {

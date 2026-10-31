@@ -2,6 +2,7 @@ package livewire
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -32,8 +33,8 @@ const (
 // changes re-run the declaration's subscriptions, none means not live; Check is the static
 // gate (D8) that runs before parameters are resolved against the database and before a body
 // is read; Parameters describes the parameters struct for the generators; DecodeParameters
-// fills a new parameters value (a *Parameters) from source and answers a missing path parameter,
-// a repeated scalar parameter or a value of the wrong form with an *Error of 400
+// fills a new parameters value (a *Parameters) from source and answers a missing path
+// parameter, a repeated scalar parameter or a value of the wrong form with an *Error of 400
 // invalid_request naming the parameter.
 type Declaration interface {
 	Kind() Kind
@@ -64,11 +65,18 @@ type signature struct {
 	path       string
 	tables     []string
 	check      authorization.Check
-	partition  PartitionResolver
-	parameters *parameterSpec
+	parameters *parameterSpecification
 	registry   *Registry
 	err        error
 }
+
+// liveness is the part the three live kinds (Resource, List, Object) share.
+type liveness struct {
+	partition PartitionResolver
+}
+
+// Partition is the partition resolver of the declaration (D25), nil without one.
+func (l *liveness) Partition() PartitionResolver { return l.partition }
 
 var identifier = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 
@@ -104,10 +112,9 @@ func (s *signature) DecodeParameters(source ParameterSource) (any, error) {
 	return s.parameters.decode(source)
 }
 
-// Partition is the partition resolver of a live declaration, nil without one.
-func (s *signature) Partition() PartitionResolver { return s.partition }
-
 func (s *signature) shared() *signature { return s }
+
+func (s *signature) live() bool { return len(s.tables) > 0 }
 
 func (s *signature) fail(format string, arguments ...any) {
 	s.failWith(fmt.Errorf(format, arguments...))
@@ -129,6 +136,11 @@ func (s *signature) compileParameters(parametersType reflect.Type) {
 		return
 	}
 	s.parameters = specification
+}
+
+// hasPathParameter reports whether the parameters struct carries `path:"name"`.
+func (s *signature) hasPathParameter(name string) bool {
+	return s.parameters != nil && s.parameters.hasPath(name)
 }
 
 type route struct {
@@ -179,27 +191,27 @@ func isSuccessStatus(status int) bool {
 	return status >= http.StatusOK && status <= 299
 }
 
-func intOrDefault(status, fallback int) int {
-	if status == 0 {
+func intOrDefault(value, fallback int) int {
+	if value == 0 {
 		return fallback
 	}
-	return status
+	return value
 }
 
 // jsonFieldsOf maps the JSON names of a struct's marshaled fields to the fields, following
-// encoding/json: embedded structs (by value or pointer) flatten unless their tag names them,
-// the shallowest field of a name wins, a tagged field beats untagged ones at the same depth,
-// and a name that stays ambiguous is dropped. Each embedded type is visited once, so a
-// recursive embedding ends. A type that is not a struct has no fields.
+// encoding/json's typeFields: one embedding level at a time, a type visited once (the
+// shallowest occurrence), a type embedded twice at one level cancels its fields, embedded
+// structs (by value or pointer) flatten unless their tag names them, a tagged field beats
+// untagged ones at the same depth, and a name that stays ambiguous is dropped. A type that
+// is not a struct has no fields.
 func jsonFieldsOf(itemType reflect.Type) map[string]reflect.StructField {
 	itemType = unwrapPointer(itemType)
 	fields := map[string]reflect.StructField{}
 	if itemType.Kind() != reflect.Struct {
 		return fields
 	}
-	collector := &jsonFieldCollector{visited: map[reflect.Type]bool{itemType: true}}
-	collector.collect(itemType, 0)
-	for name, candidates := range collector.byName {
+	byName := collectJSONFields(itemType)
+	for name, candidates := range byName {
 		if winner, ok := dominantJSONField(candidates); ok {
 			fields[name] = winner
 		}
@@ -213,41 +225,87 @@ type jsonFieldCandidate struct {
 	tagged bool
 }
 
+type embeddedLevel struct {
+	structType reflect.Type
+	depth      int
+}
+
+// collectJSONFields walks the embedding levels breadth first and returns every candidate by
+// JSON name; a type that occurs twice on one level has its candidates listed twice so the
+// dominance rule drops them, like encoding/json.
+func collectJSONFields(itemType reflect.Type) map[string][]jsonFieldCandidate {
+	collector := &jsonFieldCollector{byName: map[string][]jsonFieldCandidate{}, visited: map[reflect.Type]bool{}}
+	current := []embeddedLevel{{structType: itemType, depth: 0}}
+	count := map[reflect.Type]int{itemType: 1}
+	for len(current) > 0 {
+		current, count = collector.collectLevel(current, count)
+	}
+	return collector.byName
+}
+
 type jsonFieldCollector struct {
 	byName  map[string][]jsonFieldCandidate
 	visited map[reflect.Type]bool
-	next    []reflect.Type
 }
 
-// collect walks one depth level at a time (breadth first), like encoding/json, so a
-// shallower field is seen before a deeper one of the same name.
-func (c *jsonFieldCollector) collect(structType reflect.Type, depth int) {
-	if c.byName == nil {
-		c.byName = map[string][]jsonFieldCandidate{}
-	}
-	for position := range structType.NumField() {
-		field := structType.Field(position)
-		if field.Tag.Get("json") == "-" {
+// collectLevel records the named fields of one embedding level and returns the next level
+// with how often each type occurs on it.
+func (c *jsonFieldCollector) collectLevel(current []embeddedLevel, count map[reflect.Type]int) ([]embeddedLevel, map[reflect.Type]int) {
+	var next []embeddedLevel
+	nextCount := map[reflect.Type]int{}
+	for _, level := range current {
+		if c.visited[level.structType] {
 			continue
 		}
-		name, tagged := jsonName(field)
-		embeddedType := unwrapPointer(field.Type)
-		flattens := field.Anonymous && !tagged && embeddedType.Kind() == reflect.Struct
-		switch {
-		case flattens && !c.visited[embeddedType]:
-			c.visited[embeddedType] = true
-			c.next = append(c.next, embeddedType)
-		case flattens:
-		case field.IsExported() || field.Anonymous && embeddedType.Kind() == reflect.Struct:
-			c.byName[name] = append(c.byName[name], jsonFieldCandidate{field: field, depth: depth, tagged: tagged})
+		c.visited[level.structType] = true
+		for position := range level.structType.NumField() {
+			field := level.structType.Field(position)
+			embeddedType := unwrapPointer(field.Type)
+			switch classifyJSONField(field, embeddedType) {
+			case jsonFieldSkipped:
+			case jsonFieldFlattens:
+				nextCount[embeddedType]++
+				if nextCount[embeddedType] == 1 {
+					next = append(next, embeddedLevel{structType: embeddedType, depth: level.depth + 1})
+				}
+			case jsonFieldNamed:
+				c.record(field, level.depth, count[level.structType])
+			}
 		}
 	}
-	for len(c.next) > 0 {
-		pending := c.next
-		c.next = nil
-		for _, embedded := range pending {
-			c.collect(embedded, depth+1)
-		}
+	return next, nextCount
+}
+
+// record lists the candidate once per occurrence of its struct on the level, so a struct
+// embedded twice cancels its fields in the dominance rule.
+func (c *jsonFieldCollector) record(field reflect.StructField, depth, occurrences int) {
+	name, tagged := jsonName(field)
+	candidate := jsonFieldCandidate{field: field, depth: depth, tagged: tagged}
+	for range max(occurrences, 1) {
+		c.byName[name] = append(c.byName[name], candidate)
+	}
+}
+
+type jsonFieldClass int
+
+const (
+	jsonFieldSkipped jsonFieldClass = iota
+	jsonFieldFlattens
+	jsonFieldNamed
+)
+
+func classifyJSONField(field reflect.StructField, embeddedType reflect.Type) jsonFieldClass {
+	_, tagged := jsonName(field)
+	embeddedStruct := field.Anonymous && embeddedType.Kind() == reflect.Struct
+	switch {
+	case field.Tag.Get("json") == "-":
+		return jsonFieldSkipped
+	case embeddedStruct && !tagged:
+		return jsonFieldFlattens
+	case field.IsExported() || embeddedStruct:
+		return jsonFieldNamed
+	default:
+		return jsonFieldSkipped
 	}
 }
 
@@ -290,11 +348,15 @@ func unwrapPointer(fieldType reflect.Type) reflect.Type {
 	return fieldType
 }
 
-// requireJSONField checks that a struct type (pointers unwrapped) marshals a field named
-// name; why says who needs it. A type that is not a struct cannot be checked and passes.
+// requireJSONField checks that a type (pointers unwrapped) marshals a field named name; why
+// says who needs it. A scalar type can never carry one and is refused; a map or interface
+// cannot be checked and passes.
 func requireJSONField(itemType reflect.Type, name, why string) error {
 	itemType = unwrapPointer(itemType)
-	if itemType.Kind() != reflect.Struct {
+	switch {
+	case isJSONScalar(itemType) && !reflect.PointerTo(itemType).Implements(jsonMarshalerType):
+		return fmt.Errorf("the type %s is a scalar and can carry no JSON field %q (%s)", itemType, name, why)
+	case itemType.Kind() != reflect.Struct:
 		return nil
 	}
 	if _, ok := jsonFieldsOf(itemType)[name]; !ok {
@@ -302,6 +364,21 @@ func requireJSONField(itemType reflect.Type, name, why string) error {
 	}
 	return nil
 }
+
+// isJSONScalar reports whether values of the type marshal to a JSON string, number, boolean
+// or array of such, never to an object.
+func isJSONScalar(itemType reflect.Type) bool {
+	switch itemType.Kind() {
+	case reflect.Bool, reflect.String, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Float32, reflect.Float64,
+		reflect.Slice, reflect.Array:
+		return true
+	default:
+		return false
+	}
+}
+
+var jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
 
 const (
 	liveListNeedsID = "a live list is diffed by id"
