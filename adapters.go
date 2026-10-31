@@ -31,7 +31,17 @@ func OwnerOf(ctx context.Context) (Owner, bool) {
 	if identity == nil {
 		return Owner{}, false
 	}
-	return Owner{Key: identity.Provider + ":" + identity.Subject, Tenant: TenantFrom(ctx)}, true
+	return Owner{Key: OwnerKey(identity), Tenant: TenantFrom(ctx)}, true
+}
+
+// OwnerKey is the key an identity owns rows, sockets and stored filters under:
+// "provider:subject". Engine.RevalidateOwner and SocketsPerOwner take the same key; a nil
+// identity has the key "".
+func OwnerKey(identity *auth.Identity) string {
+	if identity == nil {
+		return ""
+	}
+	return identity.Provider + ":" + identity.Subject
 }
 
 // ChangeOperation is what happened to a row.
@@ -202,14 +212,19 @@ const (
 	OutcomeBatch       OutcomeKind = "batch"        // one batch (D33)
 	OutcomeRerun       OutcomeKind = "rerun"        // a subscription re-run after a change, resync or tick
 	OutcomeAfterCommit OutcomeKind = "after_commit" // a mutation's transaction committed (D41)
+	OutcomeOpen        OutcomeKind = "open"         // a socket was upgraded
+	OutcomeClose       OutcomeKind = "close"        // a socket ended; Status is its close code (1000, 1001, 1013, 4401, ...)
+	OutcomeRevalidate  OutcomeKind = "revalidate"   // a socket's identity re-validated on a tick or a Revalidate call (D6)
+	OutcomeFeed        OutcomeKind = "feed"         // the change feed failed; the engine restarts it after a backoff
+	OutcomeHeartbeat   OutcomeKind = "heartbeat"    // the presence heartbeat and sweep of a tick (D37)
 )
 
 // Outcome is one unit of work the engine or an adapter finished (D4, D30). Target is the
 // declaration's name; Operation is set on the socket, empty on REST; Subscription is set for
 // subscribe and rerun; Tenant is the resolved tenant (D42); Parameters is the decoded
-// parameters value (a *Parameters) when they were decoded; Status is the HTTP status answered;
-// Err is the refusal or failure, with the server-side Reason of an *auth.Error, and nil on
-// success.
+// parameters value (a *Parameters) when they were decoded; Status is the HTTP status answered
+// (the close code for OutcomeClose); Err is the refusal or failure, with the server-side
+// Reason of an *auth.Error, and nil on success.
 type Outcome struct {
 	Kind         OutcomeKind
 	Operation    Operation
