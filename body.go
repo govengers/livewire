@@ -341,7 +341,7 @@ func hasElementType(kind reflect.Kind) bool {
 }
 
 // reachableTypes lists every type the root reaches through fields, pointers, collections and
-// map values, each once, types with their own unmarshaler included (the validator descends
+// map keys and values, each once, types with their own unmarshaler included (the validator descends
 // into them, the body walk does not). Every type is marked before its elements are
 // followed, so a recursive type (`type Tree map[string]Tree`, `type Loop *Loop`) ends the
 // walk.
@@ -355,6 +355,9 @@ func reachableTypes(root reflect.Type) []reflect.Type {
 		}
 		visited[current] = true
 		reached = append(reached, current)
+		if current.Kind() == reflect.Map {
+			visit(current.Key())
+		}
 		switch {
 		case hasElementType(current.Kind()):
 			visit(current.Elem())

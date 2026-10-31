@@ -304,8 +304,13 @@ func (m *Mutation) preflightRules(owner reflect.Type, field reflect.StructField,
 	return nil
 }
 
+// preflightDive continues the rules after `dive` on the container's keys and elements; the
+// elements of an interface value show only at run time, like every rule on one.
 func (m *Mutation) preflightDive(owner reflect.Type, field reflect.StructField, target reflect.Type, rules []string) error {
 	container := unwrapPointer(target)
+	if container.Kind() == reflect.Interface {
+		return nil
+	}
 	if !hasElements(container.Kind()) {
 		return fmt.Errorf("the validate tags of %s.%s cannot be used: dive on %s, which has no elements", owner, field.Name, target)
 	}
@@ -324,22 +329,53 @@ func (m *Mutation) preflightDive(owner reflect.Type, field reflect.StructField, 
 }
 
 // preflightRule runs one rule on a holder struct whose field of the field's name and the
-// rule's type carries the rule alone, beside the owner's other exported fields, which the
-// rule's cross-field arguments name. Pointers are allocated, so the rule runs instead of
-// stopping at nil.
+// rule's type carries the rule alone, beside every other exported field visible in the owner
+// (promoted ones flattened), which the rule's cross-field arguments name. Every pointer is
+// allocated and the rule's collection holds one zero element, so the rule and its arguments
+// run instead of stopping at nil or an empty value.
 func (m *Mutation) preflightRule(owner reflect.Type, field reflect.StructField, target reflect.Type, rule string) error {
 	holderFields := []reflect.StructField{{Name: field.Name, Type: target, Tag: reflect.StructTag("validate:" + strconv.Quote(rule))}}
-	for position := range owner.NumField() {
-		sibling := owner.Field(position)
-		if sibling.IsExported() && sibling.Name != field.Name {
+	named := map[string]bool{field.Name: true}
+	for _, sibling := range reflect.VisibleFields(owner) {
+		if sibling.IsExported() && !named[sibling.Name] {
+			named[sibling.Name] = true
 			holderFields = append(holderFields, reflect.StructField{Name: sibling.Name, Type: sibling.Type})
 		}
 	}
 	holder := reflect.New(reflect.StructOf(holderFields))
-	for value := holder.Elem().Field(0); value.Kind() == reflect.Pointer; value = value.Elem() {
-		value.Set(reflect.New(value.Type().Elem()))
+	fillSample(holder.Elem().Field(0))
+	for position := 1; position < len(holderFields); position++ {
+		allocatePointers(holder.Elem().Field(position))
 	}
 	return m.preflight(holder, owner.String()+"."+field.Name)
+}
+
+// fillSample allocates the value's pointers and gives a slice or map one zero element (its
+// key and element pointers allocated), so a rule that reads the elements runs on one.
+func fillSample(value reflect.Value) {
+	value = allocatePointers(value)
+	switch {
+	case value.Kind() == reflect.Slice:
+		value.Set(reflect.MakeSlice(value.Type(), 1, 1))
+		allocatePointers(value.Index(0))
+	case value.Kind() == reflect.Map:
+		key := reflect.New(value.Type().Key()).Elem()
+		element := reflect.New(value.Type().Elem()).Elem()
+		allocatePointers(key)
+		allocatePointers(element)
+		value.Set(reflect.MakeMapWithSize(value.Type(), 1))
+		value.SetMapIndex(key, element)
+	}
+}
+
+// allocatePointers sets every pointer of the chain value starts with to a new value and
+// returns the value at its end; the declaration has no pointer loops (refusePointerLoops).
+func allocatePointers(value reflect.Value) reflect.Value {
+	for value.Kind() == reflect.Pointer {
+		value.Set(reflect.New(value.Type().Elem()))
+		value = value.Elem()
+	}
+	return value
 }
 
 // preflight validates value (a pointer to a struct) and turns a panic of the validator, or an
@@ -373,7 +409,7 @@ func (m *Mutation) validateBody(ctx context.Context, body any) (err error) {
 		}
 	}()
 	if err := m.validate.StructCtx(ctx, body); err != nil {
-		return m.validationError(err)
+		return m.validationError(body, err)
 	}
 	return nil
 }
@@ -467,114 +503,18 @@ func (m *Mutation) bodyError(raw []byte, err error) *Error {
 	return invalidParameter("body", "could not be decoded as the request type")
 }
 
-// validationError maps the failed tags to the fields by JSON path.
-func (m *Mutation) validationError(err error) error {
+// validationError maps the failed tags of body to the fields by JSON path (namespaceResolver).
+func (m *Mutation) validationError(body any, err error) error {
 	var failures validator.ValidationErrors
 	if !errors.As(err, &failures) {
 		return fmt.Errorf("livewire: validate the body: %w", err)
 	}
+	resolver := newNamespaceResolver(unwrapPointer(m.requestType).Name(), m.fields, body)
 	fields := make(map[string]string, len(failures))
 	for _, failure := range failures {
-		fields[m.jsonPathOf(failure.StructNamespace())] = failure.Tag()
+		fields[resolver.pathOf(failure.StructNamespace())] = failure.Tag()
 	}
 	return Invalid(fields)
-}
-
-// jsonPathOf translates the validator's Go namespace ("createPart.Nested.Note",
-// "audited.createPart.Secret", "order.Lines[1].SKU", "settings.Values[a.b]") to the body's
-// JSON path with the field index: the root type is dropped, untagged embedded structs
-// contribute no segment, every other field its JSON name, and every key or position in
-// brackets consumes one level of a collection or map of the type, so a recursive type
-// (`type Tree map[string]Tree`) is followed only as deep as the namespace goes. A namespace
-// the type cannot explain (an unbalanced key, a segment that is no field, a key where the
-// type has no elements) is reported as "body", never as it is.
-func (m *Mutation) jsonPathOf(structNamespace string) string {
-	rootType := unwrapPointer(m.requestType)
-	remainder, found := strings.CutPrefix(structNamespace, rootType.Name()+".")
-	if !found {
-		return "body"
-	}
-	segments, parsed := parseNamespace(remainder)
-	if !parsed {
-		return "body"
-	}
-	path := make([]pathSegment, 0, len(segments))
-	currentType := rootType
-	for _, segment := range segments {
-		currentType = unwrapPointer(currentType)
-		if segment.index {
-			if !hasElements(currentType.Kind()) {
-				return "body"
-			}
-			path = append(path, segment)
-			currentType = currentType.Elem()
-			continue
-		}
-		if currentType.Kind() != reflect.Struct {
-			return "body"
-		}
-		field, ok := currentType.FieldByName(segment.text)
-		if !ok {
-			return "body"
-		}
-		if name, named := m.fields.jsonNameOf(currentType, field); named {
-			path = append(path, pathSegment{text: name})
-		} else if !field.Anonymous {
-			return "body"
-		}
-		currentType = field.Type
-	}
-	return writePath(path)
-}
-
-// parseNamespace splits a namespace below the root ("Lines[1].SKU", "Values[a.b]",
-// "Grid[0][1]") into field names and the keys or positions in brackets. A key may hold
-// balanced brackets ("Values[c[d]]"); a namespace that does not read back as names, each
-// followed by bracketed keys and a dot or the end, is not parsed. An empty name is kept: it
-// is no field of any type.
-func parseNamespace(namespace string) ([]pathSegment, bool) {
-	var segments []pathSegment
-	for {
-		nameEnd := strings.IndexAny(namespace, ".[")
-		if nameEnd < 0 {
-			nameEnd = len(namespace)
-		}
-		segments = append(segments, pathSegment{text: namespace[:nameEnd]})
-		namespace = namespace[nameEnd:]
-		for strings.HasPrefix(namespace, "[") {
-			keyEnd, closed := closingBracket(namespace)
-			if !closed {
-				return nil, false
-			}
-			segments = append(segments, pathSegment{text: namespace[1:keyEnd], index: true})
-			namespace = namespace[keyEnd+1:]
-		}
-		if namespace == "" {
-			return segments, true
-		}
-		rest, dotted := strings.CutPrefix(namespace, ".")
-		if !dotted {
-			return nil, false
-		}
-		namespace = rest
-	}
-}
-
-// closingBracket returns the position of the bracket that closes the one text opens with.
-func closingBracket(text string) (int, bool) {
-	depth := 0
-	for position := range len(text) {
-		switch text[position] {
-		case '[':
-			depth++
-		case ']':
-			depth--
-			if depth == 0 {
-				return position, true
-			}
-		}
-	}
-	return 0, false
 }
 
 func sortedKeys[Value any](values map[string]Value) []string {

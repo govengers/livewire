@@ -124,6 +124,20 @@ func TestMutationRefusesUnparseableValidateTags(t *testing.T) {
 	type behindAPointer struct {
 		Count **int `json:"count" validate:"omitempty,min=abc"`
 	}
+	type crossFieldOnAPointer struct {
+		Kind  string `json:"kind" validate:"required_if=Count abc"`
+		Count *int   `json:"count"`
+	}
+	type uniqueOnAMissingField struct {
+		Lines []partLine `json:"lines" validate:"omitempty,unique=Missing"`
+	}
+	type uniqueOverUnhashableMapValues struct {
+		Tags map[string][]string `json:"tags" validate:"omitempty,unique"`
+	}
+	type crossFieldOnAPromotedField struct {
+		counted
+		Kind string `json:"kind" validate:"omitempty,required_if=Count abc"`
+	}
 	type moneyPointer struct {
 		Amount *money `json:"amount"`
 	}
@@ -155,9 +169,18 @@ func TestMutationRefusesUnparseableValidateTags(t *testing.T) {
 		"behind a dive on map values":   func() error { return declareBody[behindDiveOnMapValues](t) },
 		"keys to the end of the tag":    func() error { return declareBody[behindDiveOnKeysToTheEnd](t) },
 		"behind a pointer to a pointer": func() error { return declareBody[behindAPointer](t) },
+		"cross-field on a pointer":      func() error { return declareBody[crossFieldOnAPointer](t) },
+		"unique on a missing field":     func() error { return declareBody[uniqueOnAMissingField](t) },
+		"unique over unhashable values": func() error { return declareBody[uniqueOverUnhashableMapValues](t) },
+		"cross-field on a promoted one": func() error { return declareBody[crossFieldOnAPromotedField](t) },
 	} {
 		require.ErrorContains(t, declare(), "validate tags", name)
 	}
+}
+
+// counted is embedded to promote Count.
+type counted struct {
+	Count int `json:"count"`
 }
 
 func TestMutationAcceptsUsableValidateTags(t *testing.T) {
@@ -172,6 +195,18 @@ func TestMutationAcceptsUsableValidateTags(t *testing.T) {
 		Labels  map[string]string `json:"labels" validate:"dive,keys,alphanum,endkeys"`
 	}
 	require.NoError(t, declareBody[usable](t))
+}
+
+func TestMutationDiveOnAnInterfaceRunsAtRunTime(t *testing.T) {
+	type listed struct {
+		Items any `json:"items" validate:"omitempty,dive,min=1"`
+	}
+	mutation := newBody[listed](t)
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"items":[""]}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "items[0]")
+	require.Equal(t, map[string]string{"items[0]": "min"}, fields, "the elements of an interface value are named by the decoded value")
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"items":["a"]}`))
+	require.NoError(t, err)
 }
 
 func TestMutationAnswersARunTimeValidatorFaultAsInternal(t *testing.T) {
@@ -238,8 +273,17 @@ func TestDeclarationsRefusePointerLoops(t *testing.T) {
 	type looped struct {
 		Loop pointerLoop `json:"loop"`
 	}
+	type loopKeyed struct {
+		Names map[pointerLoop]string `json:"names" validate:"dive,keys,required,endkeys"`
+	}
 	declarations := map[string]livewire.Declaration{}
 	withinDeadline(t, func() {
+		declarations["mutation map key"] = livewire.NewMutation("loopKeys", http.MethodPost, "/loop-keys", &livewire.MutationOptions[livewire.NoParameters, loopKeyed, livewire.NoContent]{
+			Check: authorization.IsUser(),
+			Handle: func(context.Context, *livewire.NoParameters, *loopKeyed) (*livewire.NoContent, error) {
+				return &livewire.NoContent{}, nil
+			},
+		})
 		declarations["resource item"] = livewire.NewResource("loops", "/loops", &livewire.ResourceOptions[pointerLoop]{
 			Read:   authorization.IsUser(),
 			Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "loops.id", Filter: true}},
@@ -314,11 +358,49 @@ func TestMutationValidationPathsThroughARecursiveMap(t *testing.T) {
 	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "sub[k].sub[j].note")
 	require.Equal(t, map[string]string{"sub[k].sub[j].note": "required"}, fields)
 
-	for _, key := range []string{"x]y.Sub[z", "k].Note[x", "k].Nope[x"} {
+	for _, key := range []string{"x]y.Sub[z", "k].Note[x", "k].Nope[x", "k]Sub[j", "k].Sub[j", "k].Sub[j].Sub[i"} {
 		_, err = mutation.DecodeBody(userContext(), []byte(`{"note":"n","sub":{"`+key+`":{}}}`))
 		fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
-		require.Equal(t, map[string]string{"body": "required"}, fields, "a key %q that forges a path the type cannot explain names the body", key)
+		require.Equal(t, map[string]string{"body": "required"}, fields, "a key %q that forges a path names the body", key)
 	}
+
+	forged := `{"note":"n","sub":{"k":{"note":"m","sub":{"j":{"note":"o","sub":{"i":{"note":"p"}}}}},"k].Sub[j":{},"k].Sub[j].Sub[i":{}}}`
+	_, err = mutation.DecodeBody(userContext(), []byte(forged))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
+	require.Equal(t, map[string]string{"body": "required"}, fields, "keys that forge the path of existing entries name the body")
+}
+
+// caseless keys format in lower case, so two keys can share one text.
+type caseless string
+
+func (c caseless) String() string { return strings.ToLower(string(c)) }
+
+func TestMutationValidationPathsOfKeysWithBrackets(t *testing.T) {
+	type keyed struct {
+		Values map[string]string            `json:"values" validate:"dive,required"`
+		Nested map[string]map[string]string `json:"nested" validate:"dive,dive,min=1"`
+	}
+	mutation := newBody[keyed](t)
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"values":{"a[":"set","a[]x":""}}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "values[a[]x]")
+	require.Equal(t, map[string]string{"values[a[]x]": "required"}, fields, "a key text that does not end at a segment is no candidate")
+
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"nested":{"a[":{"b]":""},"a[][b]":{}}}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
+	require.Equal(t, map[string]string{"body": "min"}, fields, "a namespace two entries explain names neither")
+}
+
+func TestMutationValidationPathsOfKeysSharingOneText(t *testing.T) {
+	type labels struct {
+		Labels map[caseless]string `json:"labels" validate:"dive,min=2"`
+	}
+	mutation := newBody[labels](t)
+	_, err := mutation.DecodeBody(userContext(), []byte(`{"labels":{"A":"x","a":"y"}}`))
+	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "body")
+	require.Equal(t, map[string]string{"body": "min"}, fields, "a text two keys share names neither")
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"labels":{"B":"x"}}`))
+	fields = requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "labels[B]")
+	require.Equal(t, map[string]string{"labels[B]": "min"}, fields, "the key as the body carries it")
 }
 
 type labelled struct {
