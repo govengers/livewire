@@ -232,13 +232,13 @@ BEGIN
 	EXECUTE format('SELECT coalesce(max(version), 0) + 1, greatest(clock_timestamp(), max(valid_from), max(valid_to)) FROM %s WHERE id = $1', history)
 		INTO next_version, stamp USING row_id;
 	-- The life of the version: a row arriving under an id (an insert, or an update that changes
-	-- the id onto it) starts the id's next life, unless the id's last version is a delete of
-	-- this very transaction, the delete half of a partition move; every other version
-	-- continues the life of the one before.
+	-- the id onto it) starts the id's next life, unless it is an insert whose id's last version
+	-- is a delete of this very transaction, the two halves of a partition move; every other
+	-- version continues the life of the one before.
 	EXECUTE format('SELECT life, operation, transaction_id FROM %s WHERE id = $1 ORDER BY version DESC LIMIT 1', history)
 		INTO last_life, last_operation, last_transaction USING row_id;
 	current_life := coalesce(last_life, 1);
-	IF starts AND last_life IS NOT NULL AND NOT (last_operation = 'delete' AND last_transaction = pg_current_xact_id()) THEN
+	IF starts AND last_life IS NOT NULL AND NOT (TG_OP = 'INSERT' AND last_operation = 'delete' AND last_transaction = pg_current_xact_id()) THEN
 		current_life := last_life + 1;
 	END IF;
 	EXECUTE format('UPDATE %s SET valid_to = $2 WHERE id = $1 AND valid_to IS NULL', history) USING row_id, stamp;
