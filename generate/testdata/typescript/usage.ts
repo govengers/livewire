@@ -123,8 +123,8 @@ export async function rest(): Promise<void> {
 export function socket(): void {
   connection.onStatus((status) => console.log(status))
   const subscription = connection.subscribe(live.parts, { limit: 10 }, {
-    next: (state) => console.log(state.data.items.length, state.pending, state.filterId),
-    error: (error) => console.log(error.code),
+    next: (state) => console.log(state.data.items.length, state.pending, state.filterId, state.identity),
+    error: (error) => console.log(error instanceof ApiError ? error.code : error.message),
   })
   subscription.unsubscribe()
   void connection.call(calls.createPart, {}, { name: 'a', kind: 'bolt' }, { optimistic: undefined as unknown as FixturePart })

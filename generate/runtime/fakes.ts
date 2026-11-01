@@ -84,14 +84,14 @@ export function fakeSockets(): { Socket: new (url: string) => FakeSocket; socket
 
 export interface FetchCall {
   url: string
-  init: RequestInit
+  request: RequestInit
 }
 
 /** A fetch that records its calls and answers them from responses, in order. */
 export function fakeFetch(...responses: (Response | Error)[]): { fetch: typeof fetch; calls: FetchCall[] } {
   const calls: FetchCall[] = []
-  const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    calls.push({ url: String(input), init: init ?? {} })
+  const fetcher = async (input: string | URL | Request, request?: RequestInit): Promise<Response> => {
+    calls.push({ url: String(input), request: request ?? {} })
     const response = responses.shift()
     if (response === undefined) throw new Error(`no response left for ${String(input)}`)
     if (response instanceof Error) throw response

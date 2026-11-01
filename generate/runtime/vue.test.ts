@@ -80,7 +80,7 @@ describe('useLive', () => {
     expect([live.data.value?.title, live.stale.value]).toEqual(['A', true])
     current().answer('subscribe', { subscription: 's2' })
     current().receive({ sub: 's2', seq: 1, kind: 'error', payload: { code: 'forbidden', message: 'no' } })
-    expect([live.error.value?.code, live.loading.value]).toEqual(['forbidden', false])
+    expect([live.error.value?.message, live.loading.value]).toEqual(['no', false])
     live.retry()
     expect(live.error.value).toBeUndefined()
     current().answer('subscribe', { subscription: 's3' })
@@ -150,6 +150,7 @@ describe('useLive', () => {
     expect([...storage.values.keys()]).toEqual(['livewire:identity'])
     expect(sockets).toHaveLength(2)
     current().open()
+    expect(current().sent.map((frame) => frame.op)).toEqual(['subscribe'])
     current().answer('subscribe', { subscription: 's2' })
     current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: list([{ id: 'b', name: 'of bob' }]) })
     expect(live.data.value?.items[0]?.name).toBe('of bob')
@@ -418,5 +419,80 @@ describe('useLivePresence', () => {
     expect(current().sent.some((frame) => frame.op === 'leave')).toBe(false)
     second.stop()
     expect(current().last('leave').params).toEqual({ key: 'k' })
+  })
+})
+
+describe('identity epochs in the views (D66)', () => {
+  test('a non-reactive switch through checkIdentity stores the new data under the new identity, never shown to the old one', () => {
+    const storage = new MemoryStorage()
+    let identity = 'password:alice'
+    const fakes = fakeSockets()
+    const connection = new LiveConnection({ url: 'wss://x', WebSocket: fakes.Socket, identity: () => identity, clock: new FakeClock() })
+    const view = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection, cache: true, storage }))!
+    fakes.current().open()
+    fakes.current().answer('subscribe', { subscription: 's1' })
+    fakes.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'of alice' } })
+    identity = 'password:bob'
+    connection.checkIdentity()
+    fakes.current().open()
+    expect(fakes.current().sent.some((frame) => frame.op === 'unsubscribe')).toBe(false)
+    fakes.current().answer('subscribe', { subscription: 's2' })
+    fakes.current().receive({ sub: 's2', seq: 1, kind: 'replace', payload: { title: 'secret of bob' } })
+    expect(view.data.value?.title).toBe('secret of bob')
+
+    identity = 'password:alice'
+    const remount = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: connect('password:alice').connection, cache: true, storage }))!
+    expect(remount.data.value).toBeUndefined()
+  })
+
+  test('a storage that fails is a cache miss: the view still subscribes', () => {
+    const storage = new MemoryStorage()
+    storage.setItem = () => {
+      throw new Error('private mode')
+    }
+    storage.getItem = () => {
+      throw new Error('private mode')
+    }
+    const { connection, current } = connect()
+    const live = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection, cache: true, storage }))!
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'A' } })
+    expect(live.data.value?.title).toBe('A')
+  })
+})
+
+describe('useLiveList limits and cursors', () => {
+  test('offset paging uses the limit the server applied (D14)', async () => {
+    const { connection, current } = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection, limit: 500 }))!
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }], { limit: 100, total: 250 }) })
+    expect(live.pages.value).toBe(3)
+    live.page.value = 2
+    await nextTick()
+    expect(current().last('subscribe').params).toEqual({ limit: '500', offset: '100' })
+    live.limit.value = 50
+    await nextTick()
+    expect(live.page.value).toBe(1)
+  })
+
+  test('a read of a tile\'s next started before a snapshot cannot override the snapshot\'s next (D64)', async () => {
+    const connected = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection: connected.connection, mode: 'cursor', limit: 2 }))!
+    const { current } = connected
+    current().open()
+    current().answer('subscribe', { subscription: 't1' })
+    current().receive({ sub: 't1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], { next: 'after-b' }) })
+    live.loadMore()
+    current().answer('subscribe', { subscription: 't2' })
+    current().receive({ sub: 't1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'n', name: 'N' }], removes: ['b'], order: ['n', 'a'] } })
+    const refresh = current().last('query')
+    current().receive({ sub: 't1', seq: 3, kind: 'snapshot', payload: list([{ id: 'n', name: 'N' }, { id: 'x', name: 'X' }], { next: 'after-x' }) })
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-x' })
+    current().receive({ id: refresh.id, ok: true, status: 200, payload: list([{ id: 'n', name: 'N' }, { id: 'a', name: 'A' }], { next: 'after-a' }) })
+    await settle()
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-x' })
   })
 })

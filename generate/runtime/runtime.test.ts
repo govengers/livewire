@@ -3,6 +3,7 @@ import { FakeClock, fakeFetch, fakeSockets, json, settle } from './fakes'
 import {
   ApiError,
   Client,
+  FilterMemory,
   LiveConnection,
   NetworkError,
   applyListChange,
@@ -167,24 +168,24 @@ describe('Client', () => {
     const client = new Client({ baseURL: base, fetch, headers: () => ({ Authorization: 'Bearer key' }) })
     expect(await client.read(partItem, { id: 'p 1' })).toEqual({ id: 'p', name: 'P' })
     expect(calls[0]?.url).toBe('https://example.com/api/v1/parts/p%201')
-    expect(calls[0]?.init.method).toBe('GET')
-    expect((calls[0]?.init.headers as Record<string, string>)['Authorization']).toBe('Bearer key')
-    expect(calls[0]?.init.credentials).toBe('same-origin')
+    expect(calls[0]?.request.method).toBe('GET')
+    expect((calls[0]?.request.headers as Record<string, string>)['Authorization']).toBe('Bearer key')
+    expect(calls[0]?.request.credentials).toBe('same-origin')
   })
 
   test('a call sends an Idempotency-Key, the body with a client id and answers nothing for 204', async () => {
     const { fetch, calls } = fakeFetch(json({ id: 'p', name: 'a' }, 201), new Response(null, { status: 204 }))
     const client = new Client({ baseURL: base, fetch })
     expect(await client.call(createPart, {}, { name: 'a' })).toEqual({ id: 'p', name: 'a' })
-    const headers = calls[0]?.init.headers as Record<string, string>
+    const headers = calls[0]?.request.headers as Record<string, string>
     expect(headers['Idempotency-Key']).toMatch(uuidPattern(7))
     expect(headers['Content-Type']).toBe('application/json')
-    const body = JSON.parse(String(calls[0]?.init.body)) as { id: string; name: string }
+    const body = JSON.parse(String(calls[0]?.request.body)) as { id: string; name: string }
     expect(body.id).toMatch(uuidPattern(7))
     expect(await client.call(deletePart, { id: 'p' }, undefined, { idempotencyKey: 'key' })).toBeUndefined()
     expect(calls[1]?.url).toBe(`${base}/parts/p`)
-    expect(calls[1]?.init.body).toBeUndefined()
-    expect((calls[1]?.init.headers as Record<string, string>)['Idempotency-Key']).toBe('key')
+    expect(calls[1]?.request.body).toBeUndefined()
+    expect((calls[1]?.request.headers as Record<string, string>)['Idempotency-Key']).toBe('key')
   })
 
   test('a prepared call retries with the same client id and key (D16, D18)', async () => {
@@ -193,7 +194,7 @@ describe('Client', () => {
     const prepared = prepareCall(createPart, { name: 'a' })
     await expect(client.call(createPart, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })).rejects.toBeInstanceOf(NetworkError)
     await client.call(createPart, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })
-    const [first, second] = calls.map((call) => [JSON.parse(String(call.init.body)) as { id: string }, (call.init.headers as Record<string, string>)['Idempotency-Key']] as const)
+    const [first, second] = calls.map((call) => [JSON.parse(String(call.request.body)) as { id: string }, (call.request.headers as Record<string, string>)['Idempotency-Key']] as const)
     expect(first?.[0].id).toBe(prepared.body.id ?? '')
     expect(second).toEqual(first ?? [{ id: '' }, ''])
     expect(prepareCall(deletePart, undefined, { idempotencyKey: 'k' })).toEqual({ body: undefined, idempotencyKey: 'k' })
@@ -267,23 +268,23 @@ describe('Client', () => {
     const client = new Client({ baseURL: base, fetch })
     const file = new Blob(['x'], { type: 'image/png' })
     await client.upload(attach, { id: 'p' }, file)
-    expect((calls[0]?.init.headers as Record<string, string>)['Content-Type']).toBe('image/png')
-    expect(calls[0]?.init.body).toBe(file)
+    expect((calls[0]?.request.headers as Record<string, string>)['Content-Type']).toBe('image/png')
+    expect(calls[0]?.request.body).toBe(file)
     await client.upload(attach, { id: 'p' }, file, { multipart: true, filename: 'a.png' })
-    const form = calls[1]?.init.body as FormData
+    const form = calls[1]?.request.body as FormData
     expect((form.get('file') as File).name).toBe('a.png')
-    expect((calls[1]?.init.headers as Record<string, string>)['Content-Type']).toBeUndefined()
+    expect((calls[1]?.request.headers as Record<string, string>)['Content-Type']).toBeUndefined()
   })
 
   test('the library routes: batch, stored filters, export', async () => {
     const { fetch, calls } = fakeFetch(json([{ status: 201, payload: {} }]), json(list([])), new Response(null, { status: 204 }), new Response('id\n1\n', { status: 200 }))
     const client = new Client({ baseURL: base, fetch })
     expect(await client.batch([batchCall(deletePart, { id: 'p' }, undefined)])).toEqual([{ status: 201, payload: {} }])
-    expect(JSON.parse(String(calls[0]?.init.body))).toEqual([{ target: 'deletePart', params: { id: 'p' } }])
+    expect(JSON.parse(String(calls[0]?.request.body))).toEqual([{ target: 'deletePart', params: { id: 'p' } }])
     await client.listFilters('parts.history')
     expect(calls[1]?.url).toBe(`${base}/filters?resource=parts.history`)
     await client.deleteFilter('f/1')
-    expect([calls[2]?.url, calls[2]?.init.method]).toEqual([`${base}/filters/f%2F1`, 'DELETE'])
+    expect([calls[2]?.url, calls[2]?.request.method]).toEqual([`${base}/filters/f%2F1`, 'DELETE'])
     expect(client.exportURL(partsExport, { sort: ['-name'] })).toBe(`${base}/parts/export?sort=-name`)
     const download = await client.download(partsExport, {})
     expect([await download.blob.text(), download.rows]).toEqual(['id\n1\n', null])
@@ -785,5 +786,124 @@ describe('LiveConnection', () => {
     connection.subscribe(parts, {}, listener())
     expect(current().url).toBe('wss://dynamic/socket')
     connection.close()
+  })
+})
+
+describe('LiveConnection identity epochs (D66)', () => {
+  test('a switch during reconnect backoff fails the queued write and starts the subscriptions over as the new identity', async () => {
+    let identity = 'password:reader'
+    const { connection, clock, sockets, current, received } = subscribedList([{ id: 'a', name: 'private row of the reader' }], { identity: () => identity })
+    current().end(1006)
+    const write = connection.call(deletePart, { id: 'a' }, undefined)
+    identity = 'password:writer'
+    const before = received.states.length
+    clock.advance(10)
+    expect(sockets).toHaveLength(2)
+    current().open()
+    expect(current().sent.map((frame) => frame.op)).toEqual(['subscribe'])
+    await expect(write).rejects.toThrow('the identity changed')
+    expect(received.states.slice(before).every((state) => state.identity === 'password:writer' && state.data.items.every((item) => item.name !== 'private row of the reader'))).toBe(true)
+    current().answer('subscribe', { subscription: 's9' })
+    current().receive({ sub: 's9', seq: 1, kind: 'snapshot', payload: list([{ id: 'w', name: 'of the writer' }]) })
+    expect([received.last()?.identity, received.last()?.data.items[0]?.name]).toEqual(['password:writer', 'of the writer'])
+  })
+
+  test('a switch through checkIdentity drops the data, so nothing of the old identity is delivered under the new one', async () => {
+    let identity = 'password:alice'
+    const { connection, current, received } = subscribedList([{ id: 'a', name: 'of alice' }], { identity: () => identity })
+    const pending = connection.call(deletePart, { id: 'a' }, undefined)
+    const before = received.states.length
+    identity = 'password:bob'
+    connection.checkIdentity()
+    await expect(pending).rejects.toBeInstanceOf(NetworkError)
+    expect(received.states.slice(before)).toEqual([])
+    current().open()
+    expect(current().sent.some((frame) => frame.op === 'unsubscribe')).toBe(false)
+  })
+
+  test('close() fails a write queued during backoff and stops the reconnect: a new login sends nothing of it', async () => {
+    let identity = 'password:alice'
+    const { connection, clock, sockets, current } = subscribedList([], { identity: () => identity })
+    current().end(1006)
+    const write = connection.call(deletePart, { id: 'a' }, undefined)
+    connection.close()
+    clock.advance(60_000)
+    expect(sockets).toHaveLength(1)
+    identity = 'password:bob'
+    connection.reconnect()
+    current().open()
+    expect(current().sent.map((frame) => frame.op)).toEqual(['subscribe'])
+    await expect(write).rejects.toThrow('the connection was closed')
+  })
+
+  test('a subscribe without an answer ends at the request deadline', () => {
+    const { connection, clock, current } = connect({ requestTimeout: 100 })
+    const received = listener<ListResponse<Part>>()
+    connection.subscribe(parts, {}, received)
+    current().open()
+    clock.advance(100)
+    expect(received.errors[0]).toBeInstanceOf(NetworkError)
+  })
+
+  test('an upsert without an optimistic item whose answer comes after a push keeps the push (D65)', async () => {
+    const { connection, current, received } = subscribedList([{ id: 'a', name: 'A' }])
+    const call = connection.call(createPart, {}, { id: 'a', name: 'mine' })
+    const frame = current().last('call')
+    current().receive({ sub: 's1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'a', name: 'newer' }], removes: [] } })
+    current().receive({ id: frame.id, ok: true, status: 201, payload: { id: 'a', name: 'older' } })
+    await call
+    expect(received.last()?.data.items).toEqual([{ id: 'a', name: 'newer' }])
+  })
+
+  test('an older call that settles first stays below a newer pending one', async () => {
+    const { connection, current, received } = subscribedList([{ id: 'a', name: 'A' }])
+    const first = connection.call(createPart, {}, { id: 'a', name: 'one' }, { optimistic: { id: 'a', name: 'one' } })
+    const firstFrame = current().last('call')
+    void connection.call(createPart, {}, { id: 'a', name: 'two' }, { optimistic: { id: 'a', name: 'two' } }).catch(() => {})
+    current().receive({ id: firstFrame.id, ok: true, status: 201, payload: { id: 'a', name: 'one' } })
+    await first
+    expect(received.last()?.data.items).toEqual([{ id: 'a', name: 'two' }])
+    expect(received.last()?.pending).toEqual(['a'])
+  })
+
+  test('presence: a registration that joins while the last leave waits for a join answer cancels the leave (D37)', async () => {
+    const { connection, current } = connect()
+    const first = connection.join(presence, { key: 'k' }, { cursor: 1 })
+    current().open()
+    first.leave()
+    const second = connection.join(presence, { key: 'k' }, { cursor: 2 })
+    current().answer('join')
+    await settle()
+    expect(current().sent.some((frame) => frame.op === 'leave')).toBe(false)
+    expect(current().last('join').body).toEqual({ cursor: 2 })
+    current().answer('join')
+    await second.ready
+  })
+
+  test('presence: a join lost with its socket is no error and settles with the rejoin', async () => {
+    const { connection, clock, current } = connect()
+    const errors: Error[] = []
+    let joins = 0
+    const registration = connection.join(presence, { key: 'k' }, {}, { onError: (error) => void errors.push(error), onJoined: () => void joins++ })
+    current().open()
+    current().end(1006)
+    await settle()
+    expect(errors).toEqual([])
+    clock.advance(10)
+    current().open()
+    current().answer('join')
+    await registration.ready
+    expect([errors, joins]).toEqual([[], 1])
+  })
+
+  test('a subscription by the id of a filter the Client saved recovers it through the shared memory (D54)', async () => {
+    const filters = new FilterMemory()
+    const { fetch } = fakeFetch(json({ id: 'f1', resource: 'parts', filter: { search: 'x' }, createdAt: '', lastUsedAt: '' }, 201))
+    await new Client({ baseURL: 'https://example.com/api/v1', fetch, filters }).saveFilter({ resource: 'parts', filter: { search: 'x' } })
+    const { connection, current } = connect({ filters })
+    connection.subscribe(parts, { filterId: 'f1' }, listener())
+    current().open()
+    current().receive({ id: current().last('subscribe').id, ok: false, status: 404, error: notFound })
+    expect(current().last('subscribe').params).toEqual({ filter: '{"search":"x"}' })
   })
 })

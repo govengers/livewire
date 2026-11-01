@@ -70,7 +70,7 @@ export interface UseLiveOptions {
 
 export interface LiveRead<Data> {
   data: ShallowRef<Data | undefined>
-  error: ShallowRef<ApiError | undefined>
+  error: ShallowRef<ApiError | NetworkError | undefined>
   /** True until the first push and whenever the socket is not open. */
   stale: Ref<boolean>
   /** No data yet and no error: the one condition a skeleton should show for. */
@@ -92,28 +92,27 @@ function defaultStorage(): SnapshotStorage | undefined {
 
 /**
  * Reads the snapshot under key for the identity; a snapshot of another identity is never shown:
- * a new identity clears every livewire snapshot first, and nobody ("") has none (D21).
+ * a new identity clears every livewire snapshot first, and nobody ("") has none (D21). A storage
+ * that fails (full, private mode, unparsable) is a miss: the view subscribes without a snapshot.
  */
 function readSnapshot(storage: SnapshotStorage, identity: string, key: string): unknown {
-  forgetOtherIdentities(storage, identity)
-  if (identity === '') return undefined
-  const stored = storage.getItem(key)
-  if (stored === null) return undefined
   try {
-    return JSON.parse(stored)
+    forgetOtherIdentities(storage, identity)
+    if (identity === '') return undefined
+    const stored = storage.getItem(key)
+    return stored === null ? undefined : JSON.parse(stored)
   } catch {
-    storage.removeItem(key)
     return undefined
   }
 }
 
+/** Writes the snapshot of a state under the identity of the socket that delivered it (D66). */
 function writeSnapshot(storage: SnapshotStorage, identity: string, key: string, data: unknown): void {
-  forgetOtherIdentities(storage, identity)
-  if (identity === '') return
   try {
-    storage.setItem(key, JSON.stringify(data))
+    forgetOtherIdentities(storage, identity)
+    if (identity !== '') storage.setItem(key, JSON.stringify(data))
   } catch {
-    // a full storage keeps the old snapshot: the next push tries again
+    // a full storage keeps no snapshot: the next push tries again
   }
 }
 
@@ -152,7 +151,7 @@ function liveRead<Parameters extends object, Data>(target: LiveTarget<Parameters
   const connection = useLiveConnection(options.connection)
   const storage = options.cache === true ? (options.storage ?? defaultStorage()) : undefined
   const data = shallowRef<Data>()
-  const error = shallowRef<ApiError>()
+  const error = shallowRef<ApiError | NetworkError>()
   const stale = ref(true)
   const pending = shallowRef<readonly string[]>([])
   const filterId = ref<string>()
@@ -171,9 +170,8 @@ function liveRead<Parameters extends object, Data>(target: LiveTarget<Parameters
     }
     identity = subscribedIdentity
     const wire = wireParameters(current())
-    const cacheKey = snapshotKey(subscribedIdentity, target.target, wire)
     if (storage !== undefined) {
-      const cached = readSnapshot(storage, subscribedIdentity, cacheKey)
+      const cached = readSnapshot(storage, subscribedIdentity, snapshotKey(subscribedIdentity, target.target, wire))
       if (cached !== undefined) data.value = cached as Data
     }
     error.value = undefined
@@ -186,7 +184,8 @@ function liveRead<Parameters extends object, Data>(target: LiveTarget<Parameters
         filterId.value = state.filterId
         error.value = undefined
         stale.value = connection.status !== 'open'
-        if (storage !== undefined) writeSnapshot(storage, subscribedIdentity, cacheKey, state.data)
+        // The state belongs to the identity of the socket that delivered it, whoever subscribed.
+        if (storage !== undefined) writeSnapshot(storage, state.identity, snapshotKey(state.identity, target.target, wire), state.data)
       },
       error: (refusal) => {
         if (subscription === owned) error.value = refusal
@@ -265,7 +264,7 @@ interface Tile<Item> {
   /** The cursor after the page: what its last snapshot or the last read of the page answered (a diff carries none). */
   next: Ref<string | undefined>
   data: ShallowRef<ListResponse<Item> | undefined>
-  error: ShallowRef<ApiError | undefined>
+  error: ShallowRef<ApiError | NetworkError | undefined>
   refreshError: ShallowRef<ApiError | NetworkError | undefined>
   /** Counts the reads of the page's next cursor; only the answer of the newest counts. */
   refreshes: number
@@ -292,6 +291,10 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
   const cursor = options.mode === 'cursor'
   let disposed = false
 
+  // The page size the server applied to the limit asked for (D14: clamped to MaximumLimit), else
+  // that limit; a new limit forgets it.
+  const appliedLimit = ref<number>()
+  const pageSize = (): number | undefined => appliedLimit.value ?? limit.value
   const queryOf = (after: string | undefined): Query => {
     const query: Record<string, unknown> = { ...(toValue(options.parameters) ?? {}) }
     if (filter.value !== undefined) query['filter'] = filter.value
@@ -299,8 +302,9 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     if (limit.value !== undefined) query['limit'] = limit.value
     if (cursor) {
       if (after !== undefined) query['after'] = after
-    } else if (limit.value !== undefined && page.value > 1) {
-      query['offset'] = (page.value - 1) * limit.value
+    } else if (page.value > 1) {
+      const size = pageSize()
+      if (size !== undefined) query['offset'] = (page.value - 1) * size
     }
     return query as Query
   }
@@ -318,9 +322,11 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
         tile.pending.value = state.pending
         tile.error.value = undefined
         tile.received.value = true
+        if (position === 0) appliedLimit.value = state.data.limit
         if (!cursor) return
         if (before === undefined || state.data.next !== before.next) {
-          // A snapshot carries the page's next: take it.
+          // A snapshot carries the page's next: take it, over any read of the page still on its way.
+          tile.refreshes++
           tile.next.value = state.data.next
           follow(position, state.data.next)
         } else if (boundaryMoved(before, state.data)) {
@@ -373,6 +379,9 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     stopTiles()
     tiles.value = [startTile(undefined, 0)]
   }
+  watch(limit, () => {
+    appliedLimit.value = undefined
+  })
   // An identity change starts over too; connection.subscribe replaces a socket of the old identity.
   watch(() => [JSON.stringify([toValue(options.parameters), filter.value, sort.value, limit.value]), connection.identity()], () => {
     if (page.value !== 1 && !cursor) page.value = 1 // the page watcher restarts
@@ -416,7 +425,10 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     items, total, error, stale, filter, sort, limit, page,
     loading: computed(() => error.value === undefined && first.value?.data.value === undefined),
     pending: computed(() => tiles.value.flatMap((tile) => tile.pending.value)),
-    pages: computed(() => (total.value === undefined || limit.value === undefined || limit.value === 0 ? undefined : Math.max(1, Math.ceil(total.value / limit.value)))),
+    pages: computed(() => {
+      const size = pageSize()
+      return total.value === undefined || size === undefined || size === 0 ? undefined : Math.max(1, Math.ceil(total.value / size))
+    }),
     hasMore: computed(() => cursor && tiles.value.at(-1)?.next.value !== undefined),
     loadMore: () => {
       const next = tiles.value.at(-1)?.next.value
@@ -485,7 +497,10 @@ export function useLivePresence<Parameters extends object, State>(
       presenceError.value = undefined
       registration = connection.join(target, toValue(parameters), toValue(state), {
         onError: (failure) => {
-          presenceError.value = failure as ApiError | NetworkError
+          presenceError.value = failure
+        },
+        onJoined: () => {
+          presenceError.value = undefined
         },
       })
     },

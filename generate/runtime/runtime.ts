@@ -392,16 +392,43 @@ export function applyListChange<Item>(list: ListResponse<Item>, change: ListChan
  * registered without a name and the read answers 404 (the filter was evicted, D54), once more
  * with that filter inline. Every read path that sends a filterId goes through it.
  */
-async function recoveringEvictedFilter<Result>(wire: Record<string, string>, documents: ReadonlyMap<string, string>, run: (wire: Record<string, string>) => Promise<Result>): Promise<Result> {
+async function recoveringEvictedFilter<Result>(wire: Record<string, string>, memory: FilterMemory, run: (wire: Record<string, string>) => Promise<Result>): Promise<Result> {
   try {
     return await run(wire)
   } catch (error) {
     const filterId = wire['filterId']
-    const document = filterId === undefined ? undefined : documents.get(filterId)
+    const document = filterId === undefined ? undefined : memory.document(filterId)
     if (!(error instanceof ApiError) || error.code !== 'not_found' || document === undefined) throw error
     const inline: Record<string, string> = { ...wire, filter: document }
     delete inline['filterId']
     return run(inline)
+  }
+}
+
+/**
+ * The documents of the unnamed filters a Client stored and a LiveConnection registered, by
+ * filterId, as they were sent (D54). Give one to both (ClientOptions.filters,
+ * LiveOptions.filters), so a filter either of them stored is recovered on every read path; a
+ * connection forgets them when its identity changes.
+ */
+export class FilterMemory {
+  private readonly documents = new Map<string, string>()
+
+  remember(id: string, document: string): void {
+    this.documents.set(id, document)
+  }
+
+  forget(id: string): void {
+    this.documents.delete(id)
+  }
+
+  /** The document stored under id, as sent, or undefined. */
+  document(id: string): string | undefined {
+    return this.documents.get(id)
+  }
+
+  clear(): void {
+    this.documents.clear()
   }
 }
 
@@ -423,6 +450,8 @@ export interface ClientOptions {
   credentials?: RequestCredentials
   /** Called with every 401 before it is thrown. */
   onUnauthorized?: (error: ApiError) => void
+  /** Where the unnamed filters this client stores are remembered (D54); share it with the LiveConnection. */
+  filters?: FilterMemory
 }
 
 export interface RequestOptions {
@@ -454,13 +483,13 @@ const exportRowsTrailer = 'Livewire-Export-Rows'
 /** The REST client: every route of the generated api.ts runs through one. */
 export class Client {
   private readonly options: ClientOptions
-  /** The documents of the unnamed filters this client stored, by id, as sent (D54). */
-  private readonly unnamedFilters = new Map<string, string>()
+  private readonly unnamedFilters: FilterMemory
 
   /** Validates and copies the options: a baseURL is required. */
   constructor(options: ClientOptions) {
     requireText(options.baseURL, 'ClientOptions.baseURL')
     this.options = { ...options }
+    this.unnamedFilters = options.filters ?? new FilterMemory()
   }
 
   async read<Parameters extends object, Data>(target: ReadTarget<Parameters, Data>, parameters: NoInfer<Parameters>, options: RequestOptions = {}): Promise<Data> {
@@ -516,7 +545,7 @@ export class Client {
     const document = JSON.stringify(request.filter)
     const outgoing = { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) }
     const stored = (await this.request('POST', '/filters', options, outgoing)) as FilterItem<Document>
-    if (request.name === undefined || request.name === '') this.unnamedFilters.set(stored.id, document)
+    if (request.name === undefined || request.name === '') this.unnamedFilters.remember(stored.id, document)
     return stored
   }
 
@@ -526,7 +555,7 @@ export class Client {
   }
 
   async deleteFilter(id: string, options: RequestOptions = {}): Promise<void> {
-    this.unnamedFilters.delete(id)
+    this.unnamedFilters.forget(id)
     await this.request('DELETE', `/filters/${encodeURIComponent(id)}`, options)
   }
 
@@ -600,17 +629,22 @@ export class Client {
 /** The state of the socket: idle without anything to serve, unauthorized after a 4401 (D7). */
 export type LiveStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'unauthorized' | 'closed'
 
-/** What a subscription delivers: the data, the ids an optimistic call has not settled yet (D36), the filterId an inline filter was registered as (D13). */
+/**
+ * What a subscription delivers: the data, the ids an optimistic call has not settled yet (D36),
+ * the filterId an inline filter was registered as (D13), and the identity the delivering socket
+ * acts as (D66): a snapshot of the data belongs to that identity.
+ */
 export interface LiveState<Data> {
   data: Data
   pending: readonly string[]
   filterId?: string
+  identity: string
 }
 
 export interface LiveListener<Data> {
   next(state: LiveState<Data>): void
-  /** The subscription ended with an error (an error push or a refused subscribe); retry() starts it again. */
-  error(error: ApiError): void
+  /** The subscription ended with an error (an error push, a refused or unanswered subscribe); retry() starts it again. */
+  error(error: ApiError | NetworkError): void
 }
 
 export interface LiveSubscription {
@@ -627,6 +661,13 @@ export interface PresenceRegistration {
   update(state: unknown): void
   /** Ends this registration; the socket leaves the record when the last registration on it ends. */
   leave(): void
+}
+
+export interface PresenceOptions {
+  /** A join the server refused or did not answer; a join lost with its socket is sent again on the next one and reported by its answer. */
+  onError?: (error: ApiError | NetworkError) => void
+  /** Every join the server accepted, the first and every one after a reconnect or an update. */
+  onJoined?: () => void
 }
 
 /** The part of a WebSocket the connection uses, so tests and Node can bring their own. */
@@ -659,8 +700,9 @@ export interface LiveOptions {
   WebSocket?: new (url: string) => WebSocketLike
   /**
    * Who the socket acts as, "provider:subject" or any stable key; "" or none for nobody. A socket
-   * is authorized by its upgrade request (D6), so a socket opened under another identity is
-   * replaced; the Vue snapshots are kept per identity and never without one (D21).
+   * is authorized by its upgrade request (D6), so everything the connection holds belongs to the
+   * identity it was made under, and a socket opened under another identity starts over (D66); the
+   * Vue snapshots are kept per identity and never without one (D21).
    */
   identity?: () => string
   /** Called on close code 4401: the identity is gone; the connection waits for reconnect() or another identity. */
@@ -670,10 +712,12 @@ export interface LiveOptions {
   maximumReconnectDelay?: number
   /** How often a ping goes out in ms (default 25000); a socket silent for two intervals is closed and reconnected. */
   pingInterval?: number
-  /** How long a query, call, batch, join, leave or ping waits for its answer in ms (default 30000). */
+  /** How long a request, a subscribe included, waits for its answer in ms (default 30000). */
   requestTimeout?: number
-  /** How long a settled optimistic change stays without a push in ms (default 1000): no push may come when the list did not change (D36). */
+  /** How long a settled optimistic change stays without a push in ms (default 1000): no push may come when the list did not change (D65). */
   reconcileWindow?: number
+  /** Where the unnamed filters this connection registers are remembered (D54); share it with the Client. */
+  filters?: FilterMemory
   random?: () => number
   clock?: Clock
 }
@@ -712,22 +756,33 @@ export interface PushFrame {
   payload: unknown
 }
 
+/**
+ * The identity everything the connection holds belongs to (D66): a request, its queued frame, a
+ * subscription's server id and data, an optimistic change. An epoch ends when a socket is opened
+ * under another identity, when checkIdentity finds another one, and on close(); what it held is
+ * rejected or dropped, never carried into the next.
+ */
+interface Epoch {
+  readonly identity: string
+}
+
 interface PendingRequest {
   frame: RequestFrame
+  epoch: Epoch
   resolve(frame: ResponseFrame): void
   reject(error: Error): void
 }
 
-/**
- * An optimistic change one call made to a live list (D36). It is pending while the call is in
- * flight; settled, it stays until the next push or the reconcile window, unless a push arrived
- * while the call was in flight: then the server already answered and the change is dropped.
- */
+/** An optimistic change one call made to a live list (D36, D65); entries are in the order the calls started. */
 interface OverlayEntry {
   call: number
   id: string
   item?: unknown
   pending: boolean
+}
+
+/** Where a list stood when a call started: a push since then answered the call (D65). */
+interface CallStart {
   generation: number
   sequence: number
 }
@@ -737,6 +792,8 @@ interface Subscription {
   parameters: Record<string, string>
   listener: LiveListener<unknown>
   serverID?: string
+  /** The epoch the server subscription was made in; its id means nothing on a socket of another. */
+  serverEpoch?: Epoch
   filterId?: string
   /** Counts the server subscriptions this one had; with sequence it orders every push it got. */
   generation: number
@@ -748,7 +805,7 @@ interface Subscription {
 }
 
 interface PresenceHolder {
-  onError: ((error: Error) => void) | undefined
+  options: PresenceOptions
   settle?: (error?: Error) => void
 }
 
@@ -759,8 +816,12 @@ interface PresenceRecord {
   parameters: Record<string, string>
   state: unknown
   holders: Set<PresenceHolder>
+  /** Counts the joins sent; only the answer of the last one counts. */
+  joins: number
   inFlight: boolean
   dirty: boolean
+  /** Every registration left while a join was in flight: the leave follows its answer, unless a registration joins again first. */
+  leaving: boolean
 }
 
 export interface LiveCallOptions<Response> extends RequestOptions {
@@ -772,14 +833,16 @@ export interface LiveCallOptions<Response> extends RequestOptions {
 /**
  * One socket for the application (section 4): requests answered by id within a deadline,
  * subscriptions with their pushes applied, reconnects with backoff and every subscription and
- * presence restored after one, no reconnect after 4401 until reconnect() or another identity,
- * and a new socket when the identity changes. Nothing connects before the first request.
+ * presence restored after one, no reconnect after 4401 until reconnect() or another identity.
+ * Everything it holds belongs to one identity epoch (D66). Nothing connects before the first
+ * request.
  */
 export class LiveConnection {
   private readonly options: LiveOptions
   private readonly clock: Clock
+  private readonly filters: FilterMemory
   private socket: WebSocketLike | undefined
-  private socketIdentity: string | undefined
+  private epoch: Epoch | undefined
   private currentStatus: LiveStatus = 'idle'
   private readonly statusListeners = new Set<(status: LiveStatus) => void>()
   private readonly subscriptions = new Set<Subscription>()
@@ -787,8 +850,6 @@ export class LiveConnection {
   private readonly presences = new Map<string, PresenceRecord>()
   private readonly pending = new Map<string, PendingRequest>()
   private readonly outbox: { id: string; encoded: string }[] = []
-  /** The documents of the filters this connection registered inline, by filterId (D54). */
-  private readonly registeredFilters = new Map<string, string>()
   private lastID = 0
   private lastCall = 0
   private attempt = 0
@@ -807,13 +868,14 @@ export class LiveConnection {
     requireDuration(options.reconcileWindow, 'LiveOptions.reconcileWindow', 0)
     this.options = { ...options }
     this.clock = options.clock ?? systemClock
+    this.filters = options.filters ?? new FilterMemory()
   }
 
   get status(): LiveStatus {
     return this.currentStatus
   }
 
-  /** The identity the socket acts as and the snapshots are kept under, "" without one. */
+  /** The identity the options answer now, "" without one. */
   identity(): string {
     return this.options.identity?.() ?? ''
   }
@@ -826,31 +888,22 @@ export class LiveConnection {
   }
 
   /**
-   * Replaces the socket when the identity changed since it was opened: the requests it owed fail,
-   * every subscription forgets its data and subscribes again on the new socket, every presence
-   * joins again. Every subscribe, request and ping checks it; call it when the application
-   * switches the account.
+   * Ends the epoch when the identity changed since it began (D66): the socket closes, the
+   * requests it owed and queued fail, every subscription forgets its data and subscribes again,
+   * every presence joins again, under the new identity. Every subscribe, request and ping checks
+   * it, and so does every connect; call it when the application switches the account.
    */
   checkIdentity(): void {
-    if (this.socketIdentity === undefined || this.identity() === this.socketIdentity) return
+    if (this.epoch === undefined || this.identity() === this.epoch.identity) return
     const socket = this.socket
     if (socket !== undefined) {
       this.detach(socket)
       socket.close(CloseCode.normal, 'identity changed')
     }
-    this.forgetSocket(new NetworkError('livewire: the identity changed'))
-    for (const subscription of this.subscriptions) {
-      delete subscription.data
-      subscription.overlay = []
-    }
-    this.registeredFilters.clear()
-    this.socketIdentity = undefined
+    this.endEpoch(new NetworkError('livewire: the identity changed'))
     this.closedByClient = false
-    this.attempt = 0
-    this.clock.clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = undefined
-    if (this.needed()) this.connect()
-    else this.setStatus('idle')
+    this.setStatus('idle') // after a 4401 another identity may connect again
+    if (this.needed()) this.ensureConnecting()
   }
 
   subscribe<Parameters extends object, Data>(
@@ -878,7 +931,7 @@ export class LiveConnection {
 
   /** One read over the socket; an evicted unnamed filterId is sent inline once (D54). */
   async query<Parameters extends object, Data>(target: ReadTarget<Parameters, Data>, parameters: NoInfer<Parameters>, options: RequestOptions = {}): Promise<Data> {
-    const frame = await recoveringEvictedFilter(wireParameters(parameters), this.registeredFilters, (wire) =>
+    const frame = await recoveringEvictedFilter(wireParameters(parameters), this.filters, (wire) =>
       this.request({ op: 'query', target: target.target, params: wire }, options))
     return frame.payload as Data
   }
@@ -886,9 +939,10 @@ export class LiveConnection {
   /**
    * Runs a mutation over the socket. A mutation with an Upserts effect shows the optimistic item
    * (if given) at once, one with a Removes effect hides the item named by the `id` parameter at
-   * once; both are pending until the server answers. The answer replaces the optimistic item
-   * unless a push of the list arrived meanwhile (the server already answered); the next push or
-   * the reconcile window ends the change, so the server wins; an error takes it back (D36).
+   * once; both are pending until the server answers. Whether or not an item was shown, a list
+   * that got a push while the call was in flight keeps the push (the server already answered);
+   * any other shows the answer until its next push or the reconcile window; an error takes the
+   * change back (D36, D65).
    */
   async call<Parameters extends object, Body, Response>(
     target: MutationTarget<Parameters, Body, Response>,
@@ -899,8 +953,14 @@ export class LiveConnection {
     const call = ++this.lastCall
     const wire = wireParameters(parameters)
     const effect = target.effect
-    if (effect?.kind === 'removes' && wire['id'] !== undefined) this.applyEffect(effect, call, wire['id'], undefined)
-    if (effect?.kind === 'upserts' && options.optimistic !== undefined) this.applyEffect(effect, call, itemID(options.optimistic), options.optimistic)
+    const starts = new Map<Subscription, CallStart>()
+    if (effect !== undefined) {
+      for (const subscription of this.affected(effect)) starts.set(subscription, { generation: subscription.generation, sequence: subscription.sequence })
+    }
+    if (effect?.kind === 'removes' && wire['id'] !== undefined) this.applyEffect(starts, { call, id: wire['id'], pending: true })
+    if (effect?.kind === 'upserts' && options.optimistic !== undefined) {
+      this.applyEffect(starts, { call, id: itemID(options.optimistic), item: options.optimistic, pending: true })
+    }
     const prepared = prepareCall(target, body, options)
     const frame: Omit<RequestFrame, 'id'> = { op: 'call', target: target.name, params: wire, idempotencyKey: prepared.idempotencyKey }
     if (target.body) frame.body = prepared.body
@@ -908,10 +968,10 @@ export class LiveConnection {
     try {
       response = await this.request(frame, options)
     } catch (error) {
-      if (effect !== undefined) this.rollBack(effect, call)
+      this.rollBack(starts, call)
       throw error
     }
-    if (effect !== undefined) this.settle(effect, call, response.payload)
+    if (effect !== undefined) this.settle(effect, starts, call, wire['id'], response.payload)
     return response.payload as Response
   }
 
@@ -923,15 +983,16 @@ export class LiveConnection {
   /**
    * Announces this socket on the record of a presence read (D37) for as long as the
    * registration lives. Registrations on one record share the socket's presence: its state is
-   * the last one sent, and the socket leaves when the last registration leaves. The join goes
-   * out on the open socket, and again after every reconnect; a refusal reaches `ready` and
-   * onError.
+   * the last one sent, and the socket leaves when the last registration leaves; a registration
+   * that joins while that leave waits for a join's answer cancels it. The join goes out on the
+   * open socket, and again after every reconnect; a refusal reaches `ready` and onError, every
+   * accepted join onJoined.
    */
   join<Parameters extends object>(
     target: LiveTarget<Parameters, ListResponse<PresenceItem>>,
     parameters: NoInfer<Parameters>,
     state: unknown,
-    options: { onError?: (error: Error) => void } = {},
+    options: PresenceOptions = {},
   ): PresenceRegistration {
     this.checkIdentity()
     const declaration = target.target.split('.')[0] ?? target.target
@@ -939,10 +1000,11 @@ export class LiveConnection {
     const key = JSON.stringify([declaration, Object.entries(wire).sort()])
     let record = this.presences.get(key)
     if (record === undefined) {
-      record = { key, declaration, parameters: wire, state, holders: new Set(), inFlight: false, dirty: false }
+      record = { key, declaration, parameters: wire, state, holders: new Set(), joins: 0, inFlight: false, dirty: false, leaving: false }
       this.presences.set(key, record)
     }
-    const holder: PresenceHolder = { onError: options.onError }
+    record.leaving = false
+    const holder: PresenceHolder = { options: { ...options } }
     const ready = new Promise<void>((resolve, reject) => {
       holder.settle = (error) => (error === undefined ? resolve() : reject(error))
     })
@@ -967,24 +1029,24 @@ export class LiveConnection {
   reconnect(): void {
     this.closedByClient = false
     this.attempt = 0
-    this.clock.clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = undefined
+    this.cancelReconnect()
     if (this.socket === undefined && this.needed()) this.connect()
   }
 
-  /** Closes the socket for good; reconnect() opens it again. */
+  /**
+   * Closes the socket for good and ends the epoch (logout): every queued and pending request
+   * fails, the subscriptions forget their data, the reconnect timer stops; reconnect() opens a
+   * socket again, under whoever is the identity then.
+   */
   close(): void {
     this.closedByClient = true
-    this.clock.clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = undefined
     const socket = this.socket
-    if (socket === undefined) {
-      this.setStatus('closed')
-      return
+    if (socket !== undefined) {
+      this.detach(socket)
+      socket.close(CloseCode.normal)
     }
-    this.detach(socket)
-    socket.close(CloseCode.normal)
-    this.closed(CloseCode.normal)
+    this.endEpoch(new NetworkError('livewire: the connection was closed'))
+    this.setStatus('closed')
   }
 
   private setStatus(status: LiveStatus): void {
@@ -997,14 +1059,52 @@ export class LiveConnection {
     return this.outbox.length > 0 || this.presences.size > 0 || [...this.subscriptions].some((subscription) => !subscription.ended)
   }
 
-  /** Sends a request and answers its response: refused it rejects with an ApiError, unanswered within requestTimeout, aborted or lost with the socket with a NetworkError. */
-  private request(frame: Omit<RequestFrame, 'id'>, options: RequestOptions = {}): Promise<ResponseFrame> {
+  /** The epoch of the identity now, begun if none is. */
+  private currentEpoch(): Epoch {
+    this.epoch ??= { identity: this.identity() }
+    return this.epoch
+  }
+
+  /**
+   * Ends the epoch: every request it owed or queued fails with error, every subscription forgets
+   * its server id, data and optimistic changes (and subscribes again in the next one), the
+   * remembered filters and the reconnect backoff are gone.
+   */
+  private endEpoch(error: NetworkError): void {
+    this.forgetSocket(error)
+    this.outbox.length = 0
+    for (const subscription of this.subscriptions) {
+      delete subscription.data
+      subscription.overlay = []
+    }
+    this.filters.clear()
+    this.epoch = undefined
+    this.attempt = 0
+    this.cancelReconnect()
+  }
+
+  /** Connects unless a socket is there, a reconnect is waiting, the identity is gone or the connection is closed. */
+  private ensureConnecting(): void {
+    if (this.socket === undefined && this.reconnectTimer === undefined && this.currentStatus !== 'unauthorized' && !this.closedByClient) this.connect()
+  }
+
+  private cancelReconnect(): void {
+    this.clock.clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = undefined
+  }
+
+  /** Sends a request and answers its response: refused it rejects with an ApiError, unanswered within requestTimeout, aborted, lost with the socket or of an ended epoch with a NetworkError. */
+  private request(frame: Omit<RequestFrame, 'id'>, options: RequestOptions & { epoch?: Epoch | undefined } = {}): Promise<ResponseFrame> {
     this.checkIdentity()
     const identified: RequestFrame = { ...frame, id: String(++this.lastID) }
     const signal = options.signal
     return new Promise<ResponseFrame>((resolve, reject) => {
       if (this.currentStatus === 'unauthorized' || this.closedByClient) {
         reject(new NetworkError(`livewire: the socket is ${this.currentStatus}; reconnect() opens it again`))
+        return
+      }
+      if ('epoch' in options && options.epoch !== this.epoch) {
+        reject(new NetworkError(`livewire: ${frame.op} belongs to a socket of an earlier identity`))
         return
       }
       if (signal?.aborted === true) {
@@ -1030,6 +1130,7 @@ export class LiveConnection {
       signal?.addEventListener('abort', abort, { once: true })
       this.pending.set(identified.id, {
         frame: identified,
+        epoch: this.currentEpoch(),
         resolve: (response) => {
           finish()
           resolve(response)
@@ -1046,6 +1147,7 @@ export class LiveConnection {
     })
   }
 
+  /** Sends a frame on the open socket, or queues it for the next socket of this epoch. */
   private send(frame: RequestFrame): void {
     const encoded = JSON.stringify(frame)
     if (this.socket?.readyState === socketOpen) {
@@ -1053,12 +1155,15 @@ export class LiveConnection {
       return
     }
     this.outbox.push({ id: frame.id, encoded })
-    if (this.socket === undefined && this.reconnectTimer === undefined) this.connect()
+    this.ensureConnecting()
   }
 
+  /** Opens a socket; one under another identity than the epoch's ends the epoch first (D66). */
   private connect(): void {
+    const identity = this.identity()
+    if (this.epoch !== undefined && this.epoch.identity !== identity) this.endEpoch(new NetworkError('livewire: the identity changed'))
+    this.currentEpoch()
     this.setStatus(this.attempt === 0 ? 'connecting' : 'reconnecting')
-    this.socketIdentity = this.identity()
     const url = typeof this.options.url === 'function' ? this.options.url() : this.options.url
     const SocketClass = this.options.WebSocket ?? (globalThis.WebSocket as unknown as new (url: string) => WebSocketLike)
     const socket = new SocketClass(url)
@@ -1110,26 +1215,28 @@ export class LiveConnection {
     this.pingTimer = undefined
   }
 
-  /** Every answer the socket owed is lost; the subscriptions and presences start over on the next socket. */
+  /**
+   * Every answer the socket owed is lost; the subscriptions and presences start over on the
+   * next socket. Requests queued for it stay for the next socket of the same epoch.
+   */
   private forgetSocket(error: NetworkError): void {
     const lost = [...this.pending.values()]
     this.pending.clear()
-    this.outbox.length = 0
     this.byServerID.clear()
     for (const subscription of this.subscriptions) {
       delete subscription.serverID
+      delete subscription.serverEpoch
       subscription.sequence = 0
     }
-    for (const record of this.presences.values()) record.inFlight = false
+    for (const record of [...this.presences.values()]) {
+      record.inFlight = false
+      if (record.leaving) this.presences.delete(record.key) // its presence is gone with the socket
+    }
     for (const request of lost) request.reject(error)
   }
 
   private closed(code: number): void {
     this.forgetSocket(new NetworkError(`livewire: the socket closed (${code}) before the request was answered`))
-    if (this.closedByClient) {
-      this.setStatus('closed')
-      return
-    }
     if (code === CloseCode.identityGone) {
       this.setStatus('unauthorized')
       this.options.onUnauthorized?.()
@@ -1167,19 +1274,25 @@ export class LiveConnection {
   /** Subscribes now on an open socket; otherwise the next open sends every subscription. */
   private startSubscription(subscription: Subscription): void {
     if (this.socket?.readyState === socketOpen) this.sendSubscribe(subscription)
-    else if (this.socket === undefined && this.reconnectTimer === undefined && this.currentStatus !== 'unauthorized' && !this.closedByClient) this.connect()
+    else this.ensureConnecting()
   }
 
-  /** Sends a subscribe on the open socket. */
+  /** Sends a subscribe on the open socket; unanswered within requestTimeout, the subscription ends with a NetworkError. */
   private sendSubscribe(subscription: Subscription): void {
     const frame: RequestFrame = { id: String(++this.lastID), op: 'subscribe', target: subscription.target.target, params: subscription.parameters }
+    const timeout = this.options.requestTimeout ?? 30_000
+    const timer = this.clock.setTimeout(() => {
+      if (this.pending.delete(frame.id)) this.fail(subscription, new NetworkError(`livewire: subscribe got no answer within ${timeout} ms`))
+    }, timeout)
     this.pending.set(frame.id, {
       frame,
+      epoch: this.currentEpoch(),
       resolve: (response) => {
+        this.clock.clearTimeout(timer)
         this.pending.delete(frame.id)
         this.subscribed(subscription, response)
       },
-      reject: () => {},
+      reject: () => this.clock.clearTimeout(timer), // lost with the socket: the next socket subscribes again
     })
     this.send(frame)
   }
@@ -1187,23 +1300,24 @@ export class LiveConnection {
   private subscribed(subscription: Subscription, response: ResponseFrame): void {
     if (response.ok && response.subscription !== undefined) {
       if (!this.subscriptions.has(subscription)) {
-        this.request({ op: 'unsubscribe', target: response.subscription }).catch(() => {})
+        this.unsubscribeServer(response.subscription, this.epoch)
         return
       }
       subscription.serverID = response.subscription
+      subscription.serverEpoch = this.currentEpoch()
       subscription.generation++
       subscription.sequence = 0
       this.byServerID.set(response.subscription, subscription)
       if (response.filterId !== undefined) {
         subscription.filterId = response.filterId
         const inline = subscription.parameters['filter']
-        if (inline !== undefined) this.registeredFilters.set(response.filterId, inline)
+        if (inline !== undefined) this.filters.remember(response.filterId, inline)
       }
       return
     }
     const error = new ApiError(response.status, response.error)
     const filterId = subscription.parameters['filterId']
-    const document = filterId === undefined ? undefined : this.registeredFilters.get(filterId)
+    const document = filterId === undefined ? undefined : this.filters.document(filterId)
     if (error.code === 'not_found' && document !== undefined && !subscription.retriedInline) {
       // The filter was evicted (D54): register it inline again, once.
       subscription.retriedInline = true
@@ -1215,7 +1329,16 @@ export class LiveConnection {
     this.fail(subscription, error)
   }
 
-  private fail(subscription: Subscription, error: ApiError): void {
+  /**
+   * Ends a server subscription. Its failure needs no report: the server ends a socket's
+   * subscriptions with the socket, and an id of a socket of an earlier identity is not sent.
+   */
+  private unsubscribeServer(serverID: string, epoch: Epoch | undefined): void {
+    if (this.socket?.readyState !== socketOpen) return
+    this.request({ op: 'unsubscribe', target: serverID }, { epoch }).catch(() => {})
+  }
+
+  private fail(subscription: Subscription, error: ApiError | NetworkError): void {
     if (!this.subscriptions.has(subscription)) return
     subscription.ended = true
     if (subscription.serverID !== undefined) this.byServerID.delete(subscription.serverID)
@@ -1228,7 +1351,7 @@ export class LiveConnection {
     const serverID = subscription.serverID
     if (serverID === undefined) return
     this.byServerID.delete(serverID)
-    if (this.socket?.readyState === socketOpen) this.request({ op: 'unsubscribe', target: serverID }).catch(() => {})
+    this.unsubscribeServer(serverID, subscription.serverEpoch)
   }
 
   private push(frame: PushFrame): void {
@@ -1237,7 +1360,7 @@ export class LiveConnection {
     if (frame.seq !== subscription.sequence + 1) {
       // A lost push: the list cannot be diffed any more; a new subscription starts with a snapshot.
       this.byServerID.delete(frame.sub)
-      this.request({ op: 'unsubscribe', target: frame.sub }).catch(() => {})
+      this.unsubscribeServer(frame.sub, subscription.serverEpoch)
       delete subscription.serverID
       this.sendSubscribe(subscription)
       return
@@ -1259,9 +1382,11 @@ export class LiveConnection {
     this.deliver(subscription)
   }
 
+  /** Delivers the data and its changes; an epoch's end drops the data, so data there is always the current epoch's. */
   private deliver(subscription: Subscription): void {
     if (subscription.data === undefined) return
-    const state: LiveState<unknown> = { data: overlaid(subscription), pending: subscription.overlay.filter((entry) => entry.pending).map((entry) => entry.id) }
+    const pending = subscription.overlay.filter((entry) => entry.pending).map((entry) => entry.id)
+    const state: LiveState<unknown> = { data: overlaid(subscription), pending, identity: this.currentEpoch().identity }
     if (subscription.filterId !== undefined) state.filterId = subscription.filterId
     subscription.listener.next(state)
   }
@@ -1270,33 +1395,30 @@ export class LiveConnection {
     return [...this.subscriptions].filter((subscription) => subscription.target.target === effect.target && subscription.target.list)
   }
 
-  private applyEffect(effect: Effect, call: number, id: string, item: unknown): void {
-    for (const subscription of this.affected(effect)) {
-      const entry: OverlayEntry = { call, id, pending: true, generation: subscription.generation, sequence: subscription.sequence }
-      if (item !== undefined) entry.item = item
-      subscription.overlay.push(entry)
+  private applyEffect(starts: Map<Subscription, CallStart>, entry: OverlayEntry): void {
+    for (const subscription of starts.keys()) {
+      subscription.overlay.push({ ...entry })
       this.deliver(subscription)
     }
   }
 
   /**
-   * The call answered: a list that got a push while the call was in flight already shows the
-   * server's state, so its change is dropped; any other keeps the change, the answer for an
-   * upsert, until its next push or the reconcile window.
+   * The call answered (D65): a list that got a push while the call was in flight already shows
+   * the server's state, so the change is dropped; any other keeps it, the answer for an upsert,
+   * in the order the calls started (a newer pending change stays on top), until its next push or
+   * the reconcile window.
    */
-  private settle(effect: Effect, call: number, response: unknown): void {
-    for (const subscription of this.affected(effect)) {
-      const entries = subscription.overlay.filter((entry) => entry.call === call)
-      const started = entries[0] ?? { generation: subscription.generation, sequence: subscription.sequence }
-      const pushed = started.generation !== subscription.generation || started.sequence !== subscription.sequence
+  private settle(effect: Effect, starts: Map<Subscription, CallStart>, call: number, removedID: string | undefined, response: unknown): void {
+    for (const [subscription, started] of starts) {
+      if (!this.subscriptions.has(subscription)) continue
       subscription.overlay = subscription.overlay.filter((entry) => entry.call !== call)
-      if (!pushed) {
-        const settled: OverlayEntry = { call, id: entries[0]?.id ?? itemID(response), pending: false, generation: subscription.generation, sequence: subscription.sequence }
-        if (effect.kind === 'upserts') {
-          settled.id = itemID(response)
-          settled.item = response
-        }
-        subscription.overlay.push(settled)
+      const pushed = started.generation !== subscription.generation || started.sequence !== subscription.sequence
+      const id = effect.kind === 'upserts' ? itemID(response) : removedID
+      if (!pushed && id !== undefined) {
+        const settled: OverlayEntry = { call, id, pending: false }
+        if (effect.kind === 'upserts') settled.item = response
+        const later = subscription.overlay.findIndex((entry) => entry.call > call)
+        subscription.overlay.splice(later < 0 ? subscription.overlay.length : later, 0, settled)
         this.clock.setTimeout(() => {
           if (!subscription.overlay.includes(settled)) return
           subscription.overlay = subscription.overlay.filter((entry) => entry !== settled)
@@ -1307,8 +1429,8 @@ export class LiveConnection {
     }
   }
 
-  private rollBack(effect: Effect, call: number): void {
-    for (const subscription of this.affected(effect)) {
+  private rollBack(starts: Map<Subscription, CallStart>, call: number): void {
+    for (const subscription of starts.keys()) {
       subscription.overlay = subscription.overlay.filter((entry) => entry.call !== call)
       this.deliver(subscription)
     }
@@ -1319,7 +1441,7 @@ export class LiveConnection {
     record.state = state
     record.dirty = true
     if (this.socket?.readyState === socketOpen) this.sendJoin(record)
-    else if (this.socket === undefined && this.reconnectTimer === undefined && this.currentStatus !== 'unauthorized' && !this.closedByClient) this.connect()
+    else this.ensureConnecting()
   }
 
   /** Sends the record's join; one join of a record is in flight at a time, a newer state follows its answer. */
@@ -1327,22 +1449,28 @@ export class LiveConnection {
     if (record.inFlight) return
     record.inFlight = true
     record.dirty = false
+    const join = ++record.joins
     const holders = [...record.holders]
     this.request({ op: 'join', target: record.declaration, params: record.parameters, body: record.state }).then(
-      () => this.joined(record, holders, undefined),
-      (error: Error) => this.joined(record, holders, error),
+      () => this.joined(record, join, holders, undefined),
+      (error: ApiError | NetworkError) => this.joined(record, join, holders, error),
     )
   }
 
-  private joined(record: PresenceRecord, holders: PresenceHolder[], error: Error | undefined): void {
+  private joined(record: PresenceRecord, join: number, holders: PresenceHolder[], error: ApiError | NetworkError | undefined): void {
+    if (join !== record.joins || !record.inFlight) return // lost with its socket: the next socket joins again and answers
     record.inFlight = false
     for (const holder of holders) {
-      if (error !== undefined && record.holders.has(holder)) holder.onError?.(error)
+      if (record.holders.has(holder)) {
+        if (error === undefined) holder.options.onJoined?.()
+        else holder.options.onError?.(error)
+      }
       holder.settle?.(error)
       delete holder.settle
     }
-    if (this.presences.get(record.key) !== record) {
-      // Every registration left while the join was in flight: leave now that it is answered.
+    if (record.leaving) {
+      // Every registration left while the join was in flight and none joined again: leave now.
+      this.presences.delete(record.key)
       if (error === undefined) this.sendLeave(record)
       return
     }
@@ -1351,20 +1479,25 @@ export class LiveConnection {
 
   private leavePresence(record: PresenceRecord, holder: PresenceHolder): void {
     if (!record.holders.delete(holder) || record.holders.size > 0) return
+    if (record.inFlight) {
+      record.leaving = true
+      return
+    }
     this.presences.delete(record.key)
-    if (!record.inFlight) this.sendLeave(record)
+    this.sendLeave(record)
   }
 
+  /**
+   * Sends a leave. No registration is left to hear its failure, and none is needed: a presence
+   * the server keeps ends with the socket's close or the sweep after PresenceExpiry (D37).
+   */
   private sendLeave(record: PresenceRecord): void {
     if (this.socket?.readyState !== socketOpen) return // a closed socket's presences are gone with it
-    const holders = [...record.holders]
-    this.request({ op: 'leave', target: record.declaration, params: record.parameters }).catch((error: Error) => {
-      for (const holder of holders) holder.onError?.(error)
-    })
+    this.request({ op: 'leave', target: record.declaration, params: record.parameters }).catch(() => {})
   }
 }
 
-/** The server's list with the optimistic changes not yet replaced by a push. */
+/** The server's list with the optimistic changes not yet replaced by a push, applied in the order the calls started. */
 function overlaid(subscription: Subscription): unknown {
   if (subscription.overlay.length === 0) return subscription.data
   const list = subscription.data as ListResponse<unknown>
