@@ -91,6 +91,7 @@ func (e *Engine) saveFilter(ctx context.Context, body []byte) (json.RawMessage, 
 		return nil, owner, err
 	}
 	ctx = WithTenant(ctx, owner.Tenant)
+	request.Resource = canonicalTarget(request.Resource)
 	filter, err := storedFilter(ctx, owner, fields, &request)
 	if err != nil {
 		return nil, owner, err
@@ -122,6 +123,13 @@ func (e *Engine) filterTarget(target string) (*Resource, query.Fields, error) {
 		return resource, HistoryFields(), nil
 	}
 	return nil, nil, invalidParameter("resource", "is not a filterable resource or the history of one")
+}
+
+// canonicalTarget is the target a filter is stored and looked up under: the name for a main
+// read ("documents." is "documents"), the name and ".history" for a history read.
+func canonicalTarget(target string) string {
+	name, kind := parseTarget(target)
+	return ReadRequest{Target: name, Kind: kind}.target()
 }
 
 // storedFilter is the filter a request stores: its document parsed and checked like a read's
@@ -171,6 +179,7 @@ func (e *Engine) listFilters(ctx context.Context, resource string) (json.RawMess
 		if _, _, err := e.filterTarget(resource); err != nil {
 			return nil, Owner{}, err
 		}
+		resource = canonicalTarget(resource)
 	}
 	owner, store, err := e.filterOwner(ctx)
 	if err != nil {
