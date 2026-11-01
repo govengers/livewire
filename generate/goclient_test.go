@@ -255,11 +255,11 @@ func TestGoClientSubscribes(t *testing.T) {
 
 	second, err := user.CreatePart(ctx, fixture.CreatePart{Name: "second"}, nil)
 	require.NoError(t, err)
-	diff := receivePush(t, parts)
-	require.Equal(t, livewire.PushListChange, diff.Kind, "a write reaches the subscription as a diff")
-	require.ElementsMatch(t, []uuid.UUID{first.ID, second.ID}, idsOf(diff.Data.Items), "the diff is applied")
-	require.Equal(t, 2, diff.Data.Total)
-	require.NotNil(t, diff.Change)
+	changed := receivePush(t, parts)
+	require.Equal(t, livewire.PushListChange, changed.Kind, "a write reaches the subscription as a diff")
+	require.ElementsMatch(t, []uuid.UUID{first.ID, second.ID}, idsOf(changed.Data.Items), "the diff is applied")
+	require.Equal(t, 2, changed.Data.Total)
+	require.NotNil(t, changed.Change)
 
 	served.keys.revoke(userKey)
 	served.engine.RevalidateAll() // the identity is gone: the socket closes 4401

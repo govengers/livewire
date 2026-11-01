@@ -207,15 +207,15 @@ func TestCommandLineSubscribes(t *testing.T) {
 	}
 	served.backend.put(fixture.Part{ID: newPartID(), Name: "second"})
 	require.Equal(t, fixturecommand.ExitSuccess, <-done, "an interrupted subscription ends cleanly")
-	var snapshot, diff struct {
+	var snapshot, changed struct {
 		Kind livewire.PushKind                   `json:"kind"`
 		Data livewire.ListResponse[fixture.Part] `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(output.lines[0]), &snapshot))
-	require.NoError(t, json.Unmarshal([]byte(output.lines[1]), &diff))
+	require.NoError(t, json.Unmarshal([]byte(output.lines[1]), &changed))
 	require.Equal(t, livewire.PushSnapshot, snapshot.Kind)
-	require.Equal(t, livewire.PushListChange, diff.Kind)
-	require.Len(t, diff.Data.Items, 2, "each line carries the list after the push")
+	require.Equal(t, livewire.PushListChange, changed.Kind)
+	require.Len(t, changed.Data.Items, 2, "each line carries the list after the push")
 
 	served.keys.revoke(userKey)
 	refused := fixturecommand.Run(t.Context(), []string{"fixture", "--base-url", served.baseURL, "--api-key", userKey, "subscribe", "labels"}, strings.NewReader(""), io.Discard, &diagnostics)

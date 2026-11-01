@@ -27,10 +27,10 @@ func TestAConsumerMutatingItsPushLeavesTheStateAlone(t *testing.T) {
 	socket.push("s1", 1, livewire.PushSnapshot, `{"limit":10,"offset":0,"total":2,"items":[{"id":"a","name":"A"},{"id":"b","name":"B"}]}`)
 	receive(t, pushes)
 	socket.push("s1", 2, livewire.PushListChange, `{"upserts":[{"id":"b","name":"B2"}],"removes":[],"order":["b","a"]}`)
-	diff := receive(t, pushes)
-	diff.Change.Order[0] = "a"                // the consumer reorders the diff it got
-	copy(diff.Change.Upserts[0], `{"id":"x"`) // and scribbles over its bytes
-	diff.Data.Items[0].Name = "changed"
+	changed := receive(t, pushes)
+	changed.Change.Order[0] = "a"                // the consumer reorders the change it got
+	copy(changed.Change.Upserts[0], `{"id":"x"`) // and scribbles over its bytes
+	changed.Data.Items[0].Name = "changed"
 	socket.push("s1", 3, livewire.PushListChange, `{"upserts":[],"removes":[],"total":3}`)
 	next := receive(t, pushes)
 	require.Equal(t, []item{{"b", "B2"}, {"a", "A"}}, next.Data.Items, "the live state owns its own storage")

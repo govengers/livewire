@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/govengers/livewire"
+	"github.com/govengers/livewire/internal/listkey"
 )
 
 // Push is one change of a subscription as Subscribe delivers it (section 4). Kind is the
@@ -163,7 +164,7 @@ func newListState(payload json.RawMessage) (*listState, error) {
 	}
 	state := &listState{limit: page.Limit, offset: page.Offset, total: page.Total, next: page.Next, items: map[string]json.RawMessage{}}
 	for _, item := range page.Items {
-		id, err := livewire.ItemID(item)
+		id, err := listkey.ItemID(item)
 		if err != nil {
 			return nil, err
 		}
@@ -182,7 +183,7 @@ func (s *listState) apply(change *livewire.ListChange) error {
 	items := maps.Clone(s.items)
 	var added []string
 	for _, item := range change.Upserts {
-		id, err := livewire.ItemID(item)
+		id, err := listkey.ItemID(item)
 		if err != nil {
 			return err
 		}

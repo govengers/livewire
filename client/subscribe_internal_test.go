@@ -74,6 +74,7 @@ func TestReconnectDelaysStayBounded(t *testing.T) {
 		{ReconnectDelay: 10 * time.Second, MaximumReconnectDelay: time.Hour},
 		{ReconnectDelay: time.Hour, MaximumReconnectDelay: time.Second},
 		{ReconnectDelay: time.Millisecond, MaximumReconnectDelay: 1<<63 - 1},
+		{ReconnectDelay: 1<<63 - 1, MaximumReconnectDelay: 1<<63 - 1}, // the largest delay New accepts
 	} {
 		owner := newLive(&Client{options: options})
 		for attempt := range 200 {

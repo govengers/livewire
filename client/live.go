@@ -222,7 +222,7 @@ func (l *live) dial(ctx context.Context) (*websocket.Conn, int, error) {
 func (l *live) delay(attempt int, code int) time.Duration {
 	initial := l.client.options.ReconnectDelay
 	if code == websocket.CloseGoingAway {
-		return time.Duration(rand.Int64N(int64(initial) + 1)) //nolint:gosec // G404: jitter, not a secret
+		return time.Duration(rand.Int64N(int64(initial))) //nolint:gosec // G404: jitter, not a secret; [0, initial) cannot overflow
 	}
 	exponential := l.client.options.MaximumReconnectDelay
 	if attempt < 62 && initial <= exponential>>attempt {

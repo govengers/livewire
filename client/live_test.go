@@ -191,11 +191,11 @@ func TestAListSubscriptionAppliesItsDiffs(t *testing.T) {
 	require.Equal(t, "cursor", *snapshot.Data.Next)
 
 	socket.push("s1", 2, livewire.PushListChange, `{"upserts":[{"id":"c","name":"C"},{"id":"a","name":"A2"}],"removes":["b"],"total":2}`)
-	diff := receive(t, pushes)
-	require.Equal(t, livewire.PushListChange, diff.Kind)
-	require.Equal(t, []item{{"a", "A2"}, {"c", "C"}}, diff.Data.Items)
-	require.Equal(t, 2, diff.Data.Total)
-	require.Equal(t, []string{"b"}, diff.Change.Removes)
+	changed := receive(t, pushes)
+	require.Equal(t, livewire.PushListChange, changed.Kind)
+	require.Equal(t, []item{{"a", "A2"}, {"c", "C"}}, changed.Data.Items)
+	require.Equal(t, 2, changed.Data.Total)
+	require.Equal(t, []string{"b"}, changed.Change.Removes)
 
 	socket.push("s1", 3, livewire.PushListChange, `{"upserts":[],"removes":[],"order":["c","a"]}`)
 	require.Equal(t, []item{{"c", "C"}, {"a", "A2"}}, receive(t, pushes).Data.Items)
