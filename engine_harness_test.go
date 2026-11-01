@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,7 +71,12 @@ type testbed struct {
 	// release unblocks the mutation "blockGadget".
 	release chan struct{}
 	// anonymousRuns counts the handler runs of "anonymousGadget".
-	anonymousRuns   atomic.Int64
+	anonymousRuns atomic.Int64
+	// versions are the versions of the documents, by id; historyQueries what the History
+	// loader was asked.
+	versionMutex    sync.Mutex
+	versions        map[string][]livewire.Version[document]
+	historyQueries  []*query.ListQuery
 	registryOptions livewire.RegistryOptions
 }
 
@@ -138,7 +145,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents()))
 	return registry
 }
 
@@ -334,6 +341,65 @@ func (b *testbed) openGadgets() *livewire.Resource {
 			items := b.world.sorted("")
 			next := listQuery.NextCursor(nil, firstKey) // an offset resource ignores it
 			return &livewire.Page[gadget]{Items: items, Total: len(items), Next: next}, nil
+		},
+	})
+}
+
+// document is the item of the versioned resource documents; the versions of the testbed are
+// its rows.
+type document struct {
+	ID      string `json:"id"`
+	Version int    `json:"version"`
+	Title   string `json:"title"`
+	Secret  string `json:"secret"`
+}
+
+// addVersion appends a version of a document; its data is the document.
+func (b *testbed) addVersion(item document, operation livewire.ChangeOperation) {
+	b.versionMutex.Lock()
+	defer b.versionMutex.Unlock()
+	if b.versions == nil {
+		b.versions = map[string][]livewire.Version[document]{}
+	}
+	item.Version = len(b.versions[item.ID]) + 1
+	b.versions[item.ID] = append(b.versions[item.ID], livewire.Version[document]{
+		ID: item.Version, Operation: operation, ValidFrom: time.Unix(int64(item.Version), 0).UTC(), Actor: "test:ada", Data: &item,
+	})
+}
+
+// documents is versioned with a history (D34); its secret is the admin's.
+func (b *testbed) documents() *livewire.Resource {
+	return livewire.NewResource("documents", "/documents", &livewire.ResourceOptions[document]{
+		Tables:    []string{"documents"},
+		Read:      authorization.HasRole(roleReader),
+		Versioned: true,
+		Fields: query.Fields{
+			{Name: "id", Type: query.TypeUUID, SQL: "documents.id", Filter: true, Sort: true},
+			{Name: "title", Type: query.TypeText, SQL: "documents.title", Filter: true},
+			{Name: "secret", Type: query.TypeString, SQL: "documents.secret", Read: authorization.IsAdmin()},
+		},
+		Item: &livewire.ItemKey{Parameter: "id", Field: "id"},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[document], error) {
+			return &livewire.Page[document]{}, nil
+		},
+		Get: func(_ context.Context, listQuery *query.ListQuery) (*document, error) {
+			_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "documents", IDColumn: "documents.id"})
+			b.versionMutex.Lock()
+			defer b.versionMutex.Unlock()
+			for _, argument := range arguments {
+				if versions := b.versions[fmt.Sprint(argument)]; len(versions) > 0 {
+					return versions[len(versions)-1].Data, nil
+				}
+			}
+			return nil, livewire.NotFound()
+		},
+		History: func(_ context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[document]], error) {
+			b.versionMutex.Lock()
+			defer b.versionMutex.Unlock()
+			b.historyQueries = append(b.historyQueries, listQuery)
+			_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "documents_history", IDColumn: "version"})
+			versions := b.versions[fmt.Sprint(arguments[0])]
+			return &livewire.Page[livewire.Version[document]]{Items: slices.Clone(versions), Total: len(versions)}, nil
 		},
 	})
 }

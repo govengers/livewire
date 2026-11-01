@@ -13,7 +13,8 @@ import (
 
 // ReadKind says which read of a declaration a request names. On the socket it is the
 // target's suffix after a dot (D46): "parts" is the main read, "parts.item" the item read,
-// "parts.distinct" the distinct read, "parts.presence" the presences on one record.
+// "parts.distinct" the distinct read, "parts.history" the versions of one item,
+// "parts.presence" the presences on one record.
 type ReadKind string
 
 // The read kinds.
@@ -21,6 +22,7 @@ const (
 	ReadMain     ReadKind = ""         // a resource's or list's ListResponse, an object's item
 	ReadItem     ReadKind = "item"     // a resource's item read, keyed by its ItemKey parameter
 	ReadDistinct ReadKind = "distinct" // a resource's distinct read (D15), the `field` parameter names the field
+	ReadHistory  ReadKind = "history"  // a versioned resource's versions of one item (D34), keyed like the item read
 	ReadPresence ReadKind = "presence" // the presences on the record named by the `key` parameter (D37)
 )
 
@@ -112,6 +114,8 @@ func (e *Engine) planRead(request ReadRequest) (*readPlan, error) {
 	case ReadDistinct:
 		readable = plan.resource != nil && plan.resource.DistinctPath() != ""
 		plan.answersList = false
+	case ReadHistory:
+		readable = plan.resource != nil && plan.resource.HistoryPath() != ""
 	case ReadPresence:
 		hasRecordRead := declaration.Kind() == KindObject || (plan.resource != nil && plan.resource.Item() != nil)
 		readable = hasRecordRead && e.options.PresenceStore != nil
@@ -314,6 +318,8 @@ func loadDeclaration(ctx context.Context, resolved *resolvedRead) (*readResult, 
 			return loadItem(ctx, declaration, MapSource{declaration.Item().Parameter: resolved.presenceKey})
 		case ReadDistinct:
 			return loadDistinct(ctx, declaration, resolved.readParameters)
+		case ReadHistory:
+			return loadHistory(ctx, declaration, resolved.request.Source, resolved.readParameters)
 		case ReadMain:
 		}
 		return loadPage(ctx, declaration, resolved.readParameters)
@@ -385,13 +391,15 @@ func loadPage(ctx context.Context, resource *Resource, parameters *ReadParameter
 }
 
 // listAnswer is what a list read answers before its items are marshaled: the items, the page
-// that was applied, the total and, in cursor mode, the encoded cursor of the next page.
+// that was applied, the total, in cursor mode the encoded cursor of the next page, and the
+// redaction of the marshaled items when it is not RedactItems over the read's fields.
 type listAnswer struct {
 	items  any
 	limit  int
 	offset int
 	total  int
 	next   *string
+	redact func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error)
 }
 
 // listBody is ListResponse with the items already marshaled and redacted.
@@ -408,7 +416,13 @@ func pageResult(ctx context.Context, fields query.Fields, answer listAnswer) (*r
 	if err != nil {
 		return nil, fmt.Errorf("livewire: marshal the items: %w", err)
 	}
-	redacted, err := RedactItems(ctx, fields, raw)
+	redact := answer.redact
+	if redact == nil {
+		redact = func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+			return RedactItems(ctx, fields, raw)
+		}
+	}
+	redacted, err := redact(ctx, raw)
 	if err != nil {
 		return nil, err
 	}

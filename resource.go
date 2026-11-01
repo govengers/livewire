@@ -107,9 +107,12 @@ const (
 // without it. Scope narrows every read and re-run before filter and count; nil is no scope.
 // MaximumLimit clamps the page (default 100), CountCap caps the total (0 counts every row),
 // DistinctMaximum caps a distinct read (default 1000). Cursor allows keyset pagination with
-// the `after` parameter and answers the Next of List's Page as ListResponse.next (D38, D55). Versioned marks the item as carrying `version` and the
-// history read (D34). ExportColumns names the fields an export writes; empty means all.
-// Partition names a subscription's partition (D25); nil means the tenant.
+// the `after` parameter and answers the Next of List's Page as ListResponse.next (D38, D55).
+// Versioned marks the item as carrying `version` (D34); History, which needs Versioned and
+// an Item key of type uuid, reads one item's versions for the history route (HistoryQuery
+// says what it gets) and the subscription of it re-runs on the resource's Tables, which
+// every version is written with. ExportColumns names the fields an export writes; empty
+// means all. Partition names a subscription's partition (D25); nil means the tenant.
 type ResourceOptions[Item any] struct {
 	Tables          []string
 	Read            authorization.Check
@@ -127,11 +130,12 @@ type ResourceOptions[Item any] struct {
 	List            func(ctx context.Context, listQuery *query.ListQuery) (*Page[Item], error)
 	Get             func(ctx context.Context, listQuery *query.ListQuery) (*Item, error)
 	Distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
+	History         func(ctx context.Context, listQuery *query.ListQuery) (*Page[Version[Item]], error)
 }
 
-// Resource is a filterable list of items with optional item and distinct reads. Its routes
-// are GET Path (list), GET ItemPath (one item) and GET DistinctPath (distinct values); all
-// take the reserved parameters.
+// Resource is a filterable list of items with optional item, distinct and history reads. Its
+// routes are GET Path (list), GET ItemPath (one item), GET DistinctPath (distinct values) and
+// GET HistoryPath (one item's versions); all take the reserved parameters.
 type Resource struct {
 	signature
 	liveness
@@ -149,6 +153,7 @@ type Resource struct {
 	list            func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error)
 	get             func(ctx context.Context, listQuery *query.ListQuery) (any, error)
 	distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
+	history         func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error)
 }
 
 // NewResource declares a filterable resource of Item under path (no placeholders). The
@@ -178,18 +183,12 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 	}
 	if list := options.List; list != nil {
 		resource.list = func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error) {
-			page, err := list(ctx, listQuery)
-			switch {
-			case err != nil:
-				return nil, err
-			case page == nil:
-				return nil, fmt.Errorf("livewire: the List loader of %q returned no page and no error", name)
-			}
-			answered := *page
-			if answered.Items == nil {
-				answered.Items = []Item{}
-			}
-			return &answered, nil
+			return loadPageOf(ctx, name, "List", list, listQuery)
+		}
+	}
+	if history := options.History; history != nil {
+		resource.history = func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error) {
+			return loadPageOf(ctx, name, "History", history, listQuery)
 		}
 	}
 	if get := options.Get; get != nil {
@@ -202,6 +201,23 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 	resource.failWith(resource.validate(options.MaximumLimit, options.DistinctMaximum))
 	resource.deriveNullable()
 	return resource
+}
+
+// loadPageOf runs a page loader of the resource name: a copy of its page with Items never
+// nil, or a failure when it returned neither a page nor an error.
+func loadPageOf[Item any](ctx context.Context, name, loader string, load func(context.Context, *query.ListQuery) (*Page[Item], error), listQuery *query.ListQuery) (loadedPage, error) {
+	page, err := load(ctx, listQuery)
+	switch {
+	case err != nil:
+		return nil, err
+	case page == nil:
+		return nil, fmt.Errorf("livewire: the %s loader of %q returned no page and no error", loader, name)
+	}
+	answered := *page
+	if answered.Items == nil {
+		answered.Items = []Item{}
+	}
+	return &answered, nil
 }
 
 // Kind is KindResource.
@@ -365,6 +381,9 @@ func (r *Resource) routes() []route {
 	if r.distinct != nil {
 		routes = append(routes, route{http.MethodGet, r.DistinctPath()})
 	}
+	if r.history != nil {
+		routes = append(routes, route{http.MethodGet, r.HistoryPath()})
+	}
 	return routes
 }
 
@@ -392,6 +411,9 @@ func (r *Resource) validate(maximumLimit, distinctMaximum int) error {
 		}
 	}
 	if err := r.validateItem(); err != nil {
+		return err
+	}
+	if err := r.validateHistory(); err != nil {
 		return err
 	}
 	if err := r.validateGuardedFields(); err != nil {
@@ -632,4 +654,20 @@ func cloneFields(fields query.Fields) query.Fields {
 		cloned[position].Enum = slices.Clone(cloned[position].Enum)
 	}
 	return cloned
+}
+
+// validateHistory checks the history read's needs: a versioned resource with an item key on
+// a uuid field, the id of `<table>_history`.
+func (r *Resource) validateHistory() error {
+	if r.history == nil {
+		return nil
+	}
+	if !r.versioned || r.item == nil {
+		return errors.New("a History loader needs Versioned and Item: the history route is below the item route")
+	}
+	field, _ := r.fields.Lookup(r.item.Field)
+	if field.Type != query.TypeUUID {
+		return fmt.Errorf("a History loader needs an item key of type uuid, the id of the history table; Item.Field %q is %s", r.item.Field, field.Type)
+	}
+	return nil
 }
