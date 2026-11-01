@@ -77,7 +77,7 @@ func TestObserverStatusesAndCloseCodes(t *testing.T) {
 	for _, expected := range []struct {
 		operation livewire.Operation
 		status    int
-	}{{"", http.StatusBadRequest}, {"dance", http.StatusBadRequest}, {livewire.OperationQuery, http.StatusTooManyRequests}} {
+	}{{"", http.StatusBadRequest}, {"other", http.StatusBadRequest}, {livewire.OperationQuery, http.StatusTooManyRequests}} {
 		require.True(t, outcomeWith(bed, livewire.OutcomeRequest, func(outcome livewire.Outcome) bool {
 			return outcome.Operation == expected.operation && outcome.Status == expected.status && outcome.Err != nil
 		}), "one outcome per refused frame (D30): %+v", expected)
