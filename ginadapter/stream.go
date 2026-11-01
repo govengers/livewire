@@ -14,9 +14,17 @@ import (
 	"github.com/govengers/livewire"
 )
 
+// ExportRowsTrailer is the trailer of a complete export: the rows it wrote. The response
+// declares it with its headers and sets it only when the export finished, so a client tells
+// a complete CSV from a cut one by the trailer, whatever the transport did with the abort.
+const ExportRowsTrailer = "Livewire-Export-Rows"
+
 // export streams a resource's export as CSV (D35). The headers go out with the first byte
-// the loader writes, so a refusal before it is answered as an error body; a failure after it
-// aborts the response, so the client sees a broken body and never a short CSV.
+// the loader writes, so a refusal before it is answered as an error body; a success ends with
+// the ExportRowsTrailer. A failure after the first byte aborts the response: on HTTP/1.1 the
+// connection is closed under it, else the handler panics with http.ErrAbortHandler, which
+// resets an HTTP/2 stream only when no recovery middleware swallows it (gin.Recovery does:
+// the body then ends cleanly, without the trailer).
 func (h *handlers) export(name string) gin.HandlerFunc {
 	recorded := unit{target: name, kind: "export"}
 	return func(ginContext *gin.Context) {
@@ -26,6 +34,7 @@ func (h *handlers) export(name string) gin.HandlerFunc {
 		switch {
 		case err == nil:
 			writer.start()
+			ginContext.Writer.Header().Set(ExportRowsTrailer, strconv.Itoa(rows))
 			record(ginContext, recorded, http.StatusOK, nil).Int("livewire.rows", rows)
 		case !writer.started:
 			answer(ginContext, recorded, 0, nil, err)
@@ -56,6 +65,7 @@ func (w *exportWriter) start() {
 	header := w.ginContext.Writer.Header()
 	header.Set("Content-Type", "text/csv; charset=utf-8")
 	header.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": w.filename}))
+	header.Set("Trailer", ExportRowsTrailer)
 	w.ginContext.Writer.WriteHeader(http.StatusOK)
 	w.ginContext.Writer.WriteHeaderNow()
 }

@@ -268,6 +268,7 @@ func (a *api) uploadPicture() *livewire.Upload {
 type testServer struct {
 	t      *testing.T
 	api    *api
+	people *identities
 	engine *livewire.Engine
 	router *gin.Engine
 	mutex  sync.Mutex
@@ -289,7 +290,7 @@ func newServer(t *testing.T) *testServer {
 		PresenceStore: &presences{}, SameHostOnly: true,
 	})
 	require.NoError(t, err)
-	server.engine = engine
+	server.engine, server.people = engine, people
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

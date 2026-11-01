@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/govengers/auth"
 	wideevent "github.com/govengers/wide-event-logger"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -284,6 +285,7 @@ func TestExportRoute(t *testing.T) {
 	require.Equal(t, "text/csv; charset=utf-8", exported.Header().Get("Content-Type"))
 	require.Equal(t, `attachment; filename=parts.csv`, exported.Header().Get("Content-Disposition"))
 	require.Equal(t, "id,name\n"+firstID+",bolt\n", exported.Body.String(), "the guarded secret is no column")
+	require.Equal(t, "1", exported.Result().Trailer.Get(ginadapter.ExportRowsTrailer))
 	require.Equal(t, 1, server.lastEvent()["livewire.rows"])
 	require.Equal(t, "id,name,secret\n"+firstID+",bolt,s1\n", server.do(http.MethodGet, "/api/parts/export", "root", nil, nil).Body.String())
 
@@ -316,4 +318,43 @@ func TestRegisterRoutesValidates(t *testing.T) {
 	taken.GET("/api/parts", func(*gin.Context) {})
 	err := ginadapter.RegisterRoutes(taken, &ginadapter.Options{Engine: server.engine})
 	require.ErrorContains(t, err, "GET /api/parts")
+}
+
+func TestExportTrailerTellsACompleteCSVOnHTTP2BehindRecovery(t *testing.T) {
+	server := newServer(t)
+	router := gin.New()
+	router.Use(gin.RecoveryWithWriter(io.Discard), func(ginContext *gin.Context) {
+		identity := server.people.get(ginContext.GetHeader(subjectHeader))
+		ginContext.Request = ginContext.Request.WithContext(auth.WithIdentity(ginContext.Request.Context(), identity))
+	})
+	require.NoError(t, ginadapter.RegisterRoutes(router, &ginadapter.Options{Engine: server.engine}))
+	httpServer := httptest.NewUnstartedServer(router)
+	httpServer.EnableHTTP2 = true
+	httpServer.StartTLS()
+	t.Cleanup(httpServer.Close)
+	type exported struct {
+		status  int
+		trailer http.Header
+		body    string
+	}
+	export := func(query string) exported {
+		t.Helper()
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/parts/export"+query, nil)
+		require.NoError(t, err)
+		request.Header.Set(subjectHeader, "rita")
+		response, err := httpServer.Client().Do(request)
+		require.NoError(t, err)
+		body, _ := io.ReadAll(response.Body) // a reset stream errors; the trailer decides either way
+		require.NoError(t, response.Body.Close())
+		require.Equal(t, 2, response.ProtoMajor)
+		return exported{status: response.StatusCode, trailer: response.Trailer, body: string(body)}
+	}
+
+	complete := export("")
+	require.Equal(t, "id,name\n"+firstID+",bolt\n", complete.body)
+	require.Equal(t, "1", complete.trailer.Get(ginadapter.ExportRowsTrailer), "a complete export ends with its rows")
+	broken := export("?filter=" + url.QueryEscape(`{"where":{"field":"name","op":"eq","value":"fail"}}`))
+	require.Equal(t, http.StatusOK, broken.status)
+	require.Empty(t, broken.trailer.Get(ginadapter.ExportRowsTrailer), "an export cut after its first byte has no trailer, though Recovery ended the stream cleanly")
+	httpServer.Client().CloseIdleConnections()
 }
