@@ -257,6 +257,7 @@ const (
 	OutcomeFeed        OutcomeKind = "feed"         // the change feed failed; the engine restarts it after a backoff
 	OutcomeHeartbeat   OutcomeKind = "heartbeat"    // the presence heartbeat and sweep of a tick (D37)
 	OutcomeExport      OutcomeKind = "export"       // one export (D35); Rows is how many rows it wrote
+	OutcomeEnd         OutcomeKind = "end"          // a subscription a subscribe opened ended: unsubscribed, by an error push or with its socket
 )
 
 // Outcome is one unit of work the engine or an adapter finished (D4, D30). Target is the
@@ -264,7 +265,8 @@ const (
 // subscribe and rerun; Tenant is the resolved tenant (D42); Parameters is the decoded
 // parameters value (a *Parameters) when they were decoded; Status is the HTTP status answered
 // (the close code for OutcomeClose); Err is the refusal or failure, with the server-side
-// Reason of an *auth.Error, and nil on success; Rows is the rows an export wrote.
+// Reason of an *auth.Error, and nil on success; Rows is the rows an export wrote; QueryWait is
+// how long the unit waited for the engine's query slots (D52), so it is zero on REST.
 type Outcome struct {
 	Kind         OutcomeKind
 	Operation    Operation
@@ -277,6 +279,7 @@ type Outcome struct {
 	Err          error
 	Duration     time.Duration
 	Rows         int
+	QueryWait    time.Duration
 }
 
 // Observer receives outcomes synchronously with the context of the unit of work. It must

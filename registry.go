@@ -54,7 +54,7 @@ func NewRegistry(options *RegistryOptions) (*Registry, error) {
 // reserved name "batch" (the target of a batch's outcomes, D33), a duplicate name, a
 // duplicate method and route pattern (placeholder names aside; a resource's item and
 // distinct routes count), a mutation whose Resource or Effect target is not registered by
-// the end of the call. Nothing is added and no declaration is changed when any
+// the end of the call, a route of the library's own (BatchPath, FiltersPath). Nothing is added and no declaration is changed when any
 // declaration fails, so main fails fast on a wiring mistake.
 func (r *Registry) Add(declarations ...Declaration) error {
 	staged := &staging{
@@ -151,6 +151,9 @@ func (s *staging) stage(declaration Declaration) error {
 	}
 	for _, declaredRoute := range declaration.routes() {
 		pattern := declaredRoute.pattern()
+		if reservedRoutes[pattern] {
+			return fmt.Errorf("livewire: %s %q: the route %s is the library's own (BatchPath, FiltersPath)", kind, name, declaredRoute)
+		}
 		if other, exists := s.byRoute[pattern]; exists {
 			return fmt.Errorf("livewire: %s %q: the route %s is already registered by %q", kind, name, declaredRoute, other.Name())
 		}

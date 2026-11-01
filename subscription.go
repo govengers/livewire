@@ -46,6 +46,7 @@ type subscription struct {
 
 	mutex         sync.Mutex
 	ended         bool
+	published     bool // the subscribe answered it: its end is reported (OutcomeEnd)
 	resynchronize bool // a resync asked for a snapshot; the next re-run takes it
 	snapshotDue   bool // the next push is a snapshot (lists) or a replace (objects)
 	current       *view
@@ -178,6 +179,7 @@ func (i *installation) publish(frames [][]byte) error {
 		liveSubscription.mutex.Unlock()
 		return NotFound()
 	}
+	liveSubscription.published = true
 	withinLimit := i.socket.outbox.enqueue(frames...)
 	liveSubscription.mutex.Unlock()
 	if !withinLimit {
@@ -481,7 +483,7 @@ func (s *subscription) rerunWith(marks rerunMarks) {
 	}
 	unit := startUnit(OutcomeRerun, "", s.request.Target)
 	unit.subscription = s.id
-	ctx := s.ctx
+	ctx := withQueryWait(s.ctx)
 	identity, err := s.socket.rerunIdentity(ctx)
 	if errors.Is(err, errIdentityGone) {
 		return
@@ -727,7 +729,7 @@ func (s *subscription) markEndedLocked() func() {
 		s.stopRetry()
 		s.stopRetry = nil
 	}
-	filterHash := s.filterHash
+	filterHash, published := s.filterHash, s.published
 	s.filterHash = ""
 	return func() {
 		if s.cancel != nil {
@@ -737,5 +739,20 @@ func (s *subscription) markEndedLocked() func() {
 		if filterHash != "" {
 			s.socket.releaseFilter(filterHash)
 		}
+		if published {
+			s.socket.engine.observe(s.socket.ctx, s.endOutcome())
+		}
+	}
+}
+
+// endOutcome is the OutcomeEnd of the subscription, its target named as the subscribe did.
+func (s *subscription) endOutcome() Outcome {
+	target := s.request.Target
+	if s.request.Kind != ReadMain {
+		target += "." + string(s.request.Kind)
+	}
+	return Outcome{
+		Kind: OutcomeEnd, Operation: OperationSubscribe, Target: target, Subscription: s.id,
+		Tenant: s.tenant, Identity: s.socket.lastIdentity(), Status: http.StatusOK,
 	}
 }

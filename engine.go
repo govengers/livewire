@@ -396,6 +396,9 @@ func (e *Engine) RevalidateOwner(key string) {
 	}
 }
 
+// Registry is the registry the engine serves.
+func (e *Engine) Registry() *Registry { return e.registry }
+
 // openSockets lists the open sockets; e.mutex is held.
 func (e *Engine) openSockets() []*socket {
 	open := make([]*socket, 0, len(e.sockets))
@@ -405,13 +408,17 @@ func (e *Engine) openSockets() []*socket {
 	return open
 }
 
-// inSlot runs work holding a query slot (D52), released whatever work does.
+// inSlot runs work holding a query slot (D52), released whatever work does; the wait for the
+// slot is added to the unit's QueryWait.
 func (e *Engine) inSlot(ctx context.Context, work func() error) error {
+	waiting := time.Now()
 	select {
 	case e.queries <- struct{}{}:
 	case <-ctx.Done():
+		addQueryWait(ctx, time.Since(waiting))
 		return fmt.Errorf("livewire: wait for a query slot: %w", ctx.Err())
 	}
+	addQueryWait(ctx, time.Since(waiting))
 	defer func() { <-e.queries }()
 	if err := ctx.Err(); err != nil { // a slot and the cancellation were both ready; the work is over
 		return fmt.Errorf("livewire: wait for a query slot: %w", err)

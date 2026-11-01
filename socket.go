@@ -394,8 +394,9 @@ func (s *socket) revalidate() {
 			return
 		case <-s.revalidation:
 			unit := startUnit(OutcomeRevalidate, "", "")
-			identity, err := s.freshIdentity(s.ctx)
-			s.engine.observe(s.ctx, unit.outcome(auth.WithIdentity(s.ctx, identity), err))
+			metered := withQueryWait(s.ctx)
+			identity, err := s.freshIdentity(metered)
+			s.engine.observe(s.ctx, unit.outcome(auth.WithIdentity(metered, identity), err))
 		}
 	}
 }

@@ -70,14 +70,15 @@ func (s *socket) start(frame *RequestFrame) {
 // slot before it queues them.
 func (s *socket) run(frame *RequestFrame, release func()) {
 	unit := startUnit(OutcomeRequest, frame.Operation, frame.Target)
-	identity, err := s.freshIdentity(s.ctx)
+	metered := withQueryWait(s.ctx)
+	identity, err := s.freshIdentity(metered)
 	if err != nil {
 		s.observe(unit, err)
 		release()
 		s.respondError(frame.ID, err)
 		return
 	}
-	ctx := auth.WithIdentity(s.ctx, identity)
+	ctx := auth.WithIdentity(metered, identity)
 	status, payload := http.StatusOK, json.RawMessage(nil)
 	switch frame.Operation {
 	case OperationSubscribe:

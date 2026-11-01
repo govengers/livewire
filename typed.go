@@ -171,7 +171,13 @@ func (o *Object) Load(ctx context.Context, parameters any) (any, error) {
 
 func (o *Object) declaration() Declaration { return o }
 
-func (o *Object) routes() []route { return []route{{http.MethodGet, o.path}} }
+func (o *Object) routes() []route {
+	return []route{{http.MethodGet, o.path}, {http.MethodGet, o.PresencePath()}}
+}
+
+// PresencePath is the route of the presence read (`Path/presence`, the record named by the
+// `key` parameter within the object, D37).
+func (o *Object) PresencePath() string { return o.path + "/presence" }
 
 func validateGuards(itemType reflect.Type, guarded []GuardedField) error {
 	seen := map[string]bool{}

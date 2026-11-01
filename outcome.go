@@ -37,6 +37,7 @@ func (u unitOfWork) outcome(ctx context.Context, err error) Outcome {
 	return Outcome{
 		Kind: u.kind, Operation: u.operation, Target: u.target, Subscription: u.subscription,
 		Identity: auth.IdentityFrom(ctx), Tenant: TenantFrom(ctx), Status: statusOf(err), Err: err, Duration: time.Since(u.started),
+		QueryWait: queryWaitOf(ctx),
 	}
 }
 

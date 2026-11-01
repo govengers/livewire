@@ -257,6 +257,15 @@ func (r *Resource) ItemPath() string {
 	return r.path + "/{" + r.item.Parameter + "}"
 }
 
+// PresencePath is the route of the presence read (`Path/presence`, the record named by the
+// `key` parameter, D37), or "" without an item read.
+func (r *Resource) PresencePath() string {
+	if r.item == nil {
+		return ""
+	}
+	return r.path + "/presence"
+}
+
 // DistinctPath is the route of the distinct read (`Path/distinct`), or "" without a Distinct
 // loader.
 func (r *Resource) DistinctPath() string {
@@ -394,6 +403,9 @@ func (r *Resource) routes() []route {
 	}
 	if r.export != nil {
 		routes = append(routes, route{http.MethodGet, r.ExportPath()})
+	}
+	if r.item != nil {
+		routes = append(routes, route{http.MethodGet, r.PresencePath()})
 	}
 	return routes
 }

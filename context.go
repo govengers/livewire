@@ -1,6 +1,10 @@
 package livewire
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+	"time"
+)
 
 type contextKey int
 
@@ -8,7 +12,34 @@ const (
 	transactionKey contextKey = iota
 	idempotencyKeyKey
 	tenantKey
+	queryWaitKey
 )
+
+// queryWait sums the time one unit of work waited for query slots (D52).
+type queryWait struct {
+	nanoseconds atomic.Int64
+}
+
+// withQueryWait returns a copy of ctx that sums the slot waits of the unit of work it starts.
+func withQueryWait(ctx context.Context) context.Context {
+	return context.WithValue(ctx, queryWaitKey, &queryWait{})
+}
+
+// addQueryWait adds a slot wait to the sum of ctx, if it has one.
+func addQueryWait(ctx context.Context, wait time.Duration) {
+	if sum, ok := ctx.Value(queryWaitKey).(*queryWait); ok {
+		sum.nanoseconds.Add(int64(wait))
+	}
+}
+
+// queryWaitOf is the slot wait summed in ctx, zero without a sum.
+func queryWaitOf(ctx context.Context) time.Duration {
+	sum, ok := ctx.Value(queryWaitKey).(*queryWait)
+	if !ok {
+		return 0
+	}
+	return time.Duration(sum.nanoseconds.Load())
+}
 
 // WithTransaction returns a copy of ctx carrying the query-only handle of the engine's
 // transaction (Transaction.Handle); the engine calls it for every unit of work, reads
