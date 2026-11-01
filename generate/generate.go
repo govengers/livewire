@@ -126,17 +126,19 @@ type file struct {
 }
 
 // render builds the model of the registry and renders every artifact the options ask for.
+// The TypeScript is rendered either way: its identifiers are the OpenAPI operation ids too,
+// so a collision fails the document as well.
 func render(registry *livewire.Registry, options Options) ([]file, error) {
 	model, err := newModel(registry, options)
 	if err != nil {
 		return nil, err
 	}
+	typescriptFiles, err := renderTypeScript(model)
+	if err != nil {
+		return nil, err
+	}
 	var files []file
 	if options.TypeScriptDirectory != "" {
-		typescriptFiles, err := renderTypeScript(model)
-		if err != nil {
-			return nil, err
-		}
 		for _, typescriptFile := range typescriptFiles {
 			files = append(files, file{path: filepath.Join(options.TypeScriptDirectory, typescriptFile.path), content: typescriptFile.content})
 		}
