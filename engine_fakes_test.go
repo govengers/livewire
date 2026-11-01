@@ -276,6 +276,9 @@ type fakeTransactor struct {
 	failBegin atomic.Bool
 	// panicBegin makes the next Begin panic.
 	panicBegin atomic.Bool
+	// described are the calls of batches described to their transaction (CallDescriber).
+	described    []livewire.TransactionDetails
+	failDescribe atomic.Bool
 }
 
 func (f *fakeTransactor) Begin(_ context.Context, details livewire.TransactionDetails) (livewire.Transaction, error) {
@@ -313,6 +316,17 @@ type fakeTransaction struct {
 }
 
 func (t *fakeTransaction) Handle() any { return t }
+
+// DescribeCall records the details of a batch's call with the transactor.
+func (t *fakeTransaction) DescribeCall(_ context.Context, details livewire.TransactionDetails) error {
+	if t.transactor.failDescribe.Load() {
+		return errors.New("the actor setting failed")
+	}
+	t.transactor.mutex.Lock()
+	t.transactor.described = append(t.transactor.described, details)
+	t.transactor.mutex.Unlock()
+	return nil
+}
 
 // stage records a write and the change its commit publishes.
 func (t *fakeTransaction) stage(write func(), change livewire.Change) {
@@ -476,6 +490,49 @@ func (f *fakeIdempotency) Record(_ context.Context, record *livewire.Idempotency
 	return nil
 }
 
+// fakeAudit is the AuditStore: an entry written in a transaction lands when it commits and is
+// gone when it rolls back; one written outside lands at once.
+type fakeAudit struct {
+	mutex     sync.Mutex
+	entries   []auditRecord
+	failWrite atomic.Bool
+}
+
+// auditRecord is one landed entry and whether it was written in a transaction.
+type auditRecord struct {
+	entry         livewire.AuditEntry
+	inTransaction bool
+}
+
+// Write fails on a cancelled context, as a database driver does.
+func (f *fakeAudit) Write(ctx context.Context, entry *livewire.AuditEntry) error {
+	if f.failWrite.Load() {
+		return errors.New("the audit table is gone")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	transaction := transactionOf(ctx)
+	record := auditRecord{entry: *entry, inTransaction: transaction != nil}
+	land := func() {
+		f.mutex.Lock()
+		f.entries = append(f.entries, record)
+		f.mutex.Unlock()
+	}
+	if transaction != nil {
+		transaction.hooks(land, func() {})
+		return nil
+	}
+	land()
+	return nil
+}
+
+func (f *fakeAudit) landed() []auditRecord {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return slices.Clone(f.entries)
+}
+
 // fakePresences is the PresenceStore; every change is published on the feed like the
 // presence trigger does.
 type fakePresences struct {
@@ -606,12 +663,17 @@ type outcomes struct {
 	received []livewire.Outcome
 	// panics makes the Observer panic after it recorded the outcome.
 	panics atomic.Bool
+	// holdSubscribe, when set, holds every OutcomeSubscribe until it is closed.
+	holdSubscribe atomic.Pointer[chan struct{}]
 }
 
 func (o *outcomes) observe(_ context.Context, outcome livewire.Outcome) {
 	o.mutex.Lock()
 	o.received = append(o.received, outcome)
 	o.mutex.Unlock()
+	if hold := o.holdSubscribe.Load(); hold != nil && outcome.Kind == livewire.OutcomeSubscribe {
+		<-*hold
+	}
 	if o.panics.Load() {
 		panic("the observer panicked")
 	}

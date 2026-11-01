@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +64,7 @@ type testbed struct {
 	transactor  *fakeTransactor
 	filters     *fakeFilters
 	idempotency *fakeIdempotency
+	audit       *fakeAudit
 	presences   *fakePresences
 	outcomes    *outcomes
 	engine      *livewire.Engine
@@ -68,7 +72,15 @@ type testbed struct {
 	// release unblocks the mutation "blockGadget".
 	release chan struct{}
 	// anonymousRuns counts the handler runs of "anonymousGadget".
-	anonymousRuns   atomic.Int64
+	anonymousRuns atomic.Int64
+	// cancelCall, when set, is what "cancelGadget" calls before it fails: its caller went away.
+	cancelCall atomic.Pointer[context.CancelFunc]
+	// versions are the versions of the documents, by id; historyQueries what the History
+	// loader was asked.
+	versionMutex    sync.Mutex
+	versions        map[string][]livewire.Version[document]
+	deleted         map[string]bool
+	historyQueries  []*query.ListQuery
 	registryOptions livewire.RegistryOptions
 }
 
@@ -84,14 +96,14 @@ func newTestbedWith(t *testing.T, registryOptions livewire.RegistryOptions, adju
 	feed := newFakeFeed()
 	bed := &testbed{
 		t: t, world: newWorld(feed), feed: feed, identities: newFakeIdentities(),
-		filters: newFakeFilters(), idempotency: newFakeIdempotency(), presences: newFakePresences(feed),
+		filters: newFakeFilters(), idempotency: newFakeIdempotency(), audit: &fakeAudit{}, presences: newFakePresences(feed),
 		outcomes: &outcomes{}, release: make(chan struct{}), registryOptions: registryOptions,
 	}
 	bed.transactor = &fakeTransactor{world: bed.world}
 	bed.identities.set(person("ada", roleReader, roleWriter))
 	options := &livewire.EngineOptions{
 		Registry: bed.registry(), ChangeFeed: feed, IdentitySource: bed.identities, Transactor: bed.transactor,
-		FilterStore: bed.filters, IdempotencyStore: bed.idempotency, PresenceStore: bed.presences,
+		FilterStore: bed.filters, IdempotencyStore: bed.idempotency, AuditStore: bed.audit, PresenceStore: bed.presences,
 		AllowedOrigins: []string{"https://app.example"}, DeliveryBatchWait: 10 * time.Millisecond, RetryInterval: 5 * time.Millisecond,
 	}
 	if adjust != nil {
@@ -137,7 +149,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget()))
 	return registry
 }
 
@@ -157,14 +169,15 @@ func (b *testbed) gadgets() *livewire.Resource {
 		Read:   authorization.HasRole(roleReader),
 		Fields: gadgetFields(),
 		Item:   &livewire.ItemKey{Parameter: "id", Field: "id"},
-		List: func(ctx context.Context, _ *query.ListQuery) ([]gadget, int, error) {
+		List: func(ctx context.Context, _ *query.ListQuery) (*livewire.Page[gadget], error) {
 			if err := b.world.load(ctx); err != nil {
-				return nil, 0, err
+				return nil, err
 			}
 			items := b.world.sorted("")
-			return items, len(items), nil
+			return &livewire.Page[gadget]{Items: items, Total: len(items)}, nil
 		},
-		Get: b.getGadget,
+		Get:    b.getGadget,
+		Export: b.exportGadgets,
 		Distinct: func(ctx context.Context, field string, _ *query.ListQuery) ([]livewire.DistinctValue, error) {
 			counts := map[string]int{}
 			for _, item := range b.world.sorted("") {
@@ -263,6 +276,31 @@ func (b *testbed) createGadget() *livewire.Mutation {
 	})
 }
 
+// exportGadgets writes the columns' names, then one line per gadget, as a repository's
+// postgresadapter.WriteCSV would; it fails after the header for the filter on "fail".
+func (b *testbed) exportGadgets(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error) {
+	if transactionOf(ctx) == nil {
+		return 0, errors.New("the export runs outside the read transaction")
+	}
+	names := make([]string, len(columns))
+	for index, column := range columns {
+		names[index] = column.Name
+	}
+	if _, err := fmt.Fprintln(writer, strings.Join(names, ",")); err != nil {
+		return 0, err
+	}
+	if _, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "gadgets", IDColumn: "gadgets.id"}); slices.Contains(arguments, any("fail")) {
+		return 0, errors.New("the database went away")
+	}
+	items := b.world.sorted("")
+	for _, item := range items {
+		if _, err := fmt.Fprintln(writer, item.ID+","+item.Name); err != nil {
+			return 0, err
+		}
+	}
+	return len(items), nil
+}
+
 // getGadget is the item read: the item key travels as the page query's string argument.
 func (b *testbed) getGadget(ctx context.Context, listQuery *query.ListQuery) (*gadget, error) {
 	if err := b.world.load(ctx); err != nil {
@@ -329,9 +367,113 @@ func (b *testbed) openGadgets() *livewire.Resource {
 		Tables: []string{"gadgets"},
 		Read:   authorization.HasRole(roleReader),
 		Fields: fields,
-		List: func(context.Context, *query.ListQuery) ([]gadget, int, error) {
+		List: func(_ context.Context, listQuery *query.ListQuery) (*livewire.Page[gadget], error) {
 			items := b.world.sorted("")
-			return items, len(items), nil
+			next := listQuery.NextCursor(nil, firstKey) // an offset resource ignores it
+			return &livewire.Page[gadget]{Items: items, Total: len(items), Next: next}, nil
+		},
+	})
+}
+
+// document is the item of the versioned resource documents; the versions of the testbed are
+// its rows.
+type document struct {
+	ID      string `json:"id"`
+	Version int    `json:"version"`
+	Title   string `json:"title"`
+	Secret  string `json:"secret"`
+}
+
+// addVersion appends a version of a document; its data is the document.
+func (b *testbed) addVersion(item document, operation livewire.ChangeOperation) {
+	b.versionMutex.Lock()
+	defer b.versionMutex.Unlock()
+	if b.versions == nil {
+		b.versions = map[string][]livewire.Version[document]{}
+	}
+	item.Version = len(b.versions[item.ID]) + 1
+	b.versions[item.ID] = append(b.versions[item.ID], livewire.Version[document]{
+		ID: item.Version, Operation: operation, ValidFrom: time.Unix(int64(item.Version), 0).UTC(), Actor: "test:ada", Data: &item,
+	})
+}
+
+// historyQueriesSoFar copies what the History loader was asked so far.
+func (b *testbed) historyQueriesSoFar() []*query.ListQuery {
+	b.versionMutex.Lock()
+	defer b.versionMutex.Unlock()
+	return slices.Clone(b.historyQueries)
+}
+
+// deleteDocument deletes a document: its versions stay, its item read is 404.
+func (b *testbed) deleteDocument(id string) {
+	b.versionMutex.Lock()
+	defer b.versionMutex.Unlock()
+	if b.deleted == nil {
+		b.deleted = map[string]bool{}
+	}
+	b.deleted[id] = true
+}
+
+// documents is versioned with a history (D34); its secret is the admin's.
+func (b *testbed) documents() *livewire.Resource {
+	return livewire.NewResource("documents", "/documents", &livewire.ResourceOptions[document]{
+		Tables:    []string{"documents"},
+		Read:      authorization.HasRole(roleReader),
+		Versioned: true,
+		Fields: query.Fields{
+			{Name: "id", Type: query.TypeUUID, SQL: "documents.id", Filter: true, Sort: true},
+			{Name: "title", Type: query.TypeText, SQL: "documents.title", Filter: true},
+			{Name: "secret", Type: query.TypeString, SQL: "documents.secret", Read: authorization.IsAdmin()},
+		},
+		Item: &livewire.ItemKey{Parameter: "id", Field: "id"},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[document], error) {
+			return &livewire.Page[document]{}, nil
+		},
+		Get: func(_ context.Context, listQuery *query.ListQuery) (*document, error) {
+			_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "documents", IDColumn: "documents.id"})
+			b.versionMutex.Lock()
+			defer b.versionMutex.Unlock()
+			for _, argument := range arguments {
+				if versions := b.versions[fmt.Sprint(argument)]; len(versions) > 0 && !b.deleted[fmt.Sprint(argument)] {
+					return versions[len(versions)-1].Data, nil
+				}
+			}
+			return nil, livewire.NotFound()
+		},
+		History: func(_ context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[document]], error) {
+			b.versionMutex.Lock()
+			defer b.versionMutex.Unlock()
+			b.historyQueries = append(b.historyQueries, listQuery)
+			_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "documents_history", IDColumn: "version"})
+			versions := b.versions[fmt.Sprint(arguments[0])]
+			return &livewire.Page[livewire.Version[document]]{Items: slices.Clone(versions), Total: len(versions)}, nil
+		},
+	})
+}
+
+type pagedGadget struct {
+	ID string `json:"id"`
+}
+
+// pagedGadgets pages by cursor (D38) over two rows: a page of one row after the first one's
+// cursor is the second, the last.
+func (b *testbed) pagedGadgets() *livewire.Resource {
+	return livewire.NewResource("pagedGadgets", "/paged-gadgets", &livewire.ResourceOptions[pagedGadget]{
+		Read:   authorization.HasRole(roleReader),
+		Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "paged.id", Filter: true, Sort: true}},
+		Cursor: true,
+		List: func(_ context.Context, listQuery *query.ListQuery) (*livewire.Page[pagedGadget], error) {
+			rows := []pagedGadget{{ID: firstKey}, {ID: secondKey}}
+			start := 0
+			if listQuery.Cursor != nil && listQuery.Cursor.ID == firstKey {
+				start = 1
+			}
+			items := rows[start:min(start+listQuery.Limit, len(rows))]
+			page := &livewire.Page[pagedGadget]{Items: items, Total: len(rows)}
+			if start+len(items) < len(rows) {
+				page.Next = listQuery.NextCursor(nil, items[len(items)-1].ID)
+			}
+			return page, nil
 		},
 	})
 }
@@ -395,6 +537,19 @@ func (b *testbed) blockGadget() *livewire.Mutation {
 				return nil, ctx.Err()
 			}
 			return &countItem{Count: 1}, nil
+		},
+	})
+}
+
+// cancelGadget cancels its caller's context, then fails: the handler ran, its call ended.
+func (b *testbed) cancelGadget() *livewire.Mutation {
+	return livewire.NewMutation("cancelGadget", http.MethodPost, "/gadgets/cancel", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, livewire.NoContent]{
+		Check: authorization.HasRole(roleWriter),
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*livewire.NoContent, error) {
+			if cancel := b.cancelCall.Load(); cancel != nil {
+				(*cancel)()
+			}
+			return nil, livewire.Conflict()
 		},
 	})
 }

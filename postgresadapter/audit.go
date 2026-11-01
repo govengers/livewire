@@ -8,27 +8,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/govengers/auth"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/govengers/livewire"
 )
-
-// AuditEntry is one mutation call as the audit of D32 records it: the tenant, the effective
-// identity (its Real() is the real actor), the mutation, its decoded parameters, the
-// request id, the Idempotency-Key ("" for none), the answered status and how long the call
-// took.
-type AuditEntry struct {
-	Tenant         string
-	Identity       *auth.Identity
-	Mutation       string
-	Parameters     any
-	RequestID      string
-	IdempotencyKey string
-	Status         int
-	Duration       time.Duration
-}
 
 // AuditStoreOptions configures an AuditStore. Pool is required; Retention (default 365
 // days, not negative) is how long Maintain keeps rows at least: it drops a month's partition
@@ -40,10 +24,14 @@ type AuditStoreOptions struct {
 
 const defaultAuditRetention = 365 * 24 * time.Hour
 
-// AuditStore writes livewire_audit (AuditSQL). It is safe for concurrent use.
+// AuditStore writes livewire_audit (AuditSQL) and implements livewire.AuditStore: the engine
+// writes one row per call (D32) through EngineOptions.AuditStore. It is safe for concurrent
+// use.
 type AuditStore struct {
 	options AuditStoreOptions
 }
+
+var _ livewire.AuditStore = (*AuditStore)(nil)
 
 // NewAuditStore validates and copies options.
 func NewAuditStore(options *AuditStoreOptions) (*AuditStore, error) {
@@ -61,10 +49,10 @@ func NewAuditStore(options *AuditStoreOptions) (*AuditStore, error) {
 }
 
 // Write inserts the row of entry in the engine's transaction in ctx, so it commits and rolls
-// back with the mutation (D31); outside one, a failed call's row for instance, it writes on
-// the pool. Parameters are stored as their JSON, the IdempotencyKey in any spelling
+// back with the mutation (D31); outside one, a failed call's row after the rollback, it
+// writes on the pool. Parameters are stored as their JSON, the IdempotencyKey in any spelling
 // uuid.Parse reads as its canonical uuid.
-func (s *AuditStore) Write(ctx context.Context, entry *AuditEntry) error {
+func (s *AuditStore) Write(ctx context.Context, entry *livewire.AuditEntry) error {
 	parameters, err := json.Marshal(entry.Parameters)
 	if err != nil {
 		return fmt.Errorf("postgresadapter: encode the audit parameters of %s: %w", entry.Mutation, err)

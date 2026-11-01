@@ -23,9 +23,13 @@ import (
 // request's own host may open a socket (D9). ChangeFeed is optional: without one, a
 // subscription re-runs only when its socket's identity changes and, when its filter carries
 // a relative time, on the safety tick. FilterStore enables stored filters (D13),
-// IdempotencyStore the replay of mutations (D16), PresenceStore the join and leave ops and
-// the presence reads (D37); each is optional and its feature is off without it. The
-// engine's outcomes go to the registry's Observer (D49).
+// IdempotencyStore the replay of mutations (D16), AuditStore the action audit (D32),
+// PresenceStore the join and leave ops and the presence reads (D37); each is optional and its
+// feature is off without it. The engine's outcomes go to the registry's Observer (D49). The
+// engine runs no store maintenance: the sweeps and the audit partitions (the postgresadapter's
+// FilterStore.Sweep, IdempotencyStore.Sweep and AuditStore.Maintain) are the application's to
+// schedule, a periodic govengers/jobs job for instance, so one replica runs them, not every
+// engine, and a failure lands where the application handles its jobs.
 //
 // The limits (D10) default when zero: SubscriptionsPerSocket 64, InFlightPerSocket 16,
 // PresencesPerSocket 64 (records one socket may join at once), FiltersPerSocket 64 (the
@@ -47,6 +51,7 @@ type EngineOptions struct {
 	Transactor             Transactor
 	FilterStore            FilterStore
 	IdempotencyStore       IdempotencyStore
+	AuditStore             AuditStore
 	PresenceStore          PresenceStore
 	AllowedOrigins         []string
 	SameHostOnly           bool
@@ -391,6 +396,13 @@ func (e *Engine) RevalidateOwner(key string) {
 	}
 }
 
+// ServesPresence reports whether the engine has a PresenceStore, so presence reads and the
+// join and leave ops are on (D37).
+func (e *Engine) ServesPresence() bool { return e.options.PresenceStore != nil }
+
+// Registry is the registry the engine serves.
+func (e *Engine) Registry() *Registry { return e.registry }
+
 // openSockets lists the open sockets; e.mutex is held.
 func (e *Engine) openSockets() []*socket {
 	open := make([]*socket, 0, len(e.sockets))
@@ -400,13 +412,17 @@ func (e *Engine) openSockets() []*socket {
 	return open
 }
 
-// inSlot runs work holding a query slot (D52), released whatever work does.
+// inSlot runs work holding a query slot (D52), released whatever work does; the wait for the
+// slot is added to the unit's QueryWait.
 func (e *Engine) inSlot(ctx context.Context, work func() error) error {
+	waiting := time.Now()
 	select {
 	case e.queries <- struct{}{}:
 	case <-ctx.Done():
+		addQueryWait(ctx, time.Since(waiting))
 		return fmt.Errorf("livewire: wait for a query slot: %w", ctx.Err())
 	}
+	addQueryWait(ctx, time.Since(waiting))
 	defer func() { <-e.queries }()
 	if err := ctx.Err(); err != nil { // a slot and the cancellation were both ready; the work is over
 		return fmt.Errorf("livewire: wait for a query slot: %w", err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"slices"
@@ -68,10 +69,34 @@ func ReadParametersFrom(source ParameterSource) (*ReadParameters, error) {
 
 // ItemKey says how a resource's item read addresses one row: the path parameter of the
 // item route (`{Parameter}` below the resource path) and the declared field it matches,
-// which must be filterable and of type uuid, string, text, enum, int or time.
+// which must be filterable and of type uuid, string, text, enum, int or time. On REST the
+// resource's own routes `distinct`, `export` and `presence` sit beside the item route and
+// win, so an item whose key is one of these words is readable on the socket only; a key of
+// type uuid never is.
 type ItemKey struct {
 	Parameter string
 	Field     string
+}
+
+// Page is one page a filterable resource's List loader returns (D14, D38, D55): the items in
+// page order, the total under scope and filter (at most CountCap + 1 under a cap) and, when
+// the page is full, the cursor after its last row (nil otherwise), unencoded. The engine
+// answers Next encoded as ListResponse.next for a resource in cursor mode and ignores it
+// otherwise, so a sort value without a cursor form fails only the reads that need the
+// cursor. postgresadapter.ListPage returns one.
+type Page[Item any] struct {
+	Items []Item
+	Total int
+	Next  *query.Cursor
+}
+
+func (p *Page[Item]) parts() (items any, total int, next *query.Cursor) {
+	return p.Items, p.Total, p.Next
+}
+
+// loadedPage is a *Page of any item type, as the engine reads it.
+type loadedPage interface {
+	parts() (items any, total int, next *query.Cursor)
 }
 
 // Default limits of a filterable resource.
@@ -86,9 +111,16 @@ const (
 // without it. Scope narrows every read and re-run before filter and count; nil is no scope.
 // MaximumLimit clamps the page (default 100), CountCap caps the total (0 counts every row),
 // DistinctMaximum caps a distinct read (default 1000). Cursor allows keyset pagination with
-// the `after` parameter (D38). Versioned marks the item as carrying `version` and the
-// history read (D34). ExportColumns names the fields an export writes; empty means all.
-// Partition names a subscription's partition (D25); nil means the tenant.
+// the `after` parameter and answers the Next of List's Page as ListResponse.next (D38, D55).
+// Versioned marks the item as carrying `version` (D34); History, which needs Versioned and
+// the Item key on the uuid field "id" (its SQL the table's id column), reads one item's
+// versions for the history route: its query is the reserved filter, sort and page over
+// HistoryFields, scoped to the history table's `id = key`, and the subscription of it re-runs
+// on the resource's Tables, which every version is written with. Export streams every row under scope, filter and sort to
+// the writer for the export route (D35) and returns how many it wrote: the columns are
+// ExportColumns, or every field, without those whose Read check refuses the caller, and a
+// repository passes them to postgresadapter.WriteCSV. Partition names a subscription's
+// partition (D25); nil means the tenant.
 type ResourceOptions[Item any] struct {
 	Tables          []string
 	Read            authorization.Check
@@ -103,14 +135,17 @@ type ResourceOptions[Item any] struct {
 	Versioned       bool
 	ExportColumns   []string
 	Cursor          bool
-	List            func(ctx context.Context, listQuery *query.ListQuery) ([]Item, int, error)
+	List            func(ctx context.Context, listQuery *query.ListQuery) (*Page[Item], error)
 	Get             func(ctx context.Context, listQuery *query.ListQuery) (*Item, error)
 	Distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
+	History         func(ctx context.Context, listQuery *query.ListQuery) (*Page[Version[Item]], error)
+	Export          func(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error)
 }
 
-// Resource is a filterable list of items with optional item and distinct reads. Its routes
-// are GET Path (list), GET ItemPath (one item) and GET DistinctPath (distinct values); all
-// take the reserved parameters.
+// Resource is a filterable list of items with optional item, distinct and history reads and
+// an export. Its routes are GET Path (list), GET ItemPath (one item), GET DistinctPath
+// (distinct values), GET HistoryPath (one item's versions) and GET ExportPath (every row as
+// CSV); all take the reserved parameters.
 type Resource struct {
 	signature
 	liveness
@@ -125,9 +160,11 @@ type Resource struct {
 	versioned       bool
 	exportColumns   []string
 	cursor          bool
-	list            func(ctx context.Context, listQuery *query.ListQuery) (any, int, error)
+	list            func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error)
 	get             func(ctx context.Context, listQuery *query.ListQuery) (any, error)
 	distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
+	history         func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error)
+	export          func(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error)
 }
 
 // NewResource declares a filterable resource of Item under path (no placeholders). The
@@ -150,18 +187,20 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 		exportColumns:   slices.Clone(options.ExportColumns),
 		cursor:          options.Cursor,
 		distinct:        options.Distinct,
+		export:          options.Export,
 	}
 	resource.partition = options.Partition
 	if options.Item != nil {
 		resource.item = &ItemKey{Parameter: options.Item.Parameter, Field: options.Item.Field}
 	}
 	if list := options.List; list != nil {
-		resource.list = func(ctx context.Context, listQuery *query.ListQuery) (any, int, error) {
-			items, total, err := list(ctx, listQuery)
-			if items == nil {
-				items = []Item{}
-			}
-			return items, total, err
+		resource.list = func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error) {
+			return loadPageOf(ctx, name, "List", list, listQuery)
+		}
+	}
+	if history := options.History; history != nil {
+		resource.history = func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error) {
+			return loadPageOf(ctx, name, "History", history, listQuery)
 		}
 	}
 	if get := options.Get; get != nil {
@@ -174,6 +213,23 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 	resource.failWith(resource.validate(options.MaximumLimit, options.DistinctMaximum))
 	resource.deriveNullable()
 	return resource
+}
+
+// loadPageOf runs a page loader of the resource name: a copy of its page with Items never
+// nil, or a failure when it returned neither a page nor an error.
+func loadPageOf[Item any](ctx context.Context, name, loader string, load func(context.Context, *query.ListQuery) (*Page[Item], error), listQuery *query.ListQuery) (loadedPage, error) {
+	page, err := load(ctx, listQuery)
+	switch {
+	case err != nil:
+		return nil, err
+	case page == nil:
+		return nil, fmt.Errorf("livewire: the %s loader of %q returned no page and no error", loader, name)
+	}
+	answered := *page
+	if answered.Items == nil {
+		answered.Items = []Item{}
+	}
+	return &answered, nil
 }
 
 // Kind is KindResource.
@@ -203,6 +259,15 @@ func (r *Resource) ItemPath() string {
 		return ""
 	}
 	return r.path + "/{" + r.item.Parameter + "}"
+}
+
+// PresencePath is the route of the presence read (`Path/presence`, the record named by the
+// `key` parameter, D37), or "" without an item read.
+func (r *Resource) PresencePath() string {
+	if r.item == nil {
+		return ""
+	}
+	return r.path + "/presence"
 }
 
 // DistinctPath is the route of the distinct read (`Path/distinct`), or "" without a Distinct
@@ -289,8 +354,9 @@ func (r *Resource) ItemQuery(ctx context.Context, source ParameterSource) (*quer
 	return r.compile(ctx, parsed)
 }
 
-// LoadList runs the List loader; the items are a []Item, never nil.
-func (r *Resource) LoadList(ctx context.Context, listQuery *query.ListQuery) (items any, total int, err error) {
+// LoadList runs the List loader; the page is the loader's *Page[Item], a copy whose Items are
+// never nil. A loader that returns no page and no error fails.
+func (r *Resource) LoadList(ctx context.Context, listQuery *query.ListQuery) (any, error) {
 	return r.list(ctx, listQuery)
 }
 
@@ -336,6 +402,15 @@ func (r *Resource) routes() []route {
 	if r.distinct != nil {
 		routes = append(routes, route{http.MethodGet, r.DistinctPath()})
 	}
+	if r.history != nil {
+		routes = append(routes, route{http.MethodGet, r.HistoryPath()})
+	}
+	if r.export != nil {
+		routes = append(routes, route{http.MethodGet, r.ExportPath()})
+	}
+	if r.item != nil {
+		routes = append(routes, route{http.MethodGet, r.PresencePath()})
+	}
 	return routes
 }
 
@@ -363,6 +438,9 @@ func (r *Resource) validate(maximumLimit, distinctMaximum int) error {
 		}
 	}
 	if err := r.validateItem(); err != nil {
+		return err
+	}
+	if err := r.validateHistory(); err != nil {
 		return err
 	}
 	if err := r.validateGuardedFields(); err != nil {
@@ -603,4 +681,22 @@ func cloneFields(fields query.Fields) query.Fields {
 		cloned[position].Enum = slices.Clone(cloned[position].Enum)
 	}
 	return cloned
+}
+
+// validateHistory checks the history read's needs: a versioned resource whose item key is
+// its uuid field "id", the column `<table>_history` keys its versions by. The history is
+// scoped by the key's value, so a key on any other field would let an item the caller may
+// read name the history of another row whose id equals that field's value.
+func (r *Resource) validateHistory() error {
+	if r.history == nil {
+		return nil
+	}
+	if !r.versioned || r.item == nil {
+		return errors.New("a History loader needs Versioned and Item: the history route is below the item route")
+	}
+	field, _ := r.fields.Lookup(r.item.Field)
+	if field.Name != keyFieldJSON || field.Type != query.TypeUUID {
+		return fmt.Errorf("a History loader needs the item key on the uuid field %q, the id the history table keys its versions by; Item.Field is %q (%s)", keyFieldJSON, r.item.Field, field.Type)
+	}
+	return nil
 }

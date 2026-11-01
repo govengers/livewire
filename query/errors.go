@@ -29,12 +29,11 @@ type Error struct {
 	Fields  map[string]string
 }
 
+// Error names the code and its message only: a field's path may be a key the client chose
+// and its text may quote the client's value, both stay out of logs and wide events; the
+// client gets them through the Fields.
 func (e *Error) Error() string {
-	text := string(e.Code) + ": " + e.Message
-	for path, message := range e.Fields {
-		text += " (" + path + ": " + message + ")"
-	}
-	return text
+	return string(e.Code) + ": " + e.Message
 }
 
 var messages = map[Code]string{

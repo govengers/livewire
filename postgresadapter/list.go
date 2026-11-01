@@ -31,26 +31,17 @@ type PageRow struct {
 // a sqlc query `WHERE id = ANY(@ids::uuid[])` serves it. ListPage puts them in page order.
 type Hydrate[Item any] func(ctx context.Context, database DBTX, rows []PageRow) (map[uuid.UUID]Item, error)
 
-// Page is one page of a list (D14, D38): the items in page order (never nil), the total
-// (at most CountCap + 1 under a cap) and, when the page is full, the cursor after its last
-// row (nil otherwise). A resource in cursor mode answers Next.Encode() as ListResponse.Next;
-// an offset list ignores it, so a sort value without a cursor form (a time after the year
-// 9999) fails only the reads that need the cursor.
-type Page[Item any] struct {
-	Items []Item
-	Total int
-	Next  *query.Cursor
-}
-
-// ListPage reads one page of a filterable resource (section 8, D53): the page query, the
-// capped count and the hydration of the page's rows, all on one snapshot. Inside an engine
+// ListPage reads one page of a filterable resource (section 8, D53, D55) as the resource's
+// List loader answers it: the page query, the capped count and the hydration of the page's
+// rows, all on one snapshot; the items are in page order (never nil) and Next is set when
+// the page is full. Inside an engine
 // unit of work (TransactionFrom(ctx) is not nil) they run in the engine's transaction,
 // whatever database is, so the read sees the engine's snapshot and livewire.tenant; outside
 // one, on a pool or a connection, ListPage opens a REPEATABLE READ READ ONLY transaction of
 // its own. A cursor value the column refuses (SQLSTATE 22P02, a forged enum value) is a
 // *query.Error with query.CodeInvalidCursor; an id the hydration did not return is an error.
-func ListPage[Item any](ctx context.Context, database DBTX, specification *query.ResourceSQL, listQuery *query.ListQuery, hydrate Hydrate[Item]) (*Page[Item], error) {
-	var page *Page[Item]
+func ListPage[Item any](ctx context.Context, database DBTX, specification *query.ResourceSQL, listQuery *query.ListQuery, hydrate Hydrate[Item]) (*livewire.Page[Item], error) {
+	var page *livewire.Page[Item]
 	err := inSnapshot(ctx, database, func(database DBTX) error {
 		rows, orderValues, err := scanPage(ctx, database, specification, listQuery)
 		if err != nil {
@@ -64,7 +55,7 @@ func ListPage[Item any](ctx context.Context, database DBTX, specification *query
 		if err != nil {
 			return err
 		}
-		page = &Page[Item]{Items: items, Total: total}
+		page = &livewire.Page[Item]{Items: items, Total: total}
 		if len(rows) > 0 && len(rows) >= listQuery.Limit {
 			page.Next = listQuery.NextCursor(orderValues, rows[len(rows)-1].ID.String())
 		}

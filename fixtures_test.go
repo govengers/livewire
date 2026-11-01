@@ -53,8 +53,8 @@ func partOptions() *livewire.ResourceOptions[part] {
 		Fields:      partFields(),
 		DefaultSort: []query.SortTerm{{Field: "createdAt", Descending: true}},
 		Item:        &livewire.ItemKey{Parameter: "id", Field: "id"},
-		List: func(context.Context, *query.ListQuery) ([]part, int, error) {
-			return nil, 0, nil
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[part], error) {
+			return &livewire.Page[part]{}, nil
 		},
 		Get: func(context.Context, *query.ListQuery) (*part, error) {
 			return &part{Name: "bolt"}, nil

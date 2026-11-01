@@ -44,8 +44,8 @@ func ExampleRegistry_Add() {
 			},
 			DefaultSort: []query.SortTerm{{Field: "createdAt", Descending: true}},
 			Item:        &livewire.ItemKey{Parameter: "id", Field: "id"},
-			List: func(context.Context, *query.ListQuery) ([]todo, int, error) {
-				return []todo{}, 0, nil // the repository runs listQuery.PageSQL and CountSQL
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[todo], error) {
+				return &livewire.Page[todo]{}, nil // the repository runs postgresadapter.ListPage
 			},
 			Get: func(context.Context, *query.ListQuery) (*todo, error) {
 				return nil, livewire.NotFound()

@@ -77,7 +77,9 @@ func TestResourceDeclarationErrors(t *testing.T) {
 			Versioned: versioned,
 			Read:      authorization.IsUser(),
 			Fields:    query.Fields{{Name: "name", Type: query.TypeString, SQL: "parts.name"}},
-			List:      func(context.Context, *query.ListQuery) ([]withoutID, int, error) { return nil, 0, nil },
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[withoutID], error) {
+				return &livewire.Page[withoutID]{}, nil
+			},
 		})
 	}
 	t.Run("live list without id", func(t *testing.T) {
@@ -94,7 +96,9 @@ func TestResourceDeclarationErrors(t *testing.T) {
 			Tables: []string{"parts"},
 			Read:   authorization.IsUser(),
 			Fields: query.Fields{{Name: "name", Type: query.TypeString, SQL: "parts.name"}},
-			List:   func(context.Context, *query.ListQuery) ([]*withoutID, int, error) { return nil, 0, nil },
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[*withoutID], error) {
+				return &livewire.Page[*withoutID]{}, nil
+			},
 		}))
 		require.ErrorContains(t, err, `no JSON field "id"`)
 	})
@@ -124,9 +128,9 @@ func TestResourceCopiesOptions(t *testing.T) {
 	options.Item.Field = "changed"
 	options.Tables[0] = "changed"
 
-	items, _, err := resource.LoadList(userContext(), &query.ListQuery{})
+	page, err := resource.LoadList(userContext(), &query.ListQuery{})
 	require.NoError(t, err)
-	require.Equal(t, []part{}, items)
+	require.Equal(t, &livewire.Page[part]{Items: []part{}}, page)
 	_, err = resource.LoadItem(userContext(), &query.ListQuery{})
 	require.NoError(t, err)
 	_, err = resource.LoadDistinct(userContext(), "type", &query.ListQuery{})
@@ -384,8 +388,10 @@ func TestResourceItemQuery(t *testing.T) {
 		Read:   authorization.IsUser(),
 		Fields: query.Fields{{Name: "number", Type: query.TypeInteger, SQL: "n.number", Filter: true, Read: authorization.IsAdmin()}},
 		Item:   &livewire.ItemKey{Parameter: "number", Field: "number"},
-		List:   func(context.Context, *query.ListQuery) ([]numbered, int, error) { return nil, 0, nil },
-		Get:    func(context.Context, *query.ListQuery) (*numbered, error) { return &numbered{}, nil },
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[numbered], error) {
+			return &livewire.Page[numbered]{}, nil
+		},
+		Get: func(context.Context, *query.ListQuery) (*numbered, error) { return &numbered{}, nil },
 	})
 	require.NoError(t, addError(t, byNumber))
 	listQuery, err = byNumber.ItemQuery(adminContext(), livewire.MapSource{"number": "42"})
@@ -400,10 +406,9 @@ func TestResourceItemQuery(t *testing.T) {
 
 func TestResourceLoaders(t *testing.T) {
 	resource := newParts(t, partOptions())
-	items, total, err := resource.LoadList(userContext(), &query.ListQuery{})
+	page, err := resource.LoadList(userContext(), &query.ListQuery{})
 	require.NoError(t, err)
-	require.Equal(t, 0, total)
-	require.Equal(t, []part{}, items, "a nil list becomes an empty one")
+	require.Equal(t, &livewire.Page[part]{Items: []part{}}, page, "nil items become an empty list")
 
 	item, err := resource.LoadItem(userContext(), &query.ListQuery{})
 	require.NoError(t, err)
@@ -415,10 +420,15 @@ func TestResourceLoaders(t *testing.T) {
 
 	failing := partOptions()
 	failing.Get = func(context.Context, *query.ListQuery) (*part, error) { return nil, nil } //nolint:nilnil // provokes the no-item-no-error failure
+	failing.List = func(context.Context, *query.ListQuery) (*livewire.Page[part], error) {
+		return nil, nil //nolint:nilnil // provokes the no-page-no-error failure
+	}
 	failing.Distinct = func(context.Context, string, *query.ListQuery) ([]livewire.DistinctValue, error) {
 		return nil, livewire.NotFound()
 	}
 	broken := newParts(t, failing)
+	_, err = broken.LoadList(userContext(), &query.ListQuery{})
+	require.ErrorContains(t, err, "no page and no error")
 	_, err = broken.LoadItem(userContext(), &query.ListQuery{})
 	require.ErrorContains(t, err, "no item and no error")
 	_, err = broken.LoadDistinct(userContext(), "type", &query.ListQuery{})

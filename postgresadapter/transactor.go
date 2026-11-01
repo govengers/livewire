@@ -81,16 +81,10 @@ func (t *Transactor) Begin(ctx context.Context, transactionDetails livewire.Tran
 	if transactionDetails.ReadOnly {
 		options = pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}
 	} else {
-		encoded, err := json.Marshal(actorSetting{
-			Actor:     livewire.OwnerKey(transactionDetails.Identity),
-			RealActor: livewire.OwnerKey(transactionDetails.Identity.Real()),
-			Mutation:  transactionDetails.Mutation,
-			RequestID: transactionDetails.RequestID,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("postgresadapter: encode livewire.actor: %w", err)
+		var err error
+		if actor, err = actorOf(transactionDetails); err != nil {
+			return nil, err
 		}
-		actor = string(encoded)
 	}
 	transaction, err := t.options.Pool.BeginTx(ctx, options)
 	if err != nil {
@@ -104,10 +98,40 @@ func (t *Transactor) Begin(ctx context.Context, transactionDetails livewire.Tran
 	return &engineTransaction{transaction: transaction}, nil
 }
 
+// actorOf is the JSON of livewire.actor for the details of a write.
+func actorOf(transactionDetails livewire.TransactionDetails) (string, error) {
+	encoded, err := json.Marshal(actorSetting{
+		Actor:     livewire.OwnerKey(transactionDetails.Identity),
+		RealActor: livewire.OwnerKey(transactionDetails.Identity.Real()),
+		Mutation:  transactionDetails.Mutation,
+		RequestID: transactionDetails.RequestID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("postgresadapter: encode livewire.actor: %w", err)
+	}
+	return string(encoded), nil
+}
+
 // engineTransaction is the livewire.Transaction of a Transactor: the engine holds it, the
-// unit of work's context holds its queryHandle.
+// unit of work's context holds its queryHandle. It is a livewire.CallDescriber: each call
+// of a batch sets livewire.actor to its own mutation (D58).
 type engineTransaction struct {
 	transaction pgx.Tx
+}
+
+var _ livewire.CallDescriber = (*engineTransaction)(nil)
+
+// DescribeCall sets livewire.actor to the call's details for the rest of the transaction,
+// until the next call's.
+func (t *engineTransaction) DescribeCall(ctx context.Context, transactionDetails livewire.TransactionDetails) error {
+	actor, err := actorOf(transactionDetails)
+	if err != nil {
+		return err
+	}
+	if _, err := t.transaction.Exec(ctx, "SELECT set_config('livewire.actor', $1, true)", actor); err != nil {
+		return fmt.Errorf("postgresadapter: set livewire.actor for the call %s: %w", transactionDetails.Mutation, err)
+	}
+	return nil
 }
 
 func (t *engineTransaction) Commit(ctx context.Context) error {

@@ -46,6 +46,7 @@ type subscription struct {
 
 	mutex         sync.Mutex
 	ended         bool
+	published     bool // the subscribe answered it: its end is reported (OutcomeEnd)
 	resynchronize bool // a resync asked for a snapshot; the next re-run takes it
 	snapshotDue   bool // the next push is a snapshot (lists) or a replace (objects)
 	current       *view
@@ -78,26 +79,29 @@ type view struct {
 var errTenantChanged = &auth.Error{Kind: auth.ErrForbidden, Reason: "the tenant of the subscription changed"}
 
 // subscribe opens a subscription: the response and the first push are queued together, so
-// the wire order is response, first push, then every later change.
-func (s *socket) subscribe(ctx context.Context, frame *RequestFrame) {
+// the wire order is response, first push, then every later change. The op's in-flight slot
+// is released before either is queued.
+func (s *socket) subscribe(ctx context.Context, frame *RequestFrame, release func()) {
 	unit := startUnit(OutcomeSubscribe, OperationSubscribe, frame.Target)
-	opening := &installation{socket: s, frameID: frame.ID, request: readRequestOf(frame)}
+	opening := &installation{socket: s, frameID: frame.ID, request: readRequestOf(frame), release: release}
 	err := s.engine.inSlot(ctx, func() error { return opening.install(ctx) })
 	if opening.subscription != nil {
 		unit.subscription = opening.subscription.id
 	}
 	s.engine.observe(ctx, unit.readOutcome(ctx, opening.resolved, err))
 	if err != nil {
+		release()
 		s.respondError(frame.ID, err)
 	}
 }
 
 // installation carries a subscribe from its frame to the published subscription; resolved
-// and subscription are set as far as it got.
+// and subscription are set as far as it got, release frees the op's in-flight slot.
 type installation struct {
 	socket       *socket
 	frameID      string
 	request      ReadRequest
+	release      func()
 	resolved     *resolvedRead
 	subscription *subscription
 }
@@ -169,11 +173,13 @@ func (i *installation) firstFrames(ctx context.Context) ([][]byte, error) {
 // frames never cross), then starts the re-runs.
 func (i *installation) publish(frames [][]byte) error {
 	liveSubscription := i.subscription
+	i.release()
 	liveSubscription.mutex.Lock()
 	if liveSubscription.ended {
 		liveSubscription.mutex.Unlock()
 		return NotFound()
 	}
+	liveSubscription.published = true
 	withinLimit := i.socket.outbox.enqueue(frames...)
 	liveSubscription.mutex.Unlock()
 	if !withinLimit {
@@ -254,7 +260,8 @@ func isTimeDependent(resolved *resolvedRead) (bool, error) {
 	if resource == nil || resolved.readParameters == nil || len(resolved.readParameters.Filter) == 0 {
 		return false, nil
 	}
-	document, err := query.Parse(resource.Fields(), resolved.readParameters.Filter)
+	fields, _ := resolved.filterScope()
+	document, err := query.Parse(fields, resolved.readParameters.Filter)
 	if err != nil {
 		return false, err
 	}
@@ -274,7 +281,8 @@ func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead, liv
 	if !inline || !hasOwner || store == nil {
 		return "", nil
 	}
-	document, err := query.Parse(resolved.plan.resource.Fields(), parameters.Filter)
+	fields, target := resolved.filterScope()
+	document, err := query.Parse(fields, parameters.Filter)
 	if err != nil {
 		return "", err
 	}
@@ -302,7 +310,7 @@ func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead, liv
 	var stored *StoredFilter
 	err = recovering(func() error {
 		var saveError error
-		stored, saveError = store.Save(ctx, &StoredFilter{Owner: owner, Resource: resolved.request.Target, Document: canonical, Hash: hash})
+		stored, saveError = store.Save(ctx, &StoredFilter{Owner: owner, Resource: target, Document: canonical, Hash: hash})
 		return saveError
 	})
 	if err != nil {
@@ -475,9 +483,9 @@ func (s *subscription) rerunWith(marks rerunMarks) {
 	if s.isOver() {
 		return // ended while a mark was pending: nothing runs for it
 	}
-	unit := startUnit(OutcomeRerun, "", s.request.Target)
+	unit := startUnit(OutcomeRerun, "", s.request.target())
 	unit.subscription = s.id
-	ctx := s.ctx
+	ctx := withQueryWait(s.ctx)
 	identity, err := s.socket.rerunIdentity(ctx)
 	if errors.Is(err, errIdentityGone) {
 		return
@@ -723,7 +731,7 @@ func (s *subscription) markEndedLocked() func() {
 		s.stopRetry()
 		s.stopRetry = nil
 	}
-	filterHash := s.filterHash
+	filterHash, published := s.filterHash, s.published
 	s.filterHash = ""
 	return func() {
 		if s.cancel != nil {
@@ -733,5 +741,16 @@ func (s *subscription) markEndedLocked() func() {
 		if filterHash != "" {
 			s.socket.releaseFilter(filterHash)
 		}
+		if published {
+			s.socket.engine.observe(s.socket.ctx, s.endOutcome())
+		}
+	}
+}
+
+// endOutcome is the OutcomeEnd of the subscription, its target named as the subscribe did.
+func (s *subscription) endOutcome() Outcome {
+	return Outcome{
+		Kind: OutcomeEnd, Operation: OperationSubscribe, Target: s.request.target(), Subscription: s.id,
+		Tenant: s.tenant, Identity: s.socket.lastIdentity(), Status: http.StatusOK,
 	}
 }

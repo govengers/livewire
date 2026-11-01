@@ -13,7 +13,8 @@ import (
 
 // ReadKind says which read of a declaration a request names. On the socket it is the
 // target's suffix after a dot (D46): "parts" is the main read, "parts.item" the item read,
-// "parts.distinct" the distinct read, "parts.presence" the presences on one record.
+// "parts.distinct" the distinct read, "parts.history" the versions of one item,
+// "parts.presence" the presences on one record.
 type ReadKind string
 
 // The read kinds.
@@ -21,6 +22,7 @@ const (
 	ReadMain     ReadKind = ""         // a resource's or list's ListResponse, an object's item
 	ReadItem     ReadKind = "item"     // a resource's item read, keyed by its ItemKey parameter
 	ReadDistinct ReadKind = "distinct" // a resource's distinct read (D15), the `field` parameter names the field
+	ReadHistory  ReadKind = "history"  // a versioned resource's versions of one item (D34), keyed like the item read
 	ReadPresence ReadKind = "presence" // the presences on the record named by the `key` parameter (D37)
 )
 
@@ -38,6 +40,15 @@ type ReadRequest struct {
 	Target string
 	Kind   ReadKind
 	Source ParameterSource
+}
+
+// target is the read as a socket target names it: the declaration's name, then the read kind
+// after a dot unless it is the main read (D46).
+func (r ReadRequest) target() string {
+	if r.Kind == ReadMain {
+		return r.Target
+	}
+	return r.Target + "." + string(r.Kind)
 }
 
 // PresenceItem is one presence as a presence read answers it: the socket that joined, its
@@ -58,7 +69,7 @@ type PresenceItem struct {
 // refusal or failure is the error, answered through ResponseFor. Read reports an
 // OutcomeRequest to the registry's Observer.
 func (e *Engine) Read(ctx context.Context, request ReadRequest) (json.RawMessage, error) {
-	unit := startUnit(OutcomeRequest, "", request.Target)
+	unit := startUnit(OutcomeRequest, "", request.target())
 	resolved, result, err := e.read(ctx, request)
 	e.observe(ctx, unit.readOutcome(ctx, resolved, err))
 	if err != nil {
@@ -112,6 +123,8 @@ func (e *Engine) planRead(request ReadRequest) (*readPlan, error) {
 	case ReadDistinct:
 		readable = plan.resource != nil && plan.resource.DistinctPath() != ""
 		plan.answersList = false
+	case ReadHistory:
+		readable = plan.resource != nil && plan.resource.HistoryPath() != ""
 	case ReadPresence:
 		hasRecordRead := declaration.Kind() == KindObject || (plan.resource != nil && plan.resource.Item() != nil)
 		readable = hasRecordRead && e.options.PresenceStore != nil
@@ -250,11 +263,21 @@ func (e *Engine) resolveStoredFilter(ctx context.Context, resolved *resolvedRead
 	if err != nil {
 		return fmt.Errorf("livewire: the stored filter %q of %s: %w", parameters.FilterID, resolved.request.Target, err)
 	}
-	if stored.Resource != resolved.request.Target {
+	if _, target := resolved.filterScope(); stored.Resource != target {
 		return NotFound()
 	}
 	parameters.Filter = stored.Document
 	return nil
+}
+
+// filterScope is what a read's filter document names and belongs to: the resource's fields
+// and name, or for a history read HistoryFields and "name.history", the target its stored
+// and registered filters are kept under (D13, D56).
+func (r *resolvedRead) filterScope() (query.Fields, string) {
+	if r.plan.kind == ReadHistory {
+		return HistoryFields(), r.request.target()
+	}
+	return r.plan.resource.Fields(), r.request.Target
 }
 
 // load runs a resolved read in a read-only engine transaction (D45). A presence read runs
@@ -314,6 +337,8 @@ func loadDeclaration(ctx context.Context, resolved *resolvedRead) (*readResult, 
 			return loadItem(ctx, declaration, MapSource{declaration.Item().Parameter: resolved.presenceKey})
 		case ReadDistinct:
 			return loadDistinct(ctx, declaration, resolved.readParameters)
+		case ReadHistory:
+			return loadHistory(ctx, declaration, resolved.request.Source, resolved.readParameters)
 		case ReadMain:
 		}
 		return loadPage(ctx, declaration, resolved.readParameters)
@@ -323,7 +348,7 @@ func loadDeclaration(ctx context.Context, resolved *resolvedRead) (*readResult, 
 			return nil, err
 		}
 		count := reflect.ValueOf(items).Len() // the loaders of a List return a slice
-		return pageResult(ctx, declaration.Fields(), items, query.Page{Limit: count}, count)
+		return pageResult(ctx, declaration.Fields(), listAnswer{items: items, limit: count, total: count})
 	case *Object:
 		item, err := declaration.Load(ctx, resolved.parameters)
 		if err != nil {
@@ -368,11 +393,32 @@ func loadPage(ctx context.Context, resource *Resource, parameters *ReadParameter
 	if err != nil {
 		return nil, err
 	}
-	items, total, err := resource.LoadList(ctx, listQuery)
+	page, err := resource.list(ctx, listQuery)
 	if err != nil {
 		return nil, err
 	}
-	return pageResult(ctx, resource.Fields(), items, query.Page{Limit: listQuery.Limit, Offset: listQuery.Offset}, total)
+	items, total, next := page.parts()
+	answer := listAnswer{items: items, limit: listQuery.Limit, offset: listQuery.Offset, total: total}
+	if resource.Cursor() && next != nil {
+		encoded, err := next.Encode()
+		if err != nil {
+			return nil, fmt.Errorf("livewire: encode the next cursor of %q: %w", resource.Name(), err)
+		}
+		answer.next = &encoded
+	}
+	return pageResult(ctx, resource.Fields(), answer)
+}
+
+// listAnswer is what a list read answers before its items are marshaled: the items, the page
+// that was applied, the total, in cursor mode the encoded cursor of the next page, and the
+// redaction of the marshaled items when it is not RedactItems over the read's fields.
+type listAnswer struct {
+	items  any
+	limit  int
+	offset int
+	total  int
+	next   *string
+	redact func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error)
 }
 
 // listBody is ListResponse with the items already marshaled and redacted.
@@ -381,22 +427,29 @@ type listBody struct {
 	Offset int             `json:"offset"`
 	Total  int             `json:"total"`
 	Items  json.RawMessage `json:"items"`
+	Next   *string         `json:"next,omitempty"`
 }
 
-func pageResult(ctx context.Context, fields query.Fields, items any, page query.Page, total int) (*readResult, error) {
-	raw, err := json.Marshal(items)
+func pageResult(ctx context.Context, fields query.Fields, answer listAnswer) (*readResult, error) {
+	raw, err := json.Marshal(answer.items)
 	if err != nil {
 		return nil, fmt.Errorf("livewire: marshal the items: %w", err)
 	}
-	redacted, err := RedactItems(ctx, fields, raw)
+	redact := answer.redact
+	if redact == nil {
+		redact = func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+			return RedactItems(ctx, fields, raw)
+		}
+	}
+	redacted, err := redact(ctx, raw)
 	if err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(listBody{Limit: page.Limit, Offset: page.Offset, Total: total, Items: redacted})
+	payload, err := json.Marshal(listBody{Limit: answer.limit, Offset: answer.offset, Total: answer.total, Items: redacted, Next: answer.next})
 	if err != nil {
 		return nil, fmt.Errorf("livewire: marshal the list: %w", err)
 	}
-	return &readResult{payload: payload, items: redacted, total: total}, nil
+	return &readResult{payload: payload, items: redacted, total: answer.total}, nil
 }
 
 func itemResult(ctx context.Context, fields query.Fields, item any) (*readResult, error) {
@@ -430,7 +483,7 @@ func (e *Engine) loadPresence(ctx context.Context, resolved *resolvedRead) (*rea
 		}
 		items = append(items, PresenceItem{ID: presence.Socket, Display: presence.Display, State: state})
 	}
-	return pageResult(ctx, nil, items, query.Page{Limit: len(items)}, len(items))
+	return pageResult(ctx, nil, listAnswer{items: items, limit: len(items), total: len(items)})
 }
 
 // parseTarget splits a socket target at its first dot: the declaration's name before it, the

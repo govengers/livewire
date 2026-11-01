@@ -41,6 +41,22 @@ func TestPresencesPerSocketBoundsJoins(t *testing.T) {
 	}, frameWait, time.Millisecond, "a closed socket leaves every record")
 }
 
+func TestInFlightSlotIsFreeWhenTheResponseArrives(t *testing.T) {
+	bed := newTestbed(t, func(options *livewire.EngineOptions) { options.InFlightPerSocket = 1 })
+	socket := bed.dial("ada")
+	for index := range 50 {
+		response := socket.do(livewire.OperationQuery, "gadgets", nil, nil)
+		require.True(t, response.OK, "request %d: %+v", index, response.Error)
+	}
+	hold := make(chan struct{})
+	bed.outcomes.holdSubscribe.Store(&hold)
+	subscribed(t, socket.do(livewire.OperationSubscribe, "gadgets", nil, nil)) // its outcome is held after the response
+	next := socket.do(livewire.OperationQuery, "gadgets", nil, nil)
+	bed.outcomes.holdSubscribe.Store(nil)
+	close(hold)
+	require.True(t, next.OK, "the subscribe's slot was free before its response was queued: %+v", next.Error)
+}
+
 func TestInlineFiltersCountLiveSubscriptionsOnly(t *testing.T) {
 	bed := newTestbed(t, func(options *livewire.EngineOptions) { options.SubscriptionsPerSocket = 100 })
 	socket := bed.dial("ada")

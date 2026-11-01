@@ -113,6 +113,19 @@ type stubItem struct {
 
 func stubEngine(t *testing.T) (*Engine, *socket) {
 	t.Helper()
+	return stubEngineWith(t, stubIdentities{})
+}
+
+// failingIdentities fails every re-validation without the identity being gone: the source is
+// down.
+type failingIdentities struct{}
+
+func (failingIdentities) Identify(context.Context, *http.Request) (*auth.Identity, error) {
+	return nil, errors.New("the identity source is down")
+}
+
+func stubEngineWith(t *testing.T, identities IdentitySource) (*Engine, *socket) {
+	t.Helper()
 	registry, err := NewRegistry(nil)
 	require.NoError(t, err)
 	require.NoError(t, registry.Add(NewList("failing", "/failing", &ListOptions[stubItem, NoParameters]{
@@ -121,6 +134,9 @@ func stubEngine(t *testing.T) (*Engine, *socket) {
 		Load: func(context.Context, *NoParameters) ([]stubItem, error) {
 			return nil, errors.New("the database is down")
 		},
+	}), NewMutation("touch", http.MethodPost, "/touch", &MutationOptions[NoParameters, NoBody, stubItem]{
+		Check:  authorization.IsAuthenticated(),
+		Handle: func(context.Context, *NoParameters, *NoBody) (*stubItem, error) { return &stubItem{ID: "touched"}, nil },
 	}), NewObject("board", "/board", &ObjectOptions[stubItem, NoParameters]{
 		Tables: []string{"boards"},
 		Read:   authorization.IsAuthenticated(),
@@ -131,7 +147,7 @@ func stubEngine(t *testing.T) (*Engine, *socket) {
 			return &stubItem{ID: "board"}, nil
 		},
 	})))
-	engine, err := NewEngine(&EngineOptions{Registry: registry, IdentitySource: stubIdentities{}, Transactor: stubTransactor{}, PresenceStore: stubPresences{}, SameHostOnly: true})
+	engine, err := NewEngine(&EngineOptions{Registry: registry, IdentitySource: identities, Transactor: stubTransactor{}, PresenceStore: stubPresences{}, SameHostOnly: true})
 	require.NoError(t, err)
 	identity := &auth.Identity{Provider: "test", Subject: "ada", Active: true}
 	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/live", nil)
@@ -267,4 +283,64 @@ func TestErrorPushIsTheLastSequence(t *testing.T) {
 			require.Less(t, sequence, terminal.Sequence, "attempt %d: a push after the error", attempt)
 		}
 	}
+}
+
+// TestEveryOpFreesItsSlotBeforeItsResponseIsQueued holds the outbox at the moment a response
+// is queued and reads the in-flight count there: a slot released after the response would
+// still count, and a client answering at once would be refused.
+func TestEveryOpFreesItsSlotBeforeItsResponseIsQueued(t *testing.T) {
+	_, clientSocket := stubEngine(t)
+	frames := []*RequestFrame{
+		{ID: "query", Operation: OperationQuery, Target: "board"},
+		{ID: "call", Operation: OperationCall, Target: "touch"},
+		{ID: "batch", Operation: OperationBatch, Body: json.RawMessage(`[{"target":"touch"}]`)},
+		{ID: "refused", Operation: OperationQuery, Target: "nothing"},
+		{ID: "refused subscribe", Operation: OperationSubscribe, Target: "nothing"},
+		{ID: "subscribe", Operation: OperationSubscribe, Target: "board"},
+	}
+	requireSlotsFreeAtResponse(t, clientSocket, frames) // one at a time; the subscribe, whose pushes follow, last
+	_, failing := stubEngineWith(t, failingIdentities{})
+	requireSlotsFreeAtResponse(t, failing, []*RequestFrame{{ID: "failed re-validation", Operation: OperationQuery, Target: "board"}})
+}
+
+// requireSlotsFreeAtResponse starts the frames one at a time and reads the in-flight count
+// when each one's response is queued.
+func requireSlotsFreeAtResponse(t *testing.T, clientSocket *socket, frames []*RequestFrame) {
+	t.Helper()
+	inFlight := make(chan int, 16)
+	clientSocket.outbox.enqueued = func() {
+		clientSocket.mutex.Lock()
+		defer clientSocket.mutex.Unlock()
+		inFlight <- clientSocket.inFlight
+	}
+	for _, frame := range frames {
+		clientSocket.start(frame)
+		select {
+		case count := <-inFlight:
+			require.Zero(t, count, "%s: the slot is free when the response is queued", frame.ID)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: no response was queued", frame.ID)
+		}
+	}
+}
+
+// TestQueryWaitSumsTheWaitForASlot fills every query slot, so a unit waits until its context
+// ends: it reports a wait within the time it was blocked, with no bound on the scheduler.
+func TestQueryWaitSumsTheWaitForASlot(t *testing.T) {
+	engine, _ := stubEngine(t)
+	for range cap(engine.queries) {
+		engine.queries <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(withQueryWait(t.Context()), 20*time.Millisecond)
+	defer cancel()
+	called := time.Now()
+	require.ErrorIs(t, engine.inSlot(ctx, func() error { return nil }), context.DeadlineExceeded, "it waited for a slot until its deadline")
+	blocked := time.Since(called)
+	require.Positive(t, queryWaitOf(ctx))
+	require.LessOrEqual(t, queryWaitOf(ctx), blocked, "the wait is summed while the unit is blocked")
+	for range cap(engine.queries) {
+		<-engine.queries
+	}
+	require.NoError(t, engine.inSlot(withQueryWait(t.Context()), func() error { return nil }), "a free slot is taken at once")
+	require.Zero(t, queryWaitOf(t.Context()), "no sum without withQueryWait")
 }

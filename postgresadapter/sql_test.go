@@ -3,12 +3,14 @@ package postgresadapter_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/govengers/auth"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/postgresadapter"
+	"github.com/govengers/livewire/query"
 )
 
 const quiet = 300 * time.Millisecond
@@ -335,7 +338,7 @@ func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {
 	transactor, err := postgresadapter.NewTransactor(&postgresadapter.TransactorOptions{Pool: database.pool})
 	require.NoError(t, err)
 	identity := &auth.Identity{Provider: "password", Subject: "alice"}
-	entry := &postgresadapter.AuditEntry{
+	entry := &livewire.AuditEntry{
 		Tenant: "north", Identity: identity, Mutation: "createPart", Parameters: map[string]string{"id": "7"},
 		RequestID: "request-1", IdempotencyKey: "0193a8f0-0000-7000-8000-000000000001", Status: 201, Duration: 1500 * time.Millisecond,
 	}
@@ -363,7 +366,7 @@ func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {
 		[]any{tenant, actor, realActor, mutation, requestID, key, status, duration})
 	require.JSONEq(t, `{"id":"7"}`, string(parameters))
 
-	err = store.Write(context.Background(), &postgresadapter.AuditEntry{Parameters: func() {}})
+	err = store.Write(context.Background(), &livewire.AuditEntry{Parameters: func() {}})
 	require.Error(t, err, "parameters that are no JSON are refused")
 }
 
@@ -391,6 +394,13 @@ func TestAMoveBetweenNativePartitionsIsADeleteAndAnInsert(t *testing.T) {
 	versions, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	require.NoError(t, err)
 	require.Equal(t, []string{"insert eu", "delete eu", "insert us"}, versions, "as HistorySQL documents it")
+
+	moved := historyPage(t, database, "orders", id, "")
+	require.Equal(t, 3, moved.Total, "a partition move stays in its life: the row keeps its whole history")
+	require.Equal(t, []livewire.ChangeOperation{livewire.ChangeInsert, livewire.ChangeDelete, livewire.ChangeInsert},
+		[]livewire.ChangeOperation{moved.Items[0].Operation, moved.Items[1].Operation, moved.Items[2].Operation})
+	deletes := historyPage(t, database, "orders", id, `{"where":{"field":"operation","op":"eq","value":"delete"}}`)
+	require.Equal(t, 1, deletes.Total, "the delete of a move is a version the filter reaches")
 }
 
 func TestHistoryClosesTheOldIDOnAnIDChange(t *testing.T) {
@@ -496,14 +506,14 @@ func TestAuditWriteStoresTheIdempotencyKeyCanonically(t *testing.T) {
 	require.NoError(t, err)
 	const key = "0193a8f0-0000-7000-8000-00000000000b"
 	for _, spelling := range []string{"urn:uuid:" + key, "{" + strings.ToUpper(key) + "}", ""} {
-		require.NoError(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", RequestID: spelling, IdempotencyKey: spelling, Status: 201}), spelling)
+		require.NoError(t, store.Write(t.Context(), &livewire.AuditEntry{Mutation: "createPart", RequestID: spelling, IdempotencyKey: spelling, Status: 201}), spelling)
 	}
 	rows, err := database.pool.Query(t.Context(), "SELECT coalesce(idempotency_key::text, 'none') FROM livewire_audit ORDER BY request_id")
 	require.NoError(t, err)
 	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	require.NoError(t, err)
 	require.Equal(t, []string{"none", key, key}, keys)
-	require.Error(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", IdempotencyKey: "nope"}))
+	require.Error(t, store.Write(t.Context(), &livewire.AuditEntry{Mutation: "createPart", IdempotencyKey: "nope"}))
 }
 
 func TestTriggerSQLKeepsNamesThatHoldItsDollarQuote(t *testing.T) {
@@ -562,4 +572,183 @@ func writeConcurrently(t *testing.T, database *testDatabase, statement string, m
 	writers.Wait()
 	require.NoError(t, maintained, "the move and the attach hold against concurrent inserts")
 	require.Empty(t, failures, "no writer failed, the ones queued behind the attach included")
+}
+
+// historyPage reads id's history of table through HistoryPage, filtered by filter ("" for
+// none), oldest first.
+func historyPage(t *testing.T, database *testDatabase, table, id, filter string) *livewire.Page[livewire.Version[map[string]any]] {
+	t.Helper()
+	page, err := readHistoryPage(t.Context(), database, table, id, filter)
+	require.NoError(t, err)
+	return page
+}
+
+func readHistoryPage(ctx context.Context, database *testDatabase, table, id, filter string) (*livewire.Page[livewire.Version[map[string]any]], error) {
+	var document *query.Document
+	if filter != "" {
+		var err error
+		if document, err = query.Parse(livewire.HistoryFields(), []byte(filter)); err != nil {
+			return nil, err
+		}
+	}
+	scope := func(builder *query.Builder) { builder.WriteString("id = ").Argument(id) }
+	listQuery, err := query.Compile(livewire.HistoryFields(), document, []query.SortTerm{{Field: "id"}}, query.Page{Limit: 10}, scope)
+	if err != nil {
+		return nil, err
+	}
+	return postgresadapter.HistoryPage(ctx, database.pool, table, listQuery, func(row []byte) (*map[string]any, error) {
+		var data map[string]any
+		return &data, json.Unmarshal(row, &data)
+	})
+}
+
+// names are the names the versions of a page left.
+func names(page *livewire.Page[livewire.Version[map[string]any]]) []string {
+	result := []string{}
+	for _, version := range page.Items {
+		result = append(result, string(version.Operation)+":"+fmt.Sprint((*version.Data)["name"]))
+	}
+	return result
+}
+
+func TestHistoryLifeStartsWheneverARowArrivesUnderAnID(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	exec := func(statement string, arguments ...any) {
+		t.Helper()
+		_, err := database.pool.Exec(t.Context(), statement, arguments...)
+		require.NoError(t, err)
+	}
+	truncated := uuid.NewString()
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'alices-secret')", truncated)
+	exec("UPDATE parts SET name = 'alices-other' WHERE id = $1", truncated)
+	exec("TRUNCATE parts")
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'mallorys')", truncated)
+	require.Equal(t, []string{"insert:mallorys"}, names(historyPage(t, database, "parts", truncated, "")), "a re-create after a TRUNCATE")
+
+	dead, moving := uuid.NewString(), uuid.NewString()
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'alices-secret')", dead)
+	exec("DELETE FROM parts WHERE id = $1", dead)
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'mallorys')", moving)
+	exec("UPDATE parts SET id = $1 WHERE id = $2", dead, moving)
+	require.Equal(t, []string{"update:mallorys"}, names(historyPage(t, database, "parts", dead, "")), "an id change onto a deleted id")
+
+	away, target := uuid.NewString(), uuid.NewString()
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'alices-secret')", away)
+	exec("UPDATE parts SET id = $1 WHERE id = $2", target, away)
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'mallorys')", away)
+	require.Equal(t, []string{"insert:mallorys"}, names(historyPage(t, database, "parts", away, "")), "an id moved away and re-created")
+	require.Equal(t, []string{"update:alices-secret"}, names(historyPage(t, database, "parts", target, "")), "the new id's history starts at the change")
+}
+
+func TestHistoryPageScopesTheIDBelowTheWindow(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	id := uuid.NewString()
+	_, err := database.pool.Exec(t.Context(), `INSERT INTO parts_history (id, version, operation, data, valid_from, life)
+		SELECT $1, version, 'update', '{"name":"bolt"}', now(), 1 FROM generate_series(1, 500) AS version`, id)
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), "ANALYZE parts_history")
+	require.NoError(t, err)
+	scope := func(builder *query.Builder) { builder.WriteString("id = ").Argument(id) }
+	listQuery, err := query.Compile(livewire.HistoryFields(), nil, []query.SortTerm{{Field: "id"}}, query.Page{Limit: 10}, scope)
+	require.NoError(t, err)
+	specification, scoped := postgresadapter.CurrentLifeQuery("parts", listQuery)
+	pageSQL, pageArguments := scoped.PageSQL(specification)
+	countSQL, countArguments := scoped.CountSQL(specification)
+	for _, statement := range []struct {
+		text      string
+		arguments []any
+	}{{pageSQL, pageArguments}, {countSQL, countArguments}} {
+		var plan []map[string]any
+		require.NoError(t, database.pool.QueryRow(t.Context(), "EXPLAIN (FORMAT JSON) "+statement.text, statement.arguments...).Scan(&plan))
+		root := plan[0]["Plan"].(map[string]any)
+		require.False(t, planHas(root, func(node map[string]any) bool { return node["Parent Relationship"] == "SubPlan" }),
+			"no subquery runs per version: %s", statement.text)
+		window := planFind(root, func(node map[string]any) bool { return node["Node Type"] == "WindowAgg" })
+		require.NotNil(t, window, "the current life is a window: %s", statement.text)
+		require.True(t, planHas(window, restrictsHistoryByID),
+			"the item's id restricts the scan below the window, so a read costs its versions once: %v", window)
+	}
+}
+
+// restrictsHistoryByID reports whether a plan node scans parts_history restricted by id: in
+// its Index Cond, Filter or Recheck Cond (an index or sequential scan, a bitmap heap scan),
+// or in the Index Cond of an index node below it that names no relation (the bitmap index
+// scan of a bitmap heap scan).
+func restrictsHistoryByID(node map[string]any) bool {
+	if node["Relation Name"] != "parts_history" {
+		return false
+	}
+	byID := func(node map[string]any) bool {
+		condition := fmt.Sprint(node["Index Cond"]) + fmt.Sprint(node["Filter"]) + fmt.Sprint(node["Recheck Cond"])
+		return strings.Contains(condition, "id = ")
+	}
+	if byID(node) {
+		return true
+	}
+	children, _ := node["Plans"].([]any)
+	for _, child := range children {
+		if index := child.(map[string]any); index["Relation Name"] == nil && byID(index) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRestrictsHistoryByIDReadsEveryScanShape(t *testing.T) {
+	t.Parallel()
+	shapes := map[string]struct {
+		plan       string
+		restricted bool
+	}{
+		"index scan":      {`{"Node Type":"Index Scan","Relation Name":"parts_history","Index Cond":"(id = $1)"}`, true},
+		"sequential scan": {`{"Node Type":"Seq Scan","Relation Name":"parts_history","Filter":"(id = $1)"}`, true},
+		"bitmap heap scan": {`{"Node Type":"Bitmap Heap Scan","Relation Name":"parts_history","Recheck Cond":"(id = $1)",
+			"Plans":[{"Node Type":"Bitmap Index Scan","Index Name":"parts_history_pkey","Index Cond":"(id = $1)"}]}`, true},
+		"bitmap index scan only": {`{"Node Type":"Bitmap Heap Scan","Relation Name":"parts_history",
+			"Plans":[{"Node Type":"Bitmap Index Scan","Index Name":"parts_history_pkey","Index Cond":"(id = $1)"}]}`, true},
+		"unrestricted scan": {`{"Node Type":"Seq Scan","Relation Name":"parts_history"}`, false},
+		"another relation":  {`{"Node Type":"Index Scan","Relation Name":"parts","Index Cond":"(id = $1)"}`, false},
+	}
+	for name, shape := range shapes {
+		var node map[string]any
+		require.NoError(t, json.Unmarshal([]byte(shape.plan), &node), name)
+		require.Equal(t, shape.restricted, restrictsHistoryByID(node), name)
+	}
+}
+
+// planFind returns the first node of an EXPLAIN (FORMAT JSON) plan that matches, depth first.
+func planFind(node map[string]any, matches func(map[string]any) bool) map[string]any {
+	if matches(node) {
+		return node
+	}
+	children, _ := node["Plans"].([]any)
+	for _, child := range children {
+		if found := planFind(child.(map[string]any), matches); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func planHas(node map[string]any, matches func(map[string]any) bool) bool {
+	return planFind(node, matches) != nil
+}
+
+func TestHistoryLifeStartsOnAnIDChangeAfterADeleteInOneTransaction(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	deleted, changing := uuid.NewString(), uuid.NewString()
+	_, err := database.pool.Exec(t.Context(), "INSERT INTO parts (id, name) VALUES ($1, 'alices-secret'), ($2, 'mallorys')", deleted, changing)
+	require.NoError(t, err)
+	transaction, err := database.pool.Begin(t.Context())
+	require.NoError(t, err)
+	_, err = transaction.Exec(t.Context(), "DELETE FROM parts WHERE id = $1", deleted)
+	require.NoError(t, err)
+	_, err = transaction.Exec(t.Context(), "UPDATE parts SET id = $1 WHERE id = $2", deleted, changing)
+	require.NoError(t, err)
+	require.NoError(t, transaction.Commit(t.Context()))
+	require.Equal(t, []string{"update:mallorys"}, names(historyPage(t, database, "parts", deleted, "")),
+		"an id change onto an id deleted in the same transaction is no partition move")
 }

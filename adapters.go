@@ -110,6 +110,17 @@ type TransactionDetails struct {
 	ReadOnly   bool
 }
 
+// CallDescriber is the optional interface of a Transaction that runs several calls (D58): the
+// engine calls DescribeCall before each call of a batch (D33) with that call's details, so
+// the triggers attribute each call's writes to its own mutation and request id (D34); the
+// postgresadapter sets livewire.actor (actor, real actor, mutation, request id) again (SET
+// LOCAL). The call's parameters reach its audit entry only. Without it a batch's history rows
+// carry the outer transaction's details, whose Mutation is empty. A failing DescribeCall
+// fails the batch.
+type CallDescriber interface {
+	DescribeCall(ctx context.Context, transactionDetails TransactionDetails) error
+}
+
 // Transactor begins an engine transaction (D31, D42). The implementation sets the tenant and,
 // for a write, the actor of transactionDetails (SET LOCAL) before it returns, so triggers and
 // Row Level Security policies see them.
@@ -175,6 +186,34 @@ type IdempotencyStore interface {
 	Record(ctx context.Context, record *IdempotencyRecord) error
 }
 
+// AuditEntry is one mutation call as the action audit of D32 records it: the tenant, the
+// effective identity (its Real() is the real actor), the mutation, its decoded parameters, the
+// request id, the Idempotency-Key ("" for none), the answered status and how long the call
+// took.
+type AuditEntry struct {
+	Tenant         string
+	Identity       *auth.Identity
+	Mutation       string
+	Parameters     any
+	RequestID      string
+	IdempotencyKey string
+	Status         int
+	Duration       time.Duration
+}
+
+// AuditStore keeps the action audit of D32. The engine writes one entry per call whose
+// handler ran: a mutation, an upload and every call of a batch. For a call that commits it
+// writes the entry in the mutation's transaction (TransactionFrom(ctx)) between the handler
+// and the idempotency record, so the entry commits and rolls back with the call (section 7);
+// a failing Write fails the call. For a call that failed it writes the entry after the
+// rollback, without a transaction in ctx and on a context the caller's cancellation does not
+// reach (bounded), so the store writes it on its own: the failed
+// calls of a batch each with the status the batch answered. A refusal before the handler (a
+// check, a decoding, a replayed or in-flight key) writes none.
+type AuditStore interface {
+	Write(ctx context.Context, entry *AuditEntry) error
+}
+
 // Presence is one socket's presence on a target record (D37): the socket, its owner and
 // display name, the target and key that name the record, and the client's state.
 type Presence struct {
@@ -219,14 +258,20 @@ const (
 	OutcomeRevalidate  OutcomeKind = "revalidate"   // a socket's identity re-validated on a tick or a Revalidate call (D6)
 	OutcomeFeed        OutcomeKind = "feed"         // the change feed failed; the engine restarts it after a backoff
 	OutcomeHeartbeat   OutcomeKind = "heartbeat"    // the presence heartbeat and sweep of a tick (D37)
+	OutcomeExport      OutcomeKind = "export"       // one export (D35); Rows is how many rows it wrote
+	OutcomeEnd         OutcomeKind = "end"          // a subscription a subscribe opened ended: unsubscribed, by an error push or with its socket
 )
 
 // Outcome is one unit of work the engine or an adapter finished (D4, D30). Target is the
-// declaration's name; Operation is set on the socket, empty on REST; Subscription is set for
+// declaration's name, with the read kind after a dot for a read other than the main one
+// (D46), "batch" for a batch, "filters" for the stored filter routes, and "" when the request
+// named no declaration (D59); Operation is set on the socket ("other" for an operation the
+// socket does not know), empty on REST; Subscription is set for
 // subscribe and rerun; Tenant is the resolved tenant (D42); Parameters is the decoded
 // parameters value (a *Parameters) when they were decoded; Status is the HTTP status answered
 // (the close code for OutcomeClose); Err is the refusal or failure, with the server-side
-// Reason of an *auth.Error, and nil on success.
+// Reason of an *auth.Error, and nil on success; Rows is the rows an export wrote; QueryWait is
+// how long the unit waited for the engine's query slots (D52), so it is zero on REST.
 type Outcome struct {
 	Kind         OutcomeKind
 	Operation    Operation
@@ -238,6 +283,8 @@ type Outcome struct {
 	Status       int
 	Err          error
 	Duration     time.Duration
+	Rows         int
+	QueryWait    time.Duration
 }
 
 // Observer receives outcomes synchronously with the context of the unit of work. It must
