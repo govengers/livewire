@@ -20,6 +20,16 @@ const (
 	valueFilter
 )
 
+// sortTerms are the terms a sort of the filter vocabulary may name: each sortable field,
+// ascending and with a leading - descending.
+func (r *resourceModel) sortTerms() []string {
+	var terms []string
+	for _, field := range r.sortFields() {
+		terms = append(terms, field, "-"+field)
+	}
+	return terms
+}
+
 // wireParameter is one parameter of a read, mutation, upload or export as the Go client and
 // the CLI send it: a declaration's own or a reserved one (D11-D15, D38), in the order both
 // list them.
@@ -52,10 +62,10 @@ func wireParameters(parameters []parameterModel, reserved reservedModel) []wireP
 	}
 	if reserved.field {
 		fields := reserved.filters.distinctFields()
-		listed = append(listed, wireParameter{name: livewire.ParameterField, kind: valueString, required: true, values: fields, usage: "the field whose values are counted (D15), one of " + strings.Join(fields, ", ")})
+		listed = append(listed, wireParameter{name: livewire.ParameterField, kind: valueString, required: true, values: fields, filters: reserved.filters, usage: "the field whose values are counted (D15), one of " + strings.Join(fields, ", ")})
 	}
 	if reserved.sort {
-		listed = append(listed, wireParameter{name: livewire.ParameterSort, kind: valueList, usage: "sort terms, a leading - descending (" + strings.Join(reserved.filters.sortFields(), ", ") + ")"})
+		listed = append(listed, wireParameter{name: livewire.ParameterSort, kind: valueList, values: reserved.filters.sortTerms(), filters: reserved.filters, usage: "sort terms, a leading - descending (" + strings.Join(reserved.filters.sortFields(), ", ") + ")"})
 	}
 	if reserved.page {
 		listed = append(listed,

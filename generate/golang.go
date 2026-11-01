@@ -111,11 +111,7 @@ func (g *goClient) declareIdentifiers() error {
 		owned = append(owned, ownedNames{[]string{export.queryType, "Export" + pascalCase(export.declaration)}, "the export of " + export.declaration})
 	}
 	for _, resource := range g.filterResources() {
-		names := []string{resource.name + "Field", resource.filterType()}
-		for _, function := range filterFunctions(resource) {
-			names = append(names, function.name)
-		}
-		owned = append(owned, ownedNames{names, "the filter types of " + resource.name})
+		owned = append(owned, ownedNames{filterNames(resource), "the filter types of " + resource.name})
 	}
 	for _, entry := range owned {
 		for _, name := range entry.names {
@@ -125,6 +121,21 @@ func (g *goClient) declareIdentifiers() error {
 		}
 	}
 	return nil
+}
+
+// filterNames are the identifiers of a resource's filter vocabulary.
+func filterNames(resource *resourceModel) []string {
+	names := []string{resource.name + "Field", resource.filterType()}
+	for _, function := range filterFunctions(resource) {
+		names = append(names, function.name)
+	}
+	for _, declared := range filterTypes(resource) {
+		names = append(names, declared.name)
+		for _, constant := range declared.constants {
+			names = append(names, constant.name)
+		}
+	}
+	return names
 }
 
 // ownedNames are the identifiers one declaration takes.
@@ -163,7 +174,7 @@ func (g *goClient) clientFile() ([]byte, error) {
 	source := g.newSource()
 	runtime, livewireAlias := source.file.use(clientPath, "client"), source.file.use(livewirePath, "livewire")
 	context := source.file.use("context", "context")
-	fmt.Fprintf(&source.body, clientPreamble, g.api.basePath, runtime, context, livewireAlias)
+	fmt.Fprintf(&source.body, clientPreamble, basePathOrRoot(g.api.basePath), runtime, context, livewireAlias)
 	for _, read := range g.api.reads {
 		if err := g.read(source, read); err != nil {
 			return nil, err
@@ -264,7 +275,7 @@ func (g *goClient) parametersStruct(source *goSource, name, description string, 
 			usage += "; required"
 		}
 		fmt.Fprintf(&fields, "\t// %s: %s.\n\t%s %s\n", field, usage, field, g.fieldType(source.file, parameter))
-		statements.WriteString(wireStatement(parameter, field))
+		statements.WriteString(wireStatement(runtime, parameter, field))
 	}
 	fmt.Fprintf(&source.body, "\n// %s %s.\ntype %s struct {\n%s}\n", name, description, name, fields.String())
 	fmt.Fprintf(&source.body, "\nfunc (parameters %s) wire() (%s.Parameters, error) {\n\twire := %s.Parameters{}\n%s\treturn wire, nil\n}\n", name, runtime, runtime, statements.String())
@@ -286,11 +297,17 @@ func (g *goClient) fieldType(file *goFile, parameter wireParameter) string {
 	case valueTime:
 		fieldType = file.use("time", "time") + ".Time"
 	case valueList:
+		if parameter.filters != nil {
+			return "[]" + parameter.filters.name + "SortTerm"
+		}
 		return "[]string"
 	case valueFilter:
 		return "*" + parameter.filters.filterType()
 	case valueString:
 		fieldType = "string"
+		if parameter.filters != nil {
+			fieldType = parameter.filters.name + "DistinctField"
+		}
 	}
 	if parameter.pointer {
 		return "*" + fieldType
@@ -298,8 +315,12 @@ func (g *goClient) fieldType(file *goFile, parameter wireParameter) string {
 	return fieldType
 }
 
-func wireStatement(parameter wireParameter, field string) string {
+func wireStatement(runtime string, parameter wireParameter, field string) string {
 	switch {
+	case parameter.kind == valueList && parameter.filters != nil:
+		return fmt.Sprintf("\twire.Set(%q, %s.Strings(parameters.%s))\n", parameter.name, runtime, field)
+	case parameter.kind == valueString && parameter.filters != nil:
+		return fmt.Sprintf("\twire.Set(%q, string(parameters.%s))\n", parameter.name, field)
 	case parameter.kind == valueFilter:
 		return fmt.Sprintf("\tif parameters.%[1]s != nil {\n\t\tif err := wire.SetJSON(%[2]q, parameters.%[1]s); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n", field, parameter.name)
 	case parameter.path:
@@ -556,6 +577,20 @@ func fieldSelector(structType reflect.Type, index []int) (string, bool) {
 	return selector, true
 }
 
+// unmarshalsItself refuses a type that marshals itself without the matching unmarshaler on
+// its pointer.
+func unmarshalsItself(goType reflect.Type, path string) error {
+	pointer := reflect.PointerTo(goType)
+	switch {
+	case implements(goType, jsonMarshalerType, false) && !pointer.Implements(jsonUnmarshalerType):
+		return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalJSON but no UnmarshalJSON", path)
+	case !implements(goType, jsonMarshalerType, false) && !pointer.Implements(jsonUnmarshalerType) && !pointer.Implements(textUnmarshalerType):
+		return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalText but no UnmarshalText", path)
+	default:
+		return nil
+	}
+}
+
 var (
 	jsonUnmarshalerType = reflect.TypeFor[json.Unmarshaler]()
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
@@ -577,18 +612,8 @@ func undecodable(goType reflect.Type, path string, visited map[reflect.Type]bool
 	if goType.Kind() == reflect.Pointer {
 		return undecodable(goType.Elem(), path, visited) // encoding/json allocates and decodes the value
 	}
-	pointer := reflect.PointerTo(goType)
-	switch {
-	case implements(goType, jsonMarshalerType, false):
-		if !pointer.Implements(jsonUnmarshalerType) {
-			return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalJSON but no UnmarshalJSON", path)
-		}
-		return nil
-	case implements(goType, textMarshalerType, false):
-		if !pointer.Implements(jsonUnmarshalerType) && !pointer.Implements(textUnmarshalerType) {
-			return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalText but no UnmarshalText", path)
-		}
-		return nil
+	if marshalsItselfAnyway(goType) {
+		return unmarshalsItself(goType, path)
 	}
 	switch goType.Kind() {
 	case reflect.Pointer, reflect.Slice, reflect.Array:
@@ -654,6 +679,7 @@ func (g *goClient) export(source *goSource, export *exportModel) error {
 // filterFunction is one generated condition builder: a field and one of its operators.
 type filterFunction struct {
 	name     string
+	resource string
 	field    query.Field
 	operator query.Operator
 	operand  *shape
@@ -676,7 +702,7 @@ func filterFunctions(resource *resourceModel) []filterFunction {
 		field, _ := resource.fields.Lookup(member.field)
 		for _, operator := range member.operators {
 			functions = append(functions, filterFunction{
-				name: resource.name + goIdentifier(member.field) + goOperatorNames[operator], field: field, operator: operator, operand: member.operand,
+				name: resource.name + goIdentifier(member.field) + goOperatorNames[operator], resource: resource.name, field: field, operator: operator, operand: member.operand,
 			})
 		}
 	}
@@ -706,6 +732,17 @@ func (g *goClient) resourceFilters(source *goSource, resource *resourceModel) {
 	}
 	fmt.Fprintf(&source.body, "\n// %s is a filter document of %s: its conditions under Where, combined with\n// %s.And, Or and Not; the zero value matches every row.\ntype %s struct {\n\tWhere *%s `json:\"where,omitempty\"`%s\n}\n",
 		resource.filterType(), description, runtime, resource.filterType(), node, search)
+	for _, declared := range filterTypes(resource) {
+		fmt.Fprintf(&source.body, "\n// %s is %s.\ntype %s string\n", declared.name, declared.description, declared.name)
+		if len(declared.constants) == 0 {
+			continue
+		}
+		source.body.WriteString("\n// The values of " + declared.name + ".\nconst (\n")
+		for _, constant := range declared.constants {
+			fmt.Fprintf(&source.body, "\t%s %s = %q\n", constant.name, declared.name, constant.value)
+		}
+		source.body.WriteString(")\n")
+	}
 	for _, function := range filterFunctions(resource) {
 		operandType, argument, value := g.operand(source.file, function)
 		fmt.Fprintf(&source.body, "\n// %s is the condition %s %s.\nfunc %s(%s %s) %s {\n\treturn %s.Condition(%s(%q), %s.Operator%s, %s)\n}\n",
@@ -716,13 +753,63 @@ func (g *goClient) resourceFilters(source *goSource, resource *resourceModel) {
 // operand is the Go type of a condition's operand, its argument name and the value passed
 // on: a list operator takes its values variadic, a flag operator a bool.
 func (g *goClient) operand(file *goFile, function filterFunction) (operandType, argument, value string) {
+	scalar := scalarOperand(file, function.field.Type)
+	if function.field.Type == query.TypeEnum {
+		scalar = function.resource + goIdentifier(function.field.Name)
+	}
 	if function.operand.kind == shapeArray {
-		return "..." + scalarOperand(file, function.field.Type), "values", "values"
+		return "..." + scalar, "values", "values"
 	}
 	if function.operand.kind == shapeBoolean {
 		return "bool", "value", "value"
 	}
-	return scalarOperand(file, function.field.Type), "value", "value"
+	return scalar, "value", "value"
+}
+
+// filterType is a string type the filter document of a resource names, with its values:
+// an enum field's values, the sort terms, the distinct fields.
+type filterType struct {
+	name        string
+	description string
+	constants   []filterConstant
+}
+
+type filterConstant struct {
+	name  string
+	value string
+}
+
+// filterTypes are the typed strings of a resource's filter vocabulary, as filters.ts has
+// them: one per enum field (<Resource><Field>), the sort terms (<Resource>SortTerm) and,
+// except for history, the distinct fields (<Resource>DistinctField).
+func filterTypes(resource *resourceModel) []filterType {
+	var declared []filterType
+	for _, field := range resource.fields {
+		if !field.Filter || field.Type != query.TypeEnum {
+			continue
+		}
+		name := resource.name + goIdentifier(field.Name)
+		enum := filterType{name: name, description: "a value of the enum field " + field.Name}
+		for _, value := range field.Enum {
+			enum.constants = append(enum.constants, filterConstant{name: name + goIdentifier(value), value: value})
+		}
+		declared = append(declared, enum)
+	}
+	sort := filterType{name: resource.name + "SortTerm", description: "a sort term: a sortable field, with a leading - descending"}
+	for _, field := range resource.sortFields() {
+		sort.constants = append(sort.constants,
+			filterConstant{name: resource.name + "Sort" + goIdentifier(field), value: field},
+			filterConstant{name: resource.name + "Sort" + goIdentifier(field) + "Descending", value: "-" + field})
+	}
+	declared = append(declared, sort)
+	if !resource.history {
+		distinct := filterType{name: resource.name + "DistinctField", description: "a field a distinct read counts the values of (D15)"}
+		for _, field := range resource.distinctFields() {
+			distinct.constants = append(distinct.constants, filterConstant{name: resource.name + "Distinct" + goIdentifier(field), value: field})
+		}
+		declared = append(declared, distinct)
+	}
+	return declared
 }
 
 func scalarOperand(file *goFile, fieldType query.FieldType) string {

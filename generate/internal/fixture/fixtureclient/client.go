@@ -71,7 +71,7 @@ type PartsListQuery struct {
 	// FilterID: the id of a stored filter (D13).
 	FilterID string
 	// Sort: sort terms, a leading - descending (id, name, kind, price, createdAt, version).
-	Sort []string
+	Sort []PartsSortTerm
 	// Limit: the page size, clamped to the maximum (D14).
 	Limit int
 	// Offset: the rows to skip.
@@ -88,7 +88,7 @@ func (parameters PartsListQuery) wire() (client.Parameters, error) {
 		}
 	}
 	wire.Set("filterId", parameters.FilterID)
-	wire.Set("sort", parameters.Sort)
+	wire.Set("sort", client.Strings(parameters.Sort))
 	wire.Set("limit", parameters.Limit)
 	wire.Set("offset", parameters.Offset)
 	wire.Set("after", parameters.After)
@@ -160,7 +160,7 @@ type PartsDistinctQuery struct {
 	// FilterID: the id of a stored filter (D13).
 	FilterID string
 	// Field: the field whose values are counted (D15), one of id, name, kind, price, secret, createdAt, version, flag; required.
-	Field string
+	Field PartsDistinctField
 	// Limit: the page size, clamped to the maximum (D14).
 	Limit int
 	// Offset: the rows to skip.
@@ -175,7 +175,7 @@ func (parameters PartsDistinctQuery) wire() (client.Parameters, error) {
 		}
 	}
 	wire.Set("filterId", parameters.FilterID)
-	wire.Set("field", parameters.Field)
+	wire.Set("field", string(parameters.Field))
 	wire.Set("limit", parameters.Limit)
 	wire.Set("offset", parameters.Offset)
 	return wire, nil
@@ -213,7 +213,7 @@ type PartsHistoryQuery struct {
 	// FilterID: the id of a stored filter (D13).
 	FilterID string
 	// Sort: sort terms, a leading - descending (id, validFrom, validTo).
-	Sort []string
+	Sort []HistorySortTerm
 	// Limit: the page size, clamped to the maximum (D14).
 	Limit int
 	// Offset: the rows to skip.
@@ -229,7 +229,7 @@ func (parameters PartsHistoryQuery) wire() (client.Parameters, error) {
 		}
 	}
 	wire.Set("filterId", parameters.FilterID)
-	wire.Set("sort", parameters.Sort)
+	wire.Set("sort", client.Strings(parameters.Sort))
 	wire.Set("limit", parameters.Limit)
 	wire.Set("offset", parameters.Offset)
 	return wire, nil
@@ -300,7 +300,7 @@ type NotesListQuery struct {
 	// FilterID: the id of a stored filter (D13).
 	FilterID string
 	// Sort: sort terms, a leading - descending (id).
-	Sort []string
+	Sort []NotesSortTerm
 	// Limit: the page size, clamped to the maximum (D14).
 	Limit int
 	// Offset: the rows to skip.
@@ -315,7 +315,7 @@ func (parameters NotesListQuery) wire() (client.Parameters, error) {
 		}
 	}
 	wire.Set("filterId", parameters.FilterID)
-	wire.Set("sort", parameters.Sort)
+	wire.Set("sort", client.Strings(parameters.Sort))
 	wire.Set("limit", parameters.Limit)
 	wire.Set("offset", parameters.Offset)
 	return wire, nil
@@ -680,7 +680,7 @@ type PartsExportQuery struct {
 	// FilterID: the id of a stored filter (D13).
 	FilterID string
 	// Sort: sort terms, a leading - descending (id, name, kind, price, createdAt, version).
-	Sort []string
+	Sort []PartsSortTerm
 }
 
 func (parameters PartsExportQuery) wire() (client.Parameters, error) {
@@ -691,7 +691,7 @@ func (parameters PartsExportQuery) wire() (client.Parameters, error) {
 		}
 	}
 	wire.Set("filterId", parameters.FilterID)
-	wire.Set("sort", parameters.Sort)
+	wire.Set("sort", client.Strings(parameters.Sort))
 	return wire, nil
 }
 

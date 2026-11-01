@@ -29,6 +29,15 @@ func (p Parameters) Set(name string, value any) {
 	}
 }
 
+// Strings converts a list of typed strings (generated sort terms) for Set.
+func Strings[Text ~string](values []Text) []string {
+	converted := make([]string, 0, len(values))
+	for _, value := range values {
+		converted = append(converted, string(value))
+	}
+	return converted
+}
+
 // SetPath puts a path parameter under name, its zero value included; the route refuses an
 // empty one.
 func (p Parameters) SetPath(name string, value any) {

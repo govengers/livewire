@@ -47,7 +47,7 @@ func TestGoClientServesEveryRouteKind(t *testing.T) {
 	second, err := user.CreatePart(ctx, fixture.CreatePart{ID: newPartID(), Name: "nut", Kind: fixture.KindNut}, nil)
 	require.NoError(t, err)
 
-	page, err := user.GetParts(ctx, fixtureclient.PartsListQuery{Limit: 1, Sort: []string{"-createdAt"}})
+	page, err := user.GetParts(ctx, fixtureclient.PartsListQuery{Limit: 1, Sort: []fixtureclient.PartsSortTerm{fixtureclient.PartsSortCreatedAtDescending}})
 	require.NoError(t, err)
 	require.Len(t, page.Items, 1)
 	require.Equal(t, 2, page.Total)
@@ -57,7 +57,7 @@ func TestGoClientServesEveryRouteKind(t *testing.T) {
 	require.NotEqual(t, page.Items[0].ID, rest.Items[0].ID)
 
 	filtered, err := user.GetParts(ctx, fixtureclient.PartsListQuery{Filter: &fixtureclient.PartsFilter{
-		Where:  new(client.And(fixtureclient.PartsNameEqual("bolt"), client.Not(fixtureclient.PartsKindIn("nut")), fixtureclient.PartsCreatedAtGreater(client.Relative("-7d")))),
+		Where:  new(client.And(fixtureclient.PartsNameEqual("bolt"), client.Not(fixtureclient.PartsKindIn(fixtureclient.PartsKindNut)), fixtureclient.PartsCreatedAtGreater(client.Relative("-7d")))),
 		Search: "bo",
 	}})
 	require.NoError(t, err, "the typed filter document parses on the server")
@@ -71,7 +71,7 @@ func TestGoClientServesEveryRouteKind(t *testing.T) {
 	_, err = user.GetPartsItem(ctx, fixtureclient.PartsItemParameters{ID: newPartID()})
 	requireRefusal(t, err, http.StatusNotFound, livewire.CodeNotFound)
 
-	distinct, err := user.GetPartsDistinct(ctx, fixtureclient.PartsDistinctQuery{Field: "kind"})
+	distinct, err := user.GetPartsDistinct(ctx, fixtureclient.PartsDistinctQuery{Field: fixtureclient.PartsDistinctKind})
 	require.NoError(t, err)
 	require.Equal(t, []livewire.DistinctValue{{Value: "bolt", Count: 1}, {Value: "nut", Count: 1}}, distinct)
 
@@ -84,7 +84,7 @@ func TestGoClientServesEveryRouteKind(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "user", present.Items[0].Display)
 
-	notes, err := user.GetNotes(ctx, fixtureclient.NotesListQuery{Sort: []string{"id"}})
+	notes, err := user.GetNotes(ctx, fixtureclient.NotesListQuery{Sort: []fixtureclient.NotesSortTerm{fixtureclient.NotesSortID}})
 	require.NoError(t, err)
 	require.Equal(t, "note", notes.Items[0].Text)
 	labels, err := user.GetLabels(ctx)

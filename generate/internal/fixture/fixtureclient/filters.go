@@ -21,6 +21,49 @@ type PartsFilter struct {
 	Search string                   `json:"search,omitempty"`
 }
 
+// PartsKind is a value of the enum field kind.
+type PartsKind string
+
+// The values of PartsKind.
+const (
+	PartsKindBolt PartsKind = "bolt"
+	PartsKindNut  PartsKind = "nut"
+)
+
+// PartsSortTerm is a sort term: a sortable field, with a leading - descending.
+type PartsSortTerm string
+
+// The values of PartsSortTerm.
+const (
+	PartsSortID                  PartsSortTerm = "id"
+	PartsSortIDDescending        PartsSortTerm = "-id"
+	PartsSortName                PartsSortTerm = "name"
+	PartsSortNameDescending      PartsSortTerm = "-name"
+	PartsSortKind                PartsSortTerm = "kind"
+	PartsSortKindDescending      PartsSortTerm = "-kind"
+	PartsSortPrice               PartsSortTerm = "price"
+	PartsSortPriceDescending     PartsSortTerm = "-price"
+	PartsSortCreatedAt           PartsSortTerm = "createdAt"
+	PartsSortCreatedAtDescending PartsSortTerm = "-createdAt"
+	PartsSortVersion             PartsSortTerm = "version"
+	PartsSortVersionDescending   PartsSortTerm = "-version"
+)
+
+// PartsDistinctField is a field a distinct read counts the values of (D15).
+type PartsDistinctField string
+
+// The values of PartsDistinctField.
+const (
+	PartsDistinctID        PartsDistinctField = "id"
+	PartsDistinctName      PartsDistinctField = "name"
+	PartsDistinctKind      PartsDistinctField = "kind"
+	PartsDistinctPrice     PartsDistinctField = "price"
+	PartsDistinctSecret    PartsDistinctField = "secret"
+	PartsDistinctCreatedAt PartsDistinctField = "createdAt"
+	PartsDistinctVersion   PartsDistinctField = "version"
+	PartsDistinctFlag      PartsDistinctField = "flag"
+)
+
 // PartsIDEqual is the condition id eq.
 func PartsIDEqual(value uuid.UUID) client.Node[PartsField] {
 	return client.Condition(PartsField("id"), query.OperatorEqual, value)
@@ -82,22 +125,22 @@ func PartsNameIsNull(value bool) client.Node[PartsField] {
 }
 
 // PartsKindEqual is the condition kind eq.
-func PartsKindEqual(value string) client.Node[PartsField] {
+func PartsKindEqual(value PartsKind) client.Node[PartsField] {
 	return client.Condition(PartsField("kind"), query.OperatorEqual, value)
 }
 
 // PartsKindNotEqual is the condition kind ne.
-func PartsKindNotEqual(value string) client.Node[PartsField] {
+func PartsKindNotEqual(value PartsKind) client.Node[PartsField] {
 	return client.Condition(PartsField("kind"), query.OperatorNotEqual, value)
 }
 
 // PartsKindIn is the condition kind in.
-func PartsKindIn(values ...string) client.Node[PartsField] {
+func PartsKindIn(values ...PartsKind) client.Node[PartsField] {
 	return client.Condition(PartsField("kind"), query.OperatorIn, values)
 }
 
 // PartsKindNotIn is the condition kind notIn.
-func PartsKindNotIn(values ...string) client.Node[PartsField] {
+func PartsKindNotIn(values ...PartsKind) client.Node[PartsField] {
 	return client.Condition(PartsField("kind"), query.OperatorNotIn, values)
 }
 
@@ -320,6 +363,23 @@ type NotesFilter struct {
 	Where *client.Node[NotesField] `json:"where,omitempty"`
 }
 
+// NotesSortTerm is a sort term: a sortable field, with a leading - descending.
+type NotesSortTerm string
+
+// The values of NotesSortTerm.
+const (
+	NotesSortID           NotesSortTerm = "id"
+	NotesSortIDDescending NotesSortTerm = "-id"
+)
+
+// NotesDistinctField is a field a distinct read counts the values of (D15).
+type NotesDistinctField string
+
+// The values of NotesDistinctField.
+const (
+	NotesDistinctID NotesDistinctField = "id"
+)
+
 // NotesIDEqual is the condition id eq.
 func NotesIDEqual(value int64) client.Node[NotesField] {
 	return client.Condition(NotesField("id"), query.OperatorEqual, value)
@@ -374,6 +434,29 @@ type HistoryFilter struct {
 	Where *client.Node[HistoryField] `json:"where,omitempty"`
 }
 
+// HistoryOperation is a value of the enum field operation.
+type HistoryOperation string
+
+// The values of HistoryOperation.
+const (
+	HistoryOperationInsert HistoryOperation = "insert"
+	HistoryOperationUpdate HistoryOperation = "update"
+	HistoryOperationDelete HistoryOperation = "delete"
+)
+
+// HistorySortTerm is a sort term: a sortable field, with a leading - descending.
+type HistorySortTerm string
+
+// The values of HistorySortTerm.
+const (
+	HistorySortID                  HistorySortTerm = "id"
+	HistorySortIDDescending        HistorySortTerm = "-id"
+	HistorySortValidFrom           HistorySortTerm = "validFrom"
+	HistorySortValidFromDescending HistorySortTerm = "-validFrom"
+	HistorySortValidTo             HistorySortTerm = "validTo"
+	HistorySortValidToDescending   HistorySortTerm = "-validTo"
+)
+
 // HistoryIDEqual is the condition id eq.
 func HistoryIDEqual(value int64) client.Node[HistoryField] {
 	return client.Condition(HistoryField("id"), query.OperatorEqual, value)
@@ -420,22 +503,22 @@ func HistoryIDIsNull(value bool) client.Node[HistoryField] {
 }
 
 // HistoryOperationEqual is the condition operation eq.
-func HistoryOperationEqual(value string) client.Node[HistoryField] {
+func HistoryOperationEqual(value HistoryOperation) client.Node[HistoryField] {
 	return client.Condition(HistoryField("operation"), query.OperatorEqual, value)
 }
 
 // HistoryOperationNotEqual is the condition operation ne.
-func HistoryOperationNotEqual(value string) client.Node[HistoryField] {
+func HistoryOperationNotEqual(value HistoryOperation) client.Node[HistoryField] {
 	return client.Condition(HistoryField("operation"), query.OperatorNotEqual, value)
 }
 
 // HistoryOperationIn is the condition operation in.
-func HistoryOperationIn(values ...string) client.Node[HistoryField] {
+func HistoryOperationIn(values ...HistoryOperation) client.Node[HistoryField] {
 	return client.Condition(HistoryField("operation"), query.OperatorIn, values)
 }
 
 // HistoryOperationNotIn is the condition operation notIn.
-func HistoryOperationNotIn(values ...string) client.Node[HistoryField] {
+func HistoryOperationNotIn(values ...HistoryOperation) client.Node[HistoryField] {
 	return client.Condition(HistoryField("operation"), query.OperatorNotIn, values)
 }
 

@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -63,11 +64,35 @@ func TestGeneratedGoCompilesInAnApplicationModule(t *testing.T) {
 	writeFile(t, filepath.Join(directory, "go.mod"), []byte(module))
 	writeFile(t, filepath.Join(directory, "go.sum"), readFile(t, filepath.Join(root, "go.sum")))
 	writeFile(t, filepath.Join(directory, "cmd", "fixture", "main.go"), []byte(compiledMain))
-	for _, arguments := range [][]string{{"mod", "tidy"}, {"build", "./..."}, {"vet", "./..."}} {
+	run := func(arguments ...string) ([]byte, error) {
 		command := exec.CommandContext(t.Context(), goBinary, arguments...)
 		command.Dir = directory
 		command.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod")
-		output, err := command.CombinedOutput()
+		return command.CombinedOutput()
+	}
+	for _, arguments := range [][]string{{"mod", "tidy"}, {"build", "./..."}, {"vet", "./..."}} {
+		output, err := run(arguments...)
 		require.NoError(t, err, "go %v:\n%s", arguments, output)
 	}
+
+	// The filter vocabulary is typed as filters.ts types it: a plain string is no enum value,
+	// no sort term and no distinct field.
+	writeFile(t, filepath.Join(directory, "misuse", "misuse.go"), []byte(compiledMisuse))
+	output, err := run("build", "./misuse")
+	require.Error(t, err, "%s", output)
+	for _, typed := range []string{"PartsKind", "PartsSortTerm", "PartsDistinctField"} {
+		require.Contains(t, string(output), "cannot use text (variable of type string) as fixtureclient."+typed+" value")
+	}
+	require.Equal(t, 3, strings.Count(string(output), "cannot use text"), "%s", output)
 }
+
+const compiledMisuse = `package misuse
+
+import "` + compiledModule + `/fixtureclient"
+
+func Misuse(text string) {
+	_ = fixtureclient.PartsKindEqual(text)
+	_ = fixtureclient.PartsListQuery{Sort: []fixtureclient.PartsSortTerm{text}}
+	_ = fixtureclient.PartsDistinctQuery{Field: text}
+}
+`

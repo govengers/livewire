@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,14 +44,39 @@ const (
 // diagnostic to diagnostics. It answers the exit code.
 func Run(ctx context.Context, arguments []string, input io.Reader, output, diagnostics io.Writer) int {
 	root := Command()
-	root.Reader, root.Writer, root.ErrWriter = input, output, diagnostics
+	locked := &lockedWriter{writer: diagnostics}
+	defer locked.close() // nothing reaches diagnostics after Run returned
+	root.Reader, root.Writer, root.ErrWriter = input, output, locked
 	root.ExitErrHandler = func(context.Context, *cli.Command, error) {}
 	err := root.Run(ctx, arguments)
 	if err == nil {
 		return ExitSuccess
 	}
-	report(diagnostics, err)
+	report(locked, err)
 	return exitCode(err)
+}
+
+// lockedWriter serializes the diagnostics, which the socket loop writes from its own
+// goroutine (a failed connect), and drops what comes after Run returned.
+type lockedWriter struct {
+	mutex  sync.Mutex
+	writer io.Writer
+	closed bool
+}
+
+func (w *lockedWriter) Write(data []byte) (int, error) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	if w.closed {
+		return len(data), nil
+	}
+	return w.writer.Write(data)
+}
+
+func (w *lockedWriter) close() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	w.closed = true
 }
 
 // Command is the root command fixture; Run runs it with the given streams.
@@ -229,6 +255,8 @@ func flagOf(current parameter) cli.Flag {
 
 func checkValue(current parameter, value string) error {
 	switch {
+	case current.required && value == "":
+		return fmt.Errorf("--%s must not be empty", current.flag)
 	case len(current.values) > 0 && !slices.Contains(current.values, value):
 		return fmt.Errorf("--%s must be one of %s", current.flag, strings.Join(current.values, ", "))
 	case current.kind == kindUUID:
@@ -276,7 +304,11 @@ func runtimeOf(command *cli.Command) (*client.Client, error) {
 	case command.String("api-key") == "":
 		return nil, usagef("the API key is required: --api-key or FIXTURE_API_KEY")
 	}
-	runtime, err := client.New(&client.Options{BaseURL: command.String("base-url"), APIKey: command.String("api-key"), SocketURL: command.String("socket-url")})
+	diagnostics := command.Root().ErrWriter
+	runtime, err := client.New(&client.Options{
+		BaseURL: command.String("base-url"), APIKey: command.String("api-key"), SocketURL: command.String("socket-url"),
+		ConnectFailed: func(err error) { _, _ = fmt.Fprintf(diagnostics, "fixture: %v; reconnecting\n", err) },
+	})
 	if err != nil {
 		return nil, &usageError{err: err}
 	}
@@ -314,7 +346,29 @@ func bodyFlag() cli.Flag {
 }
 
 func keyFlag() cli.Flag {
-	return &cli.StringFlag{Name: "idempotency-key", Usage: "the Idempotency-Key (D16; default: a fresh one): repeat it to retry a call safely"}
+	return &cli.StringFlag{Name: "idempotency-key", Usage: "the Idempotency-Key, a UUID (D16; default: a fresh one, shown when the call fails): repeat it to retry a call safely", Validator: func(value string) error {
+		if _, err := uuid.Parse(value); err != nil {
+			return errors.New("--idempotency-key must be a UUID")
+		}
+		return nil
+	}}
+}
+
+// keyOf is the call's Idempotency-Key: the flag's, or a fresh one.
+func keyOf(command *cli.Command) string {
+	if command.IsSet("idempotency-key") {
+		return command.String("idempotency-key")
+	}
+	return client.NewIdempotencyKey()
+}
+
+// failedCall reports a failed call with the key it went out under, so it can be repeated
+// safely, unless the command line named the key itself.
+func failedCall(command *cli.Command, key string, err error) error {
+	if !command.IsSet("idempotency-key") {
+		_, _ = fmt.Fprintf(command.Root().ErrWriter, "fixture: the call went out under the Idempotency-Key %s; repeat it with --idempotency-key %s\n", key, key)
+	}
+	return failed(err)
 }
 
 func readCommand(name, usage, path string, parameters []parameter) *cli.Command {
@@ -343,6 +397,8 @@ func subscribeCommand(name, usage, target string, parameters []parameter) *cli.C
 		if err != nil {
 			return err
 		}
+		ctx, cancel := context.WithCancel(ctx) // the subscription ends with the command, however it returns
+		defer cancel()
 		pushes, err := client.Subscribe[json.RawMessage](ctx, runtime, target, wireOf(command, parameters))
 		if err != nil {
 			return failed(err)
@@ -367,20 +423,25 @@ func exportCommand(name, usage, path string, parameters []parameter) *cli.Comman
 		if err != nil {
 			return err
 		}
-		writer, outputPath := command.Root().Writer, command.String("output")
-		if outputPath != "" {
-			created, err := os.Create(outputPath)
+		outputPath := command.String("output")
+		if outputPath == "" {
+			rows, err := runtime.Export(ctx, path, wireOf(command, parameters), command.Root().Writer)
 			if err != nil {
-				return usagef("--output: %w", err)
+				return failed(err)
 			}
-			defer func() { _ = created.Close() }()
-			writer = created
+			_, _ = fmt.Fprintf(command.Root().ErrWriter, "%d rows\n", rows)
+			return nil
 		}
-		rows, err := runtime.Export(ctx, path, wireOf(command, parameters), writer)
+		created, err := os.Create(outputPath)
 		if err != nil {
-			if outputPath != "" {
-				_ = os.Remove(outputPath)
-			}
+			return usagef("--output: %w", err)
+		}
+		rows, err := runtime.Export(ctx, path, wireOf(command, parameters), created)
+		if closeErr := created.Close(); err == nil && closeErr != nil {
+			err = &failure{err: fmt.Errorf("--output: %w", closeErr)} // a file that did not close is not written
+		}
+		if err != nil {
+			_ = os.Remove(outputPath)
 			return failed(err)
 		}
 		_, _ = fmt.Fprintf(command.Root().ErrWriter, "%d rows\n", rows)
@@ -398,7 +459,7 @@ func callCommand(name, usage, method, path string, body bool, parameters []param
 		if err != nil {
 			return err
 		}
-		call := &client.Call{Method: method, Path: path, Parameters: wireOf(command, parameters), IdempotencyKey: command.String("idempotency-key")}
+		call := &client.Call{Method: method, Path: path, Parameters: wireOf(command, parameters), IdempotencyKey: keyOf(command)}
 		if body {
 			if call.Body, err = bodyOf(command); err != nil {
 				return err
@@ -406,7 +467,7 @@ func callCommand(name, usage, method, path string, body bool, parameters []param
 		}
 		var response json.RawMessage
 		if err := runtime.Call(ctx, call, &response); err != nil {
-			return failed(err)
+			return failedCall(command, call.IdempotencyKey, err)
 		}
 		return writeJSON(command, response)
 	}}
@@ -441,11 +502,11 @@ func uploadCommand(name, usage, path string, contentTypes []string, parameters [
 		if err != nil {
 			return usagef("--file: %w", err)
 		}
-		upload := &client.Upload{Path: path, Parameters: wireOf(command, parameters), IdempotencyKey: command.String("idempotency-key"),
+		upload := &client.Upload{Path: path, Parameters: wireOf(command, parameters), IdempotencyKey: keyOf(command),
 			File: livewire.File{Body: opened, Size: information.Size(), ContentType: declared}}
 		var response json.RawMessage
 		if err := runtime.Upload(ctx, upload, &response); err != nil {
-			return failed(err)
+			return failedCall(command, upload.IdempotencyKey, err)
 		}
 		return writeJSON(command, response)
 	}}
@@ -465,9 +526,10 @@ func batchCommand() *cli.Command {
 		if err := json.Unmarshal(document, &calls); err != nil {
 			return usagef("the body is no array of batch calls: %w", err)
 		}
-		results, err := runtime.Batch(ctx, calls, &client.CallOptions{IdempotencyKey: command.String("idempotency-key")})
+		key := keyOf(command)
+		results, err := runtime.Batch(ctx, calls, &client.CallOptions{IdempotencyKey: key})
 		if err != nil {
-			return failed(err)
+			return failedCall(command, key, err)
 		}
 		encoded, err := json.Marshal(results)
 		if err != nil {
@@ -545,7 +607,7 @@ func partsListQuery() []parameter {
 	return []parameter{
 		{flag: "filter", wire: "filter", kind: kindDocument, usage: "an inline filter document (JSON, D12)"},
 		{flag: "filter-id", wire: "filterId", kind: kindString, usage: "the id of a stored filter (D13)"},
-		{flag: "sort", wire: "sort", kind: kindList, usage: "sort terms, a leading - descending (id, name, kind, price, createdAt, version)"},
+		{flag: "sort", wire: "sort", kind: kindList, values: []string{"id", "-id", "name", "-name", "kind", "-kind", "price", "-price", "createdAt", "-createdAt", "version", "-version"}, usage: "sort terms, a leading - descending (id, name, kind, price, createdAt, version)"},
 		{flag: "limit", wire: "limit", kind: kindInteger, usage: "the page size, clamped to the maximum (D14)"},
 		{flag: "offset", wire: "offset", kind: kindInteger, usage: "the rows to skip"},
 		{flag: "after", wire: "after", kind: kindString, usage: "the next of the previous page (cursor mode, D38)"},
@@ -573,7 +635,7 @@ func partsHistoryQuery() []parameter {
 		{flag: "id", wire: "id", kind: kindUUID, required: true, usage: "path parameter; required"},
 		{flag: "filter", wire: "filter", kind: kindDocument, usage: "an inline filter document (JSON, D12)"},
 		{flag: "filter-id", wire: "filterId", kind: kindString, usage: "the id of a stored filter (D13)"},
-		{flag: "sort", wire: "sort", kind: kindList, usage: "sort terms, a leading - descending (id, validFrom, validTo)"},
+		{flag: "sort", wire: "sort", kind: kindList, values: []string{"id", "-id", "validFrom", "-validFrom", "validTo", "-validTo"}, usage: "sort terms, a leading - descending (id, validFrom, validTo)"},
 		{flag: "limit", wire: "limit", kind: kindInteger, usage: "the page size, clamped to the maximum (D14)"},
 		{flag: "offset", wire: "offset", kind: kindInteger, usage: "the rows to skip"},
 	}
@@ -589,7 +651,7 @@ func partsExportQuery() []parameter {
 	return []parameter{
 		{flag: "filter", wire: "filter", kind: kindDocument, usage: "an inline filter document (JSON, D12)"},
 		{flag: "filter-id", wire: "filterId", kind: kindString, usage: "the id of a stored filter (D13)"},
-		{flag: "sort", wire: "sort", kind: kindList, usage: "sort terms, a leading - descending (id, name, kind, price, createdAt, version)"},
+		{flag: "sort", wire: "sort", kind: kindList, values: []string{"id", "-id", "name", "-name", "kind", "-kind", "price", "-price", "createdAt", "-createdAt", "version", "-version"}, usage: "sort terms, a leading - descending (id, name, kind, price, createdAt, version)"},
 	}
 }
 
@@ -597,7 +659,7 @@ func notesListQuery() []parameter {
 	return []parameter{
 		{flag: "filter", wire: "filter", kind: kindDocument, usage: "an inline filter document (JSON, D12)"},
 		{flag: "filter-id", wire: "filterId", kind: kindString, usage: "the id of a stored filter (D13)"},
-		{flag: "sort", wire: "sort", kind: kindList, usage: "sort terms, a leading - descending (id)"},
+		{flag: "sort", wire: "sort", kind: kindList, values: []string{"id", "-id"}, usage: "sort terms, a leading - descending (id)"},
 		{flag: "limit", wire: "limit", kind: kindInteger, usage: "the page size, clamped to the maximum (D14)"},
 		{flag: "offset", wire: "offset", kind: kindInteger, usage: "the rows to skip"},
 	}

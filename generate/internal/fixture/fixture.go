@@ -70,15 +70,15 @@ type HoldsTextOnly struct {
 	Inner []TextOnly `json:"inner"`
 }
 
-// Primary and Secondary both have the Go field ID; only Primary's is the JSON id.
-type (
-	Primary struct {
-		ID uuid.UUID `json:"id"`
-	}
-	Secondary struct {
-		ID uuid.UUID `json:"otherId"`
-	}
-)
+// Primary carries the JSON id of CreateEmbedded.
+type Primary struct {
+	ID uuid.UUID `json:"id"`
+}
+
+// Secondary has the Go field ID too, under another JSON name.
+type Secondary struct {
+	ID uuid.UUID `json:"otherId"`
+}
 
 // CreateEmbedded is a create body whose JSON id lives in an embedded struct, beside another
 // embedded field ID: the client fills body.Primary.ID.
