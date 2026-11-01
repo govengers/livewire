@@ -3,6 +3,7 @@ package postgresadapter_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -84,6 +85,7 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 				return postgresadapter.WriteCSV(ctx, database.pool, export, writer)
 			},
 		}),
+		versionedParts(database),
 		livewire.NewMutation("importPart", http.MethodPost, "/parts/import", &livewire.MutationOptions[livewire.NoParameters, createPartBody, livePart]{
 			Check: authorization.IsUser(),
 			Handle: func(ctx context.Context, _ *livewire.NoParameters, body *createPartBody) (*livePart, error) {
@@ -143,6 +145,90 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 		return err == nil && listening
 	}, 5*time.Second, 10*time.Millisecond, "the engine's feed listens")
 	return &liveEngine{engine: engine, server: server}
+}
+
+// versionedPart is a part as its history shows it.
+type versionedPart struct {
+	ID      uuid.UUID `json:"id"`
+	Name    string    `json:"name"`
+	Version int       `json:"version"`
+}
+
+// versionedParts reads the parts with their history (D56): the item read by id, the
+// versions through HistoryPage.
+func versionedParts(database *testDatabase) *livewire.Resource {
+	specification := &query.ResourceSQL{From: "parts", IDColumn: "parts.id"}
+	hydrate := func(ctx context.Context, handle postgresadapter.DBTX, rows []postgresadapter.PageRow) (map[uuid.UUID]versionedPart, error) {
+		result, err := handle.Query(ctx, "SELECT id, name, 0 FROM parts WHERE id = ANY($1)", postgresadapter.PageIDs(rows))
+		if err != nil {
+			return nil, err
+		}
+		loaded, err := pgx.CollectRows(result, pgx.RowToStructByPos[versionedPart])
+		parts := map[uuid.UUID]versionedPart{}
+		for _, item := range loaded {
+			parts[item.ID] = item
+		}
+		return parts, err
+	}
+	return livewire.NewResource("versionedParts", "/versioned-parts", &livewire.ResourceOptions[versionedPart]{
+		Tables: []string{"parts"}, Read: authorization.IsUser(), Versioned: true,
+		Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "parts.id", Filter: true, Sort: true}},
+		Item:   &livewire.ItemKey{Parameter: "id", Field: "id"},
+		List: func(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[versionedPart], error) {
+			return postgresadapter.ListPage(ctx, database.pool, specification, listQuery, hydrate)
+		},
+		Get: func(ctx context.Context, listQuery *query.ListQuery) (*versionedPart, error) {
+			page, err := postgresadapter.ListPage(ctx, database.pool, specification, listQuery, hydrate)
+			if err != nil || len(page.Items) == 0 {
+				return nil, errors.Join(err, livewire.NotFound())
+			}
+			return &page.Items[0], nil
+		},
+		History: func(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[versionedPart]], error) {
+			return postgresadapter.HistoryPage(ctx, database.pool, "parts", listQuery, func(row []byte) (*versionedPart, error) {
+				var stored versionedPart
+				return &stored, json.Unmarshal(row, &stored)
+			})
+		},
+	})
+}
+
+func TestEngineReadsAHistoryFromPostgres(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	live := newLiveEngine(t, database)
+	_, payload, err := live.createPart(t, "bolt", uuid.NewString())
+	require.NoError(t, err)
+	var created livePart
+	require.NoError(t, json.Unmarshal(payload, &created))
+	for _, name := range []string{"nut", "screw"} {
+		_, err := database.pool.Exec(t.Context(), "UPDATE parts SET name = $1 WHERE id = $2", name, created.ID)
+		require.NoError(t, err)
+	}
+
+	read := func(parameters livewire.MapSource) livewire.ListResponse[livewire.Version[versionedPart]] {
+		t.Helper()
+		parameters["id"] = created.ID.String()
+		payload, err := live.engine.Read(asAlice(t), livewire.ReadRequest{Target: "versionedParts", Kind: livewire.ReadHistory, Source: parameters})
+		require.NoError(t, err)
+		var history livewire.ListResponse[livewire.Version[versionedPart]]
+		require.NoError(t, json.Unmarshal(payload, &history))
+		return history
+	}
+	all := read(livewire.MapSource{})
+	require.Equal(t, 3, all.Total)
+	require.Equal(t, []int{1, 2, 3}, []int{all.Items[0].ID, all.Items[1].ID, all.Items[2].ID})
+	require.Equal(t, livewire.ChangeInsert, all.Items[0].Operation)
+	require.Equal(t, []string{"password:alice", "createPart"}, []string{all.Items[0].Actor, all.Items[0].Mutation}, "the engine's actor")
+	require.NotNil(t, all.Items[0].ValidTo)
+	require.Nil(t, all.Items[2].ValidTo, "the current version is open")
+	require.Equal(t, "bolt", all.Items[0].Data.Name)
+
+	updates := read(livewire.MapSource{"filter": `{"where":{"field":"operation","op":"eq","value":"update"}}`, "sort": "-id", "offset": "1", "limit": "1"})
+	require.Equal(t, 2, updates.Total, "the filter counts the updates")
+	require.Len(t, updates.Items, 1)
+	require.Equal(t, 2, updates.Items[0].ID, "the second update by version descending")
+	require.Equal(t, "nut", updates.Items[0].Data.Name)
 }
 
 func hydrateLiveParts(ctx context.Context, database postgresadapter.DBTX, rows []postgresadapter.PageRow) (map[uuid.UUID]livePart, error) {
