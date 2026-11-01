@@ -23,12 +23,14 @@ type model struct {
 	exports   []*exportModel
 }
 
-// parameterModel is one parameter of a read, mutation or upload on the wire.
+// parameterModel is one parameter of a read, mutation or upload on the wire; pointer says
+// that its Go field is a pointer, so the Go client sends a set zero value.
 type parameterModel struct {
 	name     string
 	in       livewire.ParameterIn
 	shape    *shape
 	required bool
+	pointer  bool
 }
 
 // reservedModel says which reserved parameters of a filterable read (D11-D15, D35, D38) a
@@ -43,6 +45,8 @@ type reservedModel struct {
 	format  bool
 }
 
+// readModel is one read; item is the Go type of its item (of a list response, a version,
+// or the object), which the Go client imports.
 type readModel struct {
 	declaration string
 	kind        livewire.ReadKind
@@ -51,10 +55,13 @@ type readModel struct {
 	parameters  []parameterModel
 	reserved    reservedModel
 	data        *shape
+	item        reflect.Type
 	list        bool
 	live        bool
 }
 
+// mutationModel is one mutation; requestType and responseType are the Go types of its body
+// and response (nil for none), which the Go client imports.
 type mutationModel struct {
 	name           string
 	method         string
@@ -63,6 +70,8 @@ type mutationModel struct {
 	parameters     []parameterModel
 	body           *shape
 	response       *shape
+	requestType    reflect.Type
+	responseType   reflect.Type
 	status         int
 	effect         livewire.Effect
 	clientID       livewire.ClientIDVersion
@@ -74,6 +83,7 @@ type uploadModel struct {
 	parametersType string
 	parameters     []parameterModel
 	response       *shape
+	responseType   reflect.Type
 	status         int
 	contentTypes   []string
 	maximumBytes   int64
@@ -284,13 +294,13 @@ func (m *model) addResource(resource *livewire.Resource, filters *resourceModel,
 	m.reads = append(m.reads, &readModel{
 		declaration: name, kind: livewire.ReadMain, path: resource.Path(), queryType: pascalCase(name) + "ListQuery",
 		reserved: reservedModel{filters: filters, sort: true, page: true, after: resource.Cursor()},
-		data:     &shape{kind: shapeListResponse, element: item}, list: true, live: live,
+		data:     &shape{kind: shapeListResponse, element: item}, item: resource.ItemType(), list: true, live: live,
 	})
 	key := itemKeyParameter(resource)
 	if key != nil {
 		m.reads = append(m.reads, &readModel{
 			declaration: name, kind: livewire.ReadItem, path: resource.ItemPath(), queryType: pascalCase(name) + "ItemParameters",
-			parameters: []parameterModel{*key}, data: item, live: live,
+			parameters: []parameterModel{*key}, data: item, item: resource.ItemType(), live: live,
 		})
 	}
 	if resource.DistinctPath() != "" {
@@ -301,14 +311,14 @@ func (m *model) addResource(resource *livewire.Resource, filters *resourceModel,
 		m.reads = append(m.reads, &readModel{
 			declaration: name, kind: livewire.ReadDistinct, path: resource.DistinctPath(), queryType: pascalCase(name) + "DistinctQuery",
 			reserved: reservedModel{filters: filters, page: true, field: true},
-			data:     &shape{kind: shapeArray, element: distinct}, live: live,
+			data:     &shape{kind: shapeArray, element: distinct}, item: reflect.TypeFor[livewire.DistinctValue](), live: live,
 		})
 	}
 	if resource.HistoryPath() != "" {
 		m.reads = append(m.reads, &readModel{
 			declaration: name, kind: livewire.ReadHistory, path: resource.HistoryPath(), queryType: pascalCase(name) + "HistoryQuery",
 			parameters: []parameterModel{*key}, reserved: reservedModel{filters: m.history, sort: true, page: true},
-			data: &shape{kind: shapeListResponse, element: &shape{kind: shapeVersion, element: item}}, list: true, live: live,
+			data: &shape{kind: shapeListResponse, element: &shape{kind: shapeVersion, element: item}}, item: resource.ItemType(), list: true, live: live,
 		})
 	}
 	if presence && key != nil {
@@ -366,7 +376,7 @@ func (m *model) addList(list *livewire.List) error {
 	}
 	m.reads = append(m.reads, &readModel{
 		declaration: list.Name(), kind: livewire.ReadMain, path: list.Path(), queryType: pascalCase(list.Name()) + "Parameters",
-		parameters: parameters, data: &shape{kind: shapeListResponse, element: item}, list: true, live: len(list.Tables()) > 0,
+		parameters: parameters, data: &shape{kind: shapeListResponse, element: item}, item: list.ItemType(), list: true, live: len(list.Tables()) > 0,
 	})
 	return nil
 }
@@ -378,7 +388,7 @@ func (m *model) addObject(object *livewire.Object, presence bool) error {
 	}
 	m.reads = append(m.reads, &readModel{
 		declaration: object.Name(), kind: livewire.ReadMain, path: object.Path(), queryType: pascalCase(object.Name()) + "Parameters",
-		parameters: parameters, data: item, live: len(object.Tables()) > 0,
+		parameters: parameters, data: item, item: object.ItemType(), live: len(object.Tables()) > 0,
 	})
 	if !presence {
 		return nil
@@ -408,7 +418,7 @@ func (m *model) addPresence(name, path string, parameters []parameterModel) erro
 	}
 	m.reads = append(m.reads, &readModel{
 		declaration: name, kind: livewire.ReadPresence, path: path, queryType: pascalCase(name) + "PresenceParameters",
-		parameters: merged, data: &shape{kind: shapeListResponse, element: presence}, list: true, live: true,
+		parameters: merged, data: &shape{kind: shapeListResponse, element: presence}, item: reflect.TypeFor[livewire.PresenceItem](), list: true, live: true,
 	})
 	return nil
 }
@@ -420,11 +430,13 @@ func (m *model) addMutation(mutation *livewire.Mutation) error {
 	}
 	var err error
 	if mutation.RequestType() != noBodyType {
+		added.requestType = mutation.RequestType()
 		if added.body, err = m.types.shapeOf(mutation.RequestType(), use{}); err != nil {
 			return err
 		}
 	}
 	if mutation.ResponseType() != noContentType {
+		added.responseType = mutation.ResponseType()
 		if added.response, err = m.types.shapeOf(mutation.ResponseType(), use{}); err != nil {
 			return err
 		}
@@ -440,7 +452,8 @@ func (m *model) addUpload(upload *livewire.Upload) error {
 	}
 	m.uploads = append(m.uploads, &uploadModel{
 		name: upload.Name(), path: upload.Path(), parametersType: pascalCase(upload.Name()) + "Parameters",
-		parameters: m.parametersOf(upload.Parameters()), response: response, status: upload.Status(), contentTypes: upload.ContentTypes(), maximumBytes: upload.MaximumBytes(),
+		parameters: m.parametersOf(upload.Parameters()), response: response, responseType: upload.ResponseType(),
+		status: upload.Status(), contentTypes: upload.ContentTypes(), maximumBytes: upload.MaximumBytes(),
 	})
 	return nil
 }
@@ -455,14 +468,15 @@ func (m *model) parametersOf(parameters []livewire.Parameter) []parameterModel {
 		if parameter.List {
 			scalarType = scalarType.Elem()
 		}
-		if scalarType.Kind() == reflect.Pointer {
+		pointer := scalarType.Kind() == reflect.Pointer
+		if pointer {
 			scalarType = scalarType.Elem()
 		}
 		scalar := m.scalarShape(scalarType, parameter.Enum)
 		if parameter.List {
 			scalar = &shape{kind: shapeArray, element: scalar}
 		}
-		result = append(result, parameterModel{name: parameter.Name, in: parameter.In, shape: scalar, required: parameter.Required()})
+		result = append(result, parameterModel{name: parameter.Name, in: parameter.In, shape: scalar, required: parameter.Required(), pointer: pointer && !parameter.List})
 	}
 	return result
 }

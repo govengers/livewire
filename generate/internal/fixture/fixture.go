@@ -4,6 +4,8 @@ package fixture
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,11 +57,136 @@ type Raw struct{}
 // MarshalJSON writes an empty object.
 func (Raw) MarshalJSON() ([]byte, error) { return []byte("{}"), nil }
 
+// UnmarshalJSON reads what MarshalJSON wrote: a type that marshals itself must unmarshal
+// itself, or the Go client refuses it (D67).
+func (*Raw) UnmarshalJSON([]byte) error { return nil }
+
+// TextOnly marshals itself as text but cannot read it back: the Go client refuses it.
+type TextOnly struct{ value string }
+
+// MarshalText writes the value.
+func (t TextOnly) MarshalText() ([]byte, error) { return []byte(t.value), nil }
+
+// The cases of the Go client's decodability check (D67), as encoding/json decodes them.
+type (
+	// JSONOnly marshals itself but reads nothing back: refused.
+	JSONOnly struct{}
+	// JSONWithText writes a JSON string and reads it back through UnmarshalText: decodes.
+	JSONWithText struct{ value string }
+	// TextString is a string kind with MarshalText: encoding/json reads the text as the string.
+	TextString string
+	// DecodesItself has UnmarshalJSON, so the field it holds is its own business: decodes.
+	DecodesItself struct {
+		Hook fmt.Stringer `json:"hook"`
+	}
+	// EmbedsDecoder decodes through the UnmarshalJSON it promotes.
+	EmbedsDecoder struct {
+		DecodesItself
+	}
+	// PointerCodec marshals and unmarshals through pointer receivers: decodes.
+	PointerCodec struct{ value string }
+	// TextReader is a struct with UnmarshalText only: written as an object, which
+	// UnmarshalText cannot read; refused.
+	TextReader struct {
+		Name string `json:"name"`
+	}
+	// TextKey is a map key that marshals itself as text only: refused as a key.
+	TextKey struct{ value string }
+	// HoldsTextKeys has a map of TextKey keys.
+	HoldsTextKeys struct {
+		Counts map[TextKey]int `json:"counts"`
+	}
+	// HoldsStringer has an interface field with methods, which encoding/json cannot fill.
+	HoldsStringer struct {
+		Hook fmt.Stringer `json:"hook"`
+	}
+)
+
+// MarshalJSON writes a string the struct cannot be read from.
+func (JSONOnly) MarshalJSON() ([]byte, error) { return []byte(`"opaque"`), nil }
+
+// MarshalJSON writes the value as a JSON string.
+func (j JSONWithText) MarshalJSON() ([]byte, error) { return []byte(strconv.Quote(j.value)), nil }
+
+// UnmarshalText reads the string.
+func (j *JSONWithText) UnmarshalText(text []byte) error {
+	j.value = string(text)
+	return nil
+}
+
+// MarshalText writes the string upper-cased.
+func (t TextString) MarshalText() ([]byte, error) { return []byte(strings.ToUpper(string(t))), nil }
+
+// UnmarshalJSON reads anything.
+func (*DecodesItself) UnmarshalJSON([]byte) error { return nil }
+
+// MarshalJSON writes the value.
+func (p *PointerCodec) MarshalJSON() ([]byte, error) { return []byte(strconv.Quote(p.value)), nil }
+
+// UnmarshalJSON reads the value.
+func (p *PointerCodec) UnmarshalJSON(data []byte) error { return json.Unmarshal(data, &p.value) }
+
+// UnmarshalText reads a name.
+func (t *TextReader) UnmarshalText(text []byte) error {
+	t.Name = string(text)
+	return nil
+}
+
+// MarshalText writes the key.
+func (k TextKey) MarshalText() ([]byte, error) { return []byte(k.value), nil }
+
+// HoldsTextOnly reaches TextOnly through a field.
+type HoldsTextOnly struct {
+	Inner []TextOnly `json:"inner"`
+}
+
+// Primary carries the JSON id of CreateEmbedded.
+type Primary struct {
+	ID uuid.UUID `json:"id"`
+}
+
+// Secondary has the Go field ID too, under another JSON name.
+type Secondary struct {
+	ID uuid.UUID `json:"otherId"`
+}
+
+type hiddenBase struct {
+	ID uuid.UUID `json:"id"`
+}
+
+// CreateHidden promotes its JSON id from an unexported embedded struct: the client fills
+// body.ID, which compiles from another package.
+type CreateHidden struct {
+	hiddenBase
+	Name string `json:"name"`
+}
+
+// CreateThroughPointer promotes its id through an embedded pointer, which may be nil: the
+// client refuses to fill it.
+type CreateThroughPointer struct {
+	*Primary
+	Name string `json:"name"`
+}
+
+// CreateEmbedded is a create body whose JSON id lives in an embedded struct, beside another
+// embedded field ID: the client fills body.Primary.ID.
+type CreateEmbedded struct {
+	Primary
+	Secondary
+	Name string `json:"name"`
+}
+
 // Code marshals itself as text.
 type Code struct{ value string }
 
 // MarshalText writes the code.
 func (c Code) MarshalText() ([]byte, error) { return []byte(strings.ToUpper(c.value)), nil }
+
+// UnmarshalText reads the code, so the Go client decodes what the server wrote.
+func (c *Code) UnmarshalText(text []byte) error {
+	c.value = strings.ToLower(string(text))
+	return nil
+}
 
 // Part is the item of the test resource.
 type Part struct {
@@ -107,6 +234,18 @@ type CreatePart struct {
 	ID   uuid.UUID `json:"id,omitzero"`
 	Name string    `json:"name" validate:"required"`
 	Kind Kind      `json:"kind"`
+}
+
+// CreateLabel is a create body whose client id is a named string.
+type CreateLabel struct {
+	ID   Color  `json:"id"`
+	Name string `json:"name"`
+}
+
+// CreateNote is a create body whose client id is a pointer.
+type CreateNote struct {
+	ID   *uuid.UUID `json:"id,omitempty"`
+	Text string     `json:"text"`
 }
 
 // RenamePart is the body of the rename mutation.
