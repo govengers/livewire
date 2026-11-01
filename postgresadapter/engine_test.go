@@ -3,6 +3,7 @@ package postgresadapter_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,10 +73,15 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 			Fields: query.Fields{
 				{Name: "id", Type: query.TypeUUID, SQL: "parts.id", Filter: true, Sort: true},
 				{Name: "name", Type: query.TypeText, SQL: "parts.name", Filter: true, Sort: true},
+				{Name: "tenant", Type: query.TypeString, SQL: "current_setting('livewire.tenant', true)"},
 			},
 			DefaultSort: []query.SortTerm{{Field: "name"}},
 			List: func(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[livePart], error) {
 				return postgresadapter.ListPage(ctx, database.pool, livePartSQL, listQuery, hydrateLiveParts)
+			},
+			Export: func(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error) {
+				export := &postgresadapter.Export{Specification: livePartSQL, Query: listQuery, Columns: columns, ChunkSize: 1}
+				return postgresadapter.WriteCSV(ctx, database.pool, export, writer)
 			},
 		}),
 		livewire.NewMutation("createPart", http.MethodPost, "/parts", &livewire.MutationOptions[livewire.NoParameters, createPartBody, livePart]{
@@ -240,6 +246,23 @@ func TestEngineReadsUnderTheTenantAndReRunsOnNotify(t *testing.T) {
 	require.NoError(t, json.Unmarshal(change.Payload, &listChange))
 	require.Len(t, listChange.Upserts, 1)
 	require.Contains(t, string(listChange.Upserts[0]), added)
+}
+
+func TestEngineExportsCSVInItsReadTransaction(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	live := newLiveEngine(t, database)
+	insertPart(t, database, "bolt")
+	insertPart(t, database, "nut")
+
+	var written strings.Builder
+	rows, err := live.engine.Export(asAlice(t), livewire.ExportRequest{Target: "parts", Source: livewire.MapSource{"sort": "-name"}, Writer: &written})
+	require.NoError(t, err)
+	require.Equal(t, 2, rows, "two chunks of one row")
+	lines := strings.Split(strings.TrimSpace(written.String()), "\n")
+	require.Len(t, lines, 3)
+	require.Equal(t, "id,name,tenant", lines[0])
+	require.True(t, strings.HasSuffix(lines[1], ",nut,north"), "sorted, under the tenant of the engine's transaction: %s", lines[1])
 }
 
 // nextPush reads frames until a push arrives and returns it.

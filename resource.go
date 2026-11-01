@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"slices"
@@ -111,8 +112,11 @@ const (
 // Versioned marks the item as carrying `version` (D34); History, which needs Versioned and
 // an Item key of type uuid, reads one item's versions for the history route (HistoryQuery
 // says what it gets) and the subscription of it re-runs on the resource's Tables, which
-// every version is written with. ExportColumns names the fields an export writes; empty
-// means all. Partition names a subscription's partition (D25); nil means the tenant.
+// every version is written with. Export streams every row under scope, filter and sort to
+// the writer for the export route (D35) and returns how many it wrote: the columns are
+// ExportColumns, or every field, without those whose Read check refuses the caller, and a
+// repository passes them to postgresadapter.WriteCSV. Partition names a subscription's
+// partition (D25); nil means the tenant.
 type ResourceOptions[Item any] struct {
 	Tables          []string
 	Read            authorization.Check
@@ -131,11 +135,13 @@ type ResourceOptions[Item any] struct {
 	Get             func(ctx context.Context, listQuery *query.ListQuery) (*Item, error)
 	Distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
 	History         func(ctx context.Context, listQuery *query.ListQuery) (*Page[Version[Item]], error)
+	Export          func(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error)
 }
 
-// Resource is a filterable list of items with optional item, distinct and history reads. Its
-// routes are GET Path (list), GET ItemPath (one item), GET DistinctPath (distinct values) and
-// GET HistoryPath (one item's versions); all take the reserved parameters.
+// Resource is a filterable list of items with optional item, distinct and history reads and
+// an export. Its routes are GET Path (list), GET ItemPath (one item), GET DistinctPath
+// (distinct values), GET HistoryPath (one item's versions) and GET ExportPath (every row as
+// CSV); all take the reserved parameters.
 type Resource struct {
 	signature
 	liveness
@@ -154,6 +160,7 @@ type Resource struct {
 	get             func(ctx context.Context, listQuery *query.ListQuery) (any, error)
 	distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
 	history         func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error)
+	export          func(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error)
 }
 
 // NewResource declares a filterable resource of Item under path (no placeholders). The
@@ -176,6 +183,7 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 		exportColumns:   slices.Clone(options.ExportColumns),
 		cursor:          options.Cursor,
 		distinct:        options.Distinct,
+		export:          options.Export,
 	}
 	resource.partition = options.Partition
 	if options.Item != nil {
@@ -383,6 +391,9 @@ func (r *Resource) routes() []route {
 	}
 	if r.history != nil {
 		routes = append(routes, route{http.MethodGet, r.HistoryPath()})
+	}
+	if r.export != nil {
+		routes = append(routes, route{http.MethodGet, r.ExportPath()})
 	}
 	return routes
 }

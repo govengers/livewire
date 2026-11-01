@@ -246,6 +246,7 @@ const (
 	OutcomeRevalidate  OutcomeKind = "revalidate"   // a socket's identity re-validated on a tick or a Revalidate call (D6)
 	OutcomeFeed        OutcomeKind = "feed"         // the change feed failed; the engine restarts it after a backoff
 	OutcomeHeartbeat   OutcomeKind = "heartbeat"    // the presence heartbeat and sweep of a tick (D37)
+	OutcomeExport      OutcomeKind = "export"       // one export (D35); Rows is how many rows it wrote
 )
 
 // Outcome is one unit of work the engine or an adapter finished (D4, D30). Target is the
@@ -253,7 +254,7 @@ const (
 // subscribe and rerun; Tenant is the resolved tenant (D42); Parameters is the decoded
 // parameters value (a *Parameters) when they were decoded; Status is the HTTP status answered
 // (the close code for OutcomeClose); Err is the refusal or failure, with the server-side
-// Reason of an *auth.Error, and nil on success.
+// Reason of an *auth.Error, and nil on success; Rows is the rows an export wrote.
 type Outcome struct {
 	Kind         OutcomeKind
 	Operation    Operation
@@ -265,6 +266,7 @@ type Outcome struct {
 	Status       int
 	Err          error
 	Duration     time.Duration
+	Rows         int
 }
 
 // Observer receives outcomes synchronously with the context of the unit of work. It must

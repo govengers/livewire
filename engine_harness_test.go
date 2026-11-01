@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -172,7 +173,8 @@ func (b *testbed) gadgets() *livewire.Resource {
 			items := b.world.sorted("")
 			return &livewire.Page[gadget]{Items: items, Total: len(items)}, nil
 		},
-		Get: b.getGadget,
+		Get:    b.getGadget,
+		Export: b.exportGadgets,
 		Distinct: func(ctx context.Context, field string, _ *query.ListQuery) ([]livewire.DistinctValue, error) {
 			counts := map[string]int{}
 			for _, item := range b.world.sorted("") {
@@ -269,6 +271,31 @@ func (b *testbed) createGadget() *livewire.Mutation {
 			return &item, nil
 		},
 	})
+}
+
+// exportGadgets writes the columns' names, then one line per gadget, as a repository's
+// postgresadapter.WriteCSV would; it fails after the header for the filter on "fail".
+func (b *testbed) exportGadgets(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error) {
+	if transactionOf(ctx) == nil {
+		return 0, errors.New("the export runs outside the read transaction")
+	}
+	names := make([]string, len(columns))
+	for index, column := range columns {
+		names[index] = column.Name
+	}
+	if _, err := fmt.Fprintln(writer, strings.Join(names, ",")); err != nil {
+		return 0, err
+	}
+	if _, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "gadgets", IDColumn: "gadgets.id"}); slices.Contains(arguments, any("fail")) {
+		return 0, errors.New("the database went away")
+	}
+	items := b.world.sorted("")
+	for _, item := range items {
+		if _, err := fmt.Fprintln(writer, item.ID+","+item.Name); err != nil {
+			return 0, err
+		}
+	}
+	return len(items), nil
 }
 
 // getGadget is the item read: the item key travels as the page query's string argument.
