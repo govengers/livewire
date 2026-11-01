@@ -8,9 +8,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
@@ -111,7 +113,9 @@ func walk(t *testing.T, database postgresadapter.DBTX, sort string, limit int) [
 			require.Less(t, len(page.Items), limit)
 			return ids
 		}
-		after, err = query.ParseCursor(partFields, *page.Next)
+		encoded, err := page.Next.Encode()
+		require.NoError(t, err)
+		after, err = query.ParseCursor(partFields, encoded)
 		require.NoError(t, err)
 	}
 }
@@ -256,4 +260,101 @@ func TestWriteCSVStreamsEveryRowInChunks(t *testing.T) {
 		Specification: &query.ResourceSQL{From: "missing", IDColumn: "missing.id"}, Query: compile(t, "", "", query.Page{}), Columns: columns,
 	}, &output)
 	require.Error(t, err)
+}
+
+func TestWriteCSVLeavesOutTheColumnsTheIdentityMayNotRead(t *testing.T) {
+	t.Parallel()
+	database := seedParts(t)
+	refused := 0
+	columns := query.Fields{
+		{Name: "id", SQL: "parts.id"},
+		{Name: "name", SQL: "parts.name", Read: func(context.Context) error { refused++; return errors.New("not for you") }},
+		{Name: "rank", SQL: "parts.rank", Read: func(context.Context) error { return nil }},
+	}
+	var output bytes.Buffer
+	_, err := postgresadapter.WriteCSV(t.Context(), database.pool, &postgresadapter.Export{
+		Specification: partSQL, Query: compile(t, `{"where":{"field":"id","op":"eq","value":"00000000-0000-7000-8000-000000000007"}}`, "", query.Page{}), Columns: columns,
+	}, &output)
+	require.NoError(t, err)
+	records, err := csv.NewReader(&output).ReadAll()
+	require.NoError(t, err)
+	require.Equal(t, [][]string{{"id", "rank"}, {"00000000-0000-7000-8000-000000000007", "1"}}, records, "D39: a refused Read strips the column")
+	require.Equal(t, 1, refused)
+}
+
+func TestListPageRunsInTheEngineTransactionWhateverTheDatabase(t *testing.T) {
+	t.Parallel()
+	database := seedParts(t)
+	single, err := pgxpool.New(t.Context(), database.dsn()+"?pool_max_conns=1") // a second connection would wait forever
+	require.NoError(t, err)
+	t.Cleanup(single.Close)
+	read, err := newTransactor(t, single).Begin(t.Context(), livewire.TransactionDetails{Tenant: "north", ReadOnly: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = read.Rollback(context.Background()) }) // a read transaction; nothing to keep
+	ctx, cancel := context.WithTimeout(livewire.WithTransaction(t.Context(), read.Handle()), 5*time.Second)
+	defer cancel()
+	tenantSQL := &query.ResourceSQL{From: "parts", IDColumn: "parts.id", Derived: []query.DerivedColumn{{Name: "shout", SQL: "current_setting('livewire.tenant', true)"}}}
+
+	page, err := postgresadapter.ListPage(ctx, single, tenantSQL, compile(t, "", "", query.Page{Limit: 1}), hydrateParts)
+	require.NoError(t, err, "the pool's connection is the engine's, held by its transaction")
+	require.Equal(t, "north", page.Items[0].Shout, "the read sees the engine transaction's tenant")
+	values, err := postgresadapter.Distinct(ctx, single, tenantSQL, compile(t, "", "", query.Page{Limit: 5}), query.Field{Name: "tenant", Type: query.TypeText, SQL: "current_setting('livewire.tenant', true)", Filter: true})
+	require.NoError(t, err)
+	require.Equal(t, []livewire.DistinctValue{{Value: "north", Count: seededParts}}, values)
+	var output bytes.Buffer
+	_, err = postgresadapter.WriteCSV(ctx, single, &postgresadapter.Export{
+		Specification: partSQL, Query: compile(t, "", "", query.Page{}), Columns: query.Fields{{Name: "tenant", SQL: "current_setting('livewire.tenant', true)"}}, ChunkSize: 100,
+	}, &output)
+	require.NoError(t, err)
+	require.Equal(t, seededParts, strings.Count(output.String(), "north\n"))
+}
+
+func TestAPanicInsideTheReadGivesTheConnectionBack(t *testing.T) {
+	t.Parallel()
+	database := seedParts(t)
+	pool, err := pgxpool.New(t.Context(), database.dsn())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if pool.Stat().AcquiredConns() == 0 { // a leaked connection would block Close; the drop of the database ends it
+			pool.Close()
+		}
+	})
+	recovered := func(read func()) (value any) {
+		defer func() { value = recover() }()
+		read()
+		return nil
+	}
+
+	require.Equal(t, "hydration panicked", recovered(func() {
+		_, _ = postgresadapter.ListPage(t.Context(), pool, partSQL, compile(t, "", "", query.Page{Limit: 5}),
+			func(context.Context, postgresadapter.DBTX, []postgresadapter.PageRow) (map[uuid.UUID]part, error) {
+				panic("hydration panicked")
+			})
+	}))
+	require.Zero(t, pool.Stat().AcquiredConns(), "the hydration's panic rolled the read back")
+	require.Equal(t, "writer panicked", recovered(func() {
+		_, _ = postgresadapter.WriteCSV(t.Context(), pool, &postgresadapter.Export{Specification: partSQL, Query: compile(t, "", "", query.Page{}), Columns: partFields},
+			panickingWriter{})
+	}))
+	require.Zero(t, pool.Stat().AcquiredConns(), "the writer's panic rolled the export back")
+	var idle int
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction'").Scan(&idle))
+	require.Zero(t, idle)
+}
+
+type panickingWriter struct{}
+
+func (panickingWriter) Write([]byte) (int, error) { panic("writer panicked") }
+
+func TestAnOffsetPageNeedsNoCursorForm(t *testing.T) {
+	t.Parallel()
+	database := seedParts(t)
+	_, err := database.pool.Exec(t.Context(), "UPDATE parts SET due_at = '10000-01-01Z' WHERE id = '00000000-0000-7000-8000-000000000001'")
+	require.NoError(t, err)
+	page, err := postgresadapter.ListPage(t.Context(), database.pool, partSQL, compile(t, `{"where":{"field":"id","op":"eq","value":"00000000-0000-7000-8000-000000000001"}}`, "-dueAt", query.Page{Limit: 1}), hydrateParts)
+	require.NoError(t, err, "an offset list does not encode the cursor of a year-10000 row")
+	require.Len(t, page.Items, 1)
+	require.NotNil(t, page.Next)
+	_, err = page.Next.Encode()
+	require.Error(t, err, "cursor mode, which encodes it, fails")
 }

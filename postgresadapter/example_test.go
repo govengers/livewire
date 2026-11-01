@@ -20,17 +20,33 @@ func Example() {
 		return
 	}
 	defer pool.Close()
-	listener, _ := postgresadapter.NewListener(&postgresadapter.ListenerOptions{DSN: databaseURL})
-	transactor, _ := postgresadapter.NewTransactor(&postgresadapter.TransactorOptions{Pool: pool})
-	filters, _ := postgresadapter.NewFilterStore(&postgresadapter.FilterStoreOptions{Pool: pool})
-	idempotency, _ := postgresadapter.NewIdempotencyStore(&postgresadapter.IdempotencyStoreOptions{Pool: pool})
-	presence, _ := postgresadapter.NewPresenceStore(&postgresadapter.PresenceStoreOptions{Pool: pool})
+	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{DSN: databaseURL})
+	if err != nil {
+		return
+	}
+	transactor, err := postgresadapter.NewTransactor(&postgresadapter.TransactorOptions{Pool: pool})
+	if err != nil {
+		return
+	}
+	filters, err := postgresadapter.NewFilterStore(&postgresadapter.FilterStoreOptions{Pool: pool})
+	if err != nil {
+		return
+	}
+	idempotency, err := postgresadapter.NewIdempotencyStore(&postgresadapter.IdempotencyStoreOptions{Pool: pool})
+	if err != nil {
+		return
+	}
+	presence, err := postgresadapter.NewPresenceStore(&postgresadapter.PresenceStoreOptions{Pool: pool})
+	if err != nil {
+		return
+	}
 	_ = livewire.EngineOptions{
 		ChangeFeed: listener, Transactor: transactor, FilterStore: filters, IdempotencyStore: idempotency, PresenceStore: presence,
 	}
 }
 
-// A resource's List loader: the page on the engine's transaction, hydrated by id.
+// A resource's List loader: the page on the engine's transaction (ListPage prefers it over
+// the pool), hydrated by id; a cursor-mode resource encodes page.Next.
 func ExampleListPage() {
 	type Part struct {
 		ID   uuid.UUID
@@ -55,11 +71,7 @@ func ExampleListPage() {
 	}
 	var pool *pgxpool.Pool // the repository's pool
 	listParts := func(ctx context.Context, listQuery *query.ListQuery) ([]Part, int, error) {
-		database := postgresadapter.TransactionFrom(ctx)
-		if database == nil {
-			database = pool
-		}
-		page, err := postgresadapter.ListPage(ctx, database, partSQL, listQuery, hydrate)
+		page, err := postgresadapter.ListPage(ctx, pool, partSQL, listQuery, hydrate)
 		if err != nil {
 			return nil, 0, err
 		}
