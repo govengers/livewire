@@ -65,7 +65,7 @@ func compileSQL(t *testing.T, raw string) (string, []any) {
 
 func TestErrorText(t *testing.T) {
 	_, err := query.Parse(testFields, []byte(`{"where":{"field":"nope","op":"eq","value":1}}`))
-	require.EqualError(t, err, `invalid_filter: the filter is not valid for this resource (where.field)`, "the text names the path, not the client's value")
+	require.EqualError(t, err, `invalid_filter: the filter is not valid for this resource`, "the text names the code, not the client's keys or values")
 	var queryError *query.Error
 	require.ErrorAs(t, err, &queryError)
 	require.Equal(t, map[string]string{"where.field": `unknown or unfilterable field "nope"`}, queryError.Fields, "the client gets the value through Fields")
