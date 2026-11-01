@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -215,5 +216,47 @@ func TestListenerOptions(t *testing.T) {
 	} {
 		_, err := postgresadapter.NewListener(options)
 		require.Error(t, err, name)
+	}
+}
+
+func TestListenerStartsTheBackoffOverAfterASuccessfulListen(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	const retryInterval = 100 * time.Millisecond
+	var attempts atomic.Int64
+	var pid atomic.Uint32
+	reconnected := make(chan time.Time, 1)
+	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{
+		Connect: func(ctx context.Context) (*pgx.Conn, error) {
+			switch attempts.Add(1) {
+			case 1, 2, 3: // backoff grows to 8 * retryInterval
+				return nil, errors.New("refused")
+			case 4:
+				connection, err := pgx.Connect(ctx, database.dsn())
+				if err == nil {
+					pid.Store(connection.PgConn().PID())
+				}
+				return connection, err
+			default:
+				select {
+				case reconnected <- time.Now():
+				default:
+				}
+				return nil, errors.New("refused again")
+			}
+		},
+		RetryInterval: retryInterval,
+	})
+	require.NoError(t, err)
+	delivered := runListener(t, listener)
+	require.Eventually(t, func() bool { _, resyncs, _ := delivered.snapshot(); return resyncs == 1 }, 5*time.Second, 10*time.Millisecond)
+	terminated := time.Now()
+	_, err = database.pool.Exec(t.Context(), "SELECT pg_terminate_backend($1)", pid.Load())
+	require.NoError(t, err)
+	select {
+	case at := <-reconnected:
+		require.Less(t, at.Sub(terminated), 4*retryInterval, "the delay after a lost connection is the first one again, not 8 times it")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the listener did not reconnect")
 	}
 }

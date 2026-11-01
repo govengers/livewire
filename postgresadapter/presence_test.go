@@ -36,7 +36,9 @@ func TestPresenceNotifiesJoinsChangesAndLeavesButNotHeartbeats(t *testing.T) {
 	presences, err := store.List(t.Context(), "north", "parts", "7")
 	require.NoError(t, err)
 	require.Len(t, presences, 1)
-	require.WithinDuration(t, time.Now(), presences[0].UpdatedAt, time.Minute)
+	var databaseNow time.Time
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT now()").Scan(&databaseNow))
+	require.WithinDuration(t, databaseNow, presences[0].UpdatedAt, time.Minute, "the database clock stamps it")
 	presences[0].UpdatedAt = time.Time{}
 	presence.UpdatedAt = time.Time{}
 	require.JSONEq(t, `{"field":"status"}`, string(presences[0].State))
@@ -73,4 +75,18 @@ func TestPresenceSweepRemovesStalePresences(t *testing.T) {
 
 	_, err = postgresadapter.NewPresenceStore(nil)
 	require.Error(t, err)
+}
+
+func TestPresenceListReturnsAtMostAThousand(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store, err := postgresadapter.NewPresenceStore(&postgresadapter.PresenceStoreOptions{Pool: database.pool})
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), `INSERT INTO livewire_presence (tenant, target, key, socket, owner)
+		SELECT 'north', 'parts', '7', 'socket-' || lpad(n::text, 4, '0'), 'password:alice' FROM generate_series(1, 1001) AS n`)
+	require.NoError(t, err)
+	presences, err := store.List(t.Context(), "north", "parts", "7")
+	require.NoError(t, err)
+	require.Len(t, presences, 1000)
+	require.Equal(t, "socket-1000", presences[999].Socket, "the first thousand by socket")
 }
