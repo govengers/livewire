@@ -31,8 +31,8 @@ var reservedRoutes = map[route]bool{
 	{http.MethodDelete, FiltersPath + "/{}"}: true,
 }
 
-// FilterRequest is the body of POST /filters (D13): the resource the filter is for, the
-// application's context of the dedup key ("" for none), a name ("" for an unnamed filter,
+// FilterRequest is the body of POST /filters (D13): the resource the filter is for (its name,
+// or "name.history" for its history read, D56), the application's context of the dedup key ("" for none), a name ("" for an unnamed filter,
 // which is swept after 30 days without use) and the filter document.
 type FilterRequest struct {
 	Resource string          `json:"resource"`
@@ -54,8 +54,8 @@ type FilterItem struct {
 }
 
 // SaveFilter stores a filter for the caller (POST /filters, D13): body is a FilterRequest
-// (unknown fields refused); the resource must be a registered filterable resource whose
-// static Check passes, the document must parse against its fields and name only fields the
+// (unknown fields refused); the resource must be a registered filterable resource, or
+// "name.history" for its history read over HistoryFields (D56), whose static Check passes, the document must parse against its fields and name only fields the
 // caller may read (D39). The filter is the owner's under the tenant of a resource read
 // (D42). The payload is the stored FilterItem, answered with 201; an unnamed filter the
 // owner stored already for the resource and context is that filter. Without a FilterStore
@@ -75,10 +75,9 @@ func (e *Engine) saveFilter(ctx context.Context, body []byte) (json.RawMessage, 
 	if err := decoder.Decode(&request); err != nil || !atEnd(decoder) {
 		return nil, Owner{}, invalidParameter("body", "must be one JSON object {resource, context, name, filter}")
 	}
-	declaration, _ := e.registry.Lookup(request.Resource)
-	resource, ok := declaration.(*Resource)
-	if !ok {
-		return nil, Owner{}, invalidParameter("resource", "is not a filterable resource")
+	resource, fields, err := e.filterTarget(request.Resource)
+	if err != nil {
+		return nil, Owner{}, err
 	}
 	if err := resource.Check()(ctx); err != nil {
 		return nil, Owner{}, err
@@ -88,7 +87,7 @@ func (e *Engine) saveFilter(ctx context.Context, body []byte) (json.RawMessage, 
 		return nil, owner, err
 	}
 	ctx = WithTenant(ctx, owner.Tenant)
-	filter, err := resource.storedFilter(ctx, owner, &request)
+	filter, err := storedFilter(ctx, owner, fields, &request)
 	if err != nil {
 		return nil, owner, err
 	}
@@ -105,13 +104,29 @@ func (e *Engine) saveFilter(ctx context.Context, body []byte) (json.RawMessage, 
 	return payload, owner, err
 }
 
+// filterTarget resolves the target a stored filter belongs to: a filterable resource's name,
+// or "name.history" for the history read of one with a History loader (D56); it returns the
+// resource and the fields the filter's document names.
+func (e *Engine) filterTarget(target string) (*Resource, query.Fields, error) {
+	name, kind := parseTarget(target)
+	declaration, _ := e.registry.Lookup(name)
+	resource, ok := declaration.(*Resource)
+	switch {
+	case ok && kind == ReadMain:
+		return resource, resource.Fields(), nil
+	case ok && kind == ReadHistory && resource.HistoryPath() != "":
+		return resource, HistoryFields(), nil
+	}
+	return nil, nil, invalidParameter("resource", "is not a filterable resource or the history of one")
+}
+
 // storedFilter is the filter a request stores: its document parsed and checked like a read's
 // (D39), in canonical form with its hash.
-func (r *Resource) storedFilter(ctx context.Context, owner Owner, request *FilterRequest) (*StoredFilter, error) {
+func storedFilter(ctx context.Context, owner Owner, fields query.Fields, request *FilterRequest) (*StoredFilter, error) {
 	if len(bytes.TrimSpace(request.Filter)) == 0 {
 		return nil, invalidParameter(ParameterFilter, "required")
 	}
-	document, err := r.visibleFilter(ctx, request.Filter)
+	document, err := visibleFilter(ctx, fields, request.Filter)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +138,7 @@ func (r *Resource) storedFilter(ctx context.Context, owner Owner, request *Filte
 	if err != nil {
 		return nil, fmt.Errorf("livewire: the hash of a filter: %w", err)
 	}
-	return &StoredFilter{Owner: owner, Resource: r.Name(), Context: request.Context, Name: request.Name, Document: canonical, Hash: hash}, nil
+	return &StoredFilter{Owner: owner, Resource: request.Resource, Context: request.Context, Name: request.Name, Document: canonical, Hash: hash}, nil
 }
 
 // observeFilters reports a filter route's outcome under the owner's tenant.
@@ -133,10 +148,13 @@ func (e *Engine) observeFilters(ctx context.Context, unit unitOfWork, owner Owne
 	e.observe(ctx, outcome)
 }
 
-// ListFilters answers the caller's named filters of a resource, of every resource when
-// resource is "" (GET /filters, D13), as a ListResponse of FilterItem; unnamed filters are
-// registrations and not listed. A resource that is not a registered filterable resource is
-// 400; without a FilterStore it is 404, without an identity 401.
+// ListFilters answers the caller's named filters of a resource (or "name.history"), of every
+// one when resource is "" (GET /filters, D13), as a ListResponse of FilterItem; unnamed
+// filters are registrations and not listed. Every filter is authorized again under the
+// caller as SaveFilter does: one whose resource's static Check refuses the caller now, or
+// whose document names a field the caller may no longer read (D39), is left out. A resource
+// that is not a registered filterable resource is 400; without a FilterStore it is 404,
+// without an identity 401.
 func (e *Engine) ListFilters(ctx context.Context, resource string) (json.RawMessage, error) {
 	unit := startUnit(OutcomeRequest, "", filtersTarget)
 	payload, owner, err := e.listFilters(ctx, resource)
@@ -146,8 +164,8 @@ func (e *Engine) ListFilters(ctx context.Context, resource string) (json.RawMess
 
 func (e *Engine) listFilters(ctx context.Context, resource string) (json.RawMessage, Owner, error) {
 	if resource != "" {
-		if declaration, _ := e.registry.Lookup(resource); declaration == nil || declaration.Kind() != KindResource {
-			return nil, Owner{}, invalidParameter("resource", "is not a filterable resource")
+		if _, _, err := e.filterTarget(resource); err != nil {
+			return nil, Owner{}, err
 		}
 	}
 	owner, store, err := e.filterOwner(ctx)
@@ -165,7 +183,9 @@ func (e *Engine) listFilters(ctx context.Context, resource string) (json.RawMess
 	}
 	items := make([]FilterItem, 0, len(stored))
 	for index := range stored {
-		items = append(items, filterItemOf(&stored[index]))
+		if e.mayUseFilter(WithTenant(ctx, owner.Tenant), &stored[index]) {
+			items = append(items, filterItemOf(&stored[index]))
+		}
 	}
 	payload, err := marshalFilter(ListResponse[FilterItem]{Limit: len(items), Total: len(items), Items: items})
 	return payload, owner, err
@@ -220,14 +240,26 @@ func marshalFilter(value any) (json.RawMessage, error) {
 	return payload, nil
 }
 
-// visibleFilter parses a filter document against the resource's fields and refuses one that
-// names a field the identity in ctx may not read (D39), as a read would.
-func (r *Resource) visibleFilter(ctx context.Context, raw json.RawMessage) (*query.Document, error) {
-	document, err := query.Parse(r.fields, raw)
+// mayUseFilter reports whether the caller in ctx may read with a stored filter now: its
+// target is still registered, the resource's static Check passes and the document names
+// only fields the caller may read.
+func (e *Engine) mayUseFilter(ctx context.Context, stored *StoredFilter) bool {
+	resource, fields, err := e.filterTarget(stored.Resource)
+	if err != nil || recovering(func() error { return resource.Check()(ctx) }) != nil {
+		return false
+	}
+	_, err = visibleFilter(ctx, fields, stored.Document)
+	return err == nil
+}
+
+// visibleFilter parses a filter document against fields and refuses one that names a field
+// the identity in ctx may not read (D39), as a read would.
+func visibleFilter(ctx context.Context, fields query.Fields, raw json.RawMessage) (*query.Document, error) {
+	document, err := query.Parse(fields, raw)
 	if err != nil {
 		return nil, err
 	}
-	visible := r.fields.Visible(ctx)
+	visible := fields.Visible(ctx)
 	for _, name := range document.FieldNames() {
 		if _, ok := visible.Lookup(name); !ok {
 			return nil, ForbiddenField(name)

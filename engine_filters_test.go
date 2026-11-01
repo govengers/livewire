@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -188,4 +189,44 @@ func TestOutcomeTargetsAreAClosedSet(t *testing.T) {
 		Read: authorization.IsUser(),
 		Load: func(context.Context, *livewire.NoParameters) ([]gadget, error) { return nil, nil },
 	})), "reserved")
+}
+
+func TestListedFiltersAreAuthorizedAgain(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	fields := gadgetFields()
+	fields[4].Filter = true // the admin's secret
+	require.NoError(t, registry.Add(livewire.NewResource("secrets", "/secrets", &livewire.ResourceOptions[gadget]{
+		Read: authorization.HasRole(roleReader), Fields: fields,
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[gadget], error) {
+			return &livewire.Page[gadget]{}, nil
+		},
+	})))
+	engine, err := livewire.NewEngine(&livewire.EngineOptions{
+		Registry: registry, IdentitySource: newFakeIdentities(), Transactor: &fakeTransactor{}, FilterStore: newFakeFilters(), SameHostOnly: true,
+	})
+	require.NoError(t, err)
+	save := func(filter string) {
+		_, err := engine.SaveFilter(auth.WithIdentity(t.Context(), admin("ada")), []byte(`{"resource":"secrets","name":"`+filter+`","filter":{"where":{"field":"`+filter+`","op":"eq","value":"sensitive-value"}}}`))
+		require.NoError(t, err)
+	}
+	save("secret")
+	save("name")
+	listed := func(identity *auth.Identity, resource string) []string {
+		payload, err := engine.ListFilters(auth.WithIdentity(t.Context(), identity), resource)
+		require.NoError(t, err)
+		var list livewire.ListResponse[livewire.FilterItem]
+		require.NoError(t, json.Unmarshal(payload, &list))
+		names := []string{}
+		for _, item := range list.Items {
+			names = append(names, item.Name)
+		}
+		slices.Sort(names)
+		return names
+	}
+	for _, resource := range []string{"", "secrets"} {
+		require.Equal(t, []string{"name", "secret"}, listed(admin("ada"), resource))
+		require.Equal(t, []string{"name"}, listed(person("ada", roleReader), resource), "the secret's filter left with the admin role (%q)", resource)
+		require.Empty(t, listed(person("ada"), resource), "no filter of a resource the owner may no longer read (%q)", resource)
+	}
 }
