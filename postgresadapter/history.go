@@ -24,8 +24,10 @@ var historyColumns = []query.DerivedColumn{
 
 // HistoryPage reads one page of an item's versions from table's `<table>_history`
 // (HistorySQL) as a resource's History loader answers it (D34, D56): listQuery is the
-// engine's history query (HistoryFields, scoped to the item's id), read with its page query
-// and its capped count on one snapshot like ListPage, in the engine's transaction inside an
+// engine's history query (HistoryFields, scoped to the item's id), over the versions of the
+// id's current life only, so an item re-created under a deleted id never shows the deleted
+// one's versions; it is read with its page query and its capped count on one snapshot like
+// ListPage, in the engine's transaction inside an
 // engine unit of work. decode maps a version's stored row, the jsonb of the table's columns,
 // to the item's JSON shape. The page has no cursor: a history pages by offset.
 //
@@ -33,7 +35,10 @@ var historyColumns = []query.DerivedColumn{
 //		return postgresadapter.HistoryPage(ctx, r.pool, "parts", listQuery, decodePartRow)
 //	},
 func HistoryPage[Item any](ctx context.Context, database DBTX, table string, listQuery *query.ListQuery, decode func(row []byte) (*Item, error)) (*livewire.Page[livewire.Version[Item]], error) {
-	specification := &query.ResourceSQL{From: identifier(table + historySuffix), IDColumn: "version", Derived: historyColumns}
+	history := identifier(table + historySuffix)
+	currentLife := "(SELECT * FROM " + history + " candidate WHERE candidate.life = (SELECT max(lives.life) FROM " + history +
+		" lives WHERE lives.id = candidate.id)) AS history"
+	specification := &query.ResourceSQL{From: currentLife, IDColumn: "version", Derived: historyColumns}
 	page := &livewire.Page[livewire.Version[Item]]{Items: []livewire.Version[Item]{}}
 	err := inSnapshot(ctx, database, func(database DBTX) error {
 		var err error

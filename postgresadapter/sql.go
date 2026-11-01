@@ -216,6 +216,10 @@ DECLARE
 	row_id uuid := (current_row->>'id')::uuid;
 	next_version integer;
 	stamp timestamptz;
+	last_life integer;
+	last_operation text;
+	last_transaction xid8;
+	current_life integer;
 BEGIN
 	IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = to_jsonb(NEW) THEN
 		RETURN NULL;
@@ -226,11 +230,20 @@ BEGIN
 	END IF;
 	EXECUTE format('SELECT coalesce(max(version), 0) + 1, greatest(clock_timestamp(), max(valid_from), max(valid_to)) FROM %s WHERE id = $1', history)
 		INTO next_version, stamp USING row_id;
+	-- The life of the version: an insert after a delete of another transaction is a new item
+	-- under an old id, so it starts the next life; a delete and an insert of one transaction (a
+	-- partition move) and every update stay in the life they continue.
+	EXECUTE format('SELECT life, operation, transaction_id FROM %s WHERE id = $1 ORDER BY version DESC LIMIT 1', history)
+		INTO last_life, last_operation, last_transaction USING row_id;
+	current_life := coalesce(last_life, 1);
+	IF TG_OP = 'INSERT' AND last_operation = 'delete' AND last_transaction <> pg_current_xact_id() THEN
+		current_life := last_life + 1;
+	END IF;
 	EXECUTE format('UPDATE %s SET valid_to = $2 WHERE id = $1 AND valid_to IS NULL', history) USING row_id, stamp;
-	EXECUTE format('INSERT INTO %s (id, version, operation, data, valid_from, valid_to, actor, real_actor, mutation, request_id)
-		VALUES ($1, $2, $3, $4, $9, CASE WHEN $3 = ''delete'' THEN $9 END, $5, $6, $7, $8)', history)
+	EXECUTE format('INSERT INTO %s (id, version, operation, data, valid_from, valid_to, actor, real_actor, mutation, request_id, life)
+		VALUES ($1, $2, $3, $4, $9, CASE WHEN $3 = ''delete'' THEN $9 END, $5, $6, $7, $8, $10)', history)
 		USING row_id, next_version, lower(TG_OP), current_row,
-			actor->>'actor', actor->>'realActor', actor->>'mutation', actor->>'requestId', stamp;
+			actor->>'actor', actor->>'realActor', actor->>'mutation', actor->>'requestId', stamp, current_life;
 	RETURN NULL;
 END
 $$;
@@ -251,6 +264,14 @@ $$;
 // created or replaced with it. Applications only insert into history through the trigger;
 // the trigger itself closes the previous version. A table name whose `_history` would pass
 // PostgreSQL's 63 bytes is refused.
+//
+// Every version carries the life of its id (life, from 1) and the transaction that wrote it
+// (transaction_id): an insert after a delete written by another transaction is a new item
+// under an old id (a ClientID create, D18) and starts the next life; every other version
+// continues the life of the one before, so a partition move (a delete and an insert in one
+// transaction) and an id change keep a row's history whole. A delete and a re-create of one
+// id inside one transaction cannot be told from a move and stay one life. HistoryPage reads
+// the current life only (D56).
 func HistorySQL(table string) (string, error) {
 	if len(table)+len(historySuffix) > maximumIdentifierBytes {
 		return "", fmt.Errorf("postgresadapter: HistorySQL(%q): %q is longer than PostgreSQL's %d bytes", table, table+historySuffix, maximumIdentifierBytes)
@@ -266,6 +287,8 @@ func HistorySQL(table string) (string, error) {
 	real_actor text,
 	mutation text,
 	request_id text,
+	life integer NOT NULL,
+	transaction_id xid8 NOT NULL DEFAULT pg_current_xact_id(),
 	PRIMARY KEY (id, version)
 );
 CREATE OR REPLACE TRIGGER livewire_history AFTER INSERT OR UPDATE OR DELETE ON ` + identifier(table) + `

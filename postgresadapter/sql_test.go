@@ -16,6 +16,7 @@ import (
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/postgresadapter"
+	"github.com/govengers/livewire/query"
 )
 
 const quiet = 300 * time.Millisecond
@@ -391,6 +392,30 @@ func TestAMoveBetweenNativePartitionsIsADeleteAndAnInsert(t *testing.T) {
 	versions, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	require.NoError(t, err)
 	require.Equal(t, []string{"insert eu", "delete eu", "insert us"}, versions, "as HistorySQL documents it")
+
+	historyOf := func(filter string) *livewire.Page[livewire.Version[map[string]any]] {
+		t.Helper()
+		var document *query.Document
+		if filter != "" {
+			document, err = query.Parse(livewire.HistoryFields(), []byte(filter))
+			require.NoError(t, err)
+		}
+		scope := func(builder *query.Builder) { builder.WriteString("id = ").Argument(id) }
+		listQuery, err := query.Compile(livewire.HistoryFields(), document, []query.SortTerm{{Field: "id"}}, query.Page{Limit: 10}, scope)
+		require.NoError(t, err)
+		page, err := postgresadapter.HistoryPage(t.Context(), database.pool, "orders", listQuery, func(row []byte) (*map[string]any, error) {
+			var data map[string]any
+			return &data, json.Unmarshal(row, &data)
+		})
+		require.NoError(t, err)
+		return page
+	}
+	moved := historyOf("")
+	require.Equal(t, 3, moved.Total, "a partition move stays in its life: the row keeps its whole history")
+	require.Equal(t, []livewire.ChangeOperation{livewire.ChangeInsert, livewire.ChangeDelete, livewire.ChangeInsert},
+		[]livewire.ChangeOperation{moved.Items[0].Operation, moved.Items[1].Operation, moved.Items[2].Operation})
+	deletes := historyOf(`{"where":{"field":"operation","op":"eq","value":"delete"}}`)
+	require.Equal(t, 1, deletes.Total, "the delete of a move is a version the filter reaches")
 }
 
 func TestHistoryClosesTheOldIDOnAnIDChange(t *testing.T) {

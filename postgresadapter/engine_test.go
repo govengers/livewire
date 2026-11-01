@@ -86,6 +86,13 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 			},
 		}),
 		versionedParts(database),
+		livewire.NewMutation("restorePart", http.MethodPost, "/versioned-parts", &livewire.MutationOptions[livewire.NoParameters, restorePartBody, versionedPart]{
+			Check: authorization.IsUser(), ClientID: livewire.UUIDv7,
+			Handle: func(ctx context.Context, _ *livewire.NoParameters, body *restorePartBody) (*versionedPart, error) {
+				_, err := postgresadapter.TransactionFrom(ctx).Exec(ctx, "INSERT INTO parts (id, name) VALUES ($1, $2)", body.ID, body.Name)
+				return &versionedPart{ID: body.ID, Name: body.Name}, err
+			},
+		}),
 		livewire.NewMutation("importPart", http.MethodPost, "/parts/import", &livewire.MutationOptions[livewire.NoParameters, createPartBody, livePart]{
 			Check: authorization.IsUser(),
 			Handle: func(ctx context.Context, _ *livewire.NoParameters, body *createPartBody) (*livePart, error) {
@@ -145,6 +152,12 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 		return err == nil && listening
 	}, 5*time.Second, 10*time.Millisecond, "the engine's feed listens")
 	return &liveEngine{engine: engine, server: server}
+}
+
+// restorePartBody creates a part under an id the client chose (D18).
+type restorePartBody struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
 }
 
 // versionedPart is a part as its history shows it.
@@ -229,6 +242,33 @@ func TestEngineReadsAHistoryFromPostgres(t *testing.T) {
 	require.Len(t, updates.Items, 1)
 	require.Equal(t, 2, updates.Items[0].ID, "the second update by version descending")
 	require.Equal(t, "nut", updates.Items[0].Data.Name)
+}
+
+func TestEngineHistoryOfAReCreatedIDIsItsOwn(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	live := newLiveEngine(t, database)
+	_, payload, err := live.createPart(t, "alices-secret", uuid.NewString())
+	require.NoError(t, err)
+	var deleted livePart
+	require.NoError(t, json.Unmarshal(payload, &deleted))
+	_, err = database.pool.Exec(t.Context(), "UPDATE parts SET name = 'alices-other-secret' WHERE id = $1", deleted.ID)
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), "DELETE FROM parts WHERE id = $1", deleted.ID)
+	require.NoError(t, err)
+
+	body := []byte(`{"id":"` + deleted.ID.String() + `","name":"mallorys"}`)
+	_, _, err = live.engine.Call(asAlice(t), livewire.CallRequest{Target: "restorePart", Source: livewire.MapSource{}, Body: body})
+	require.NoError(t, err, "a ClientID create re-uses the deleted id")
+	read, err := live.engine.Read(asAlice(t), livewire.ReadRequest{Target: "versionedParts", Kind: livewire.ReadHistory, Source: livewire.MapSource{"id": deleted.ID.String()}})
+	require.NoError(t, err)
+	var history livewire.ListResponse[livewire.Version[versionedPart]]
+	require.NoError(t, json.Unmarshal(read, &history))
+	require.Equal(t, 1, history.Total, "the re-created item's history is its own life only")
+	require.Len(t, history.Items, 1)
+	require.Equal(t, "mallorys", history.Items[0].Data.Name)
+	require.NotContains(t, string(read), "alices-")
+	require.Equal(t, 4, history.Items[0].ID, "versions count on across lives; the life bounds the read")
 }
 
 func hydrateLiveParts(ctx context.Context, database postgresadapter.DBTX, rows []postgresadapter.PageRow) (map[uuid.UUID]livePart, error) {
