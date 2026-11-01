@@ -368,11 +368,13 @@ func (s *typeSet) objectShape(structType reflect.Type, how use) (*shape, error) 
 		emptied := field.OmitEmpty && emptyable(fieldType)
 		// An IsZero method may call a nil collection non-zero; a nil pointer is omitted either way.
 		zeroed := field.OmitZero && (fieldType.Kind() == reflect.Pointer || !implements(fieldType, isZeroerType, false))
-		fieldUse := use{enum: enumTag(field.StructField), unaddressable: how.unaddressable}
+		// A field promoted through an embedded pointer is addressable: encoding/json dereferences the pointer.
+		throughPointer := reachedThroughPointer(structType, field.StructField.Index)
+		fieldUse := use{enum: enumTag(field.StructField), unaddressable: how.unaddressable && !throughPointer}
 		var fieldShape *shape
 		var err error
 		switch {
-		case field.Quoted && !marshalsItself(fieldType, how.unaddressable):
+		case field.Quoted && !marshalsItself(fieldType, fieldUse.unaddressable):
 			fieldShape = &shape{kind: shapeString, nullable: fieldType.Kind() == reflect.Pointer && !emptied && !field.OmitZero}
 		case emptied || zeroed:
 			fieldShape, err = s.presentShape(fieldType, fieldUse)
@@ -383,7 +385,7 @@ func (s *typeSet) objectShape(structType reflect.Type, how use) (*shape, error) 
 			return nil, fmt.Errorf("%w (the field %s of %s)", err, field.StructField.Name, structType)
 		}
 		guarded := s.guarded[structType][field.Name]
-		optional := emptied || field.OmitZero || guarded || reachedThroughPointer(structType, field.StructField.Index)
+		optional := emptied || field.OmitZero || guarded || throughPointer
 		object.properties = append(object.properties, property{name: field.Name, shape: fieldShape, optional: optional, guarded: guarded})
 	}
 	return object, nil

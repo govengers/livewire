@@ -218,6 +218,24 @@ func TestEmbeddedPointerInAMapValueIsAddressable(t *testing.T) {
 	require.Contains(t, readGenerated(t, directory, "types.ts"), "export interface ViaPointer {\n  text?: string\n}")
 }
 
+// anonymousViaPointer is Codex's probe: an anonymous map-value struct whose field is promoted
+// through an embedded pointer, which encoding/json dereferences to an addressable value.
+type anonymousViaPointer struct {
+	Values map[string]struct{ *addressed } `json:"values"`
+}
+
+func TestAnonymousMapValueEmbeddedPointerIsAddressable(t *testing.T) {
+	encoded, err := json.Marshal(anonymousViaPointer{Values: map[string]struct{ *addressed }{"x": {&addressed{}}}})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"values":{"x":{"text":"text"}}}`, string(encoded), "encoding/json writes the text")
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(objectOf[anonymousViaPointer]("anonymous")))
+	directory := t.TempDir()
+	require.NoError(t, generate.Write(registry, &generate.Options{TypeScriptDirectory: directory}))
+	require.Contains(t, readGenerated(t, directory, "types.ts"), "values: Record<string, { text?: string }> | null", "so the generated type is a string")
+}
+
 // textKind is a named string type that marshals itself as text.
 type textKind string
 
