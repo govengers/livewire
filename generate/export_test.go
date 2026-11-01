@@ -80,7 +80,8 @@ func LibraryParityTypeScript(importPath string) (string, error) {
 	names := typescriptNames{libraries: "runtime."}
 	var builder strings.Builder
 	builder.WriteString("import type * as runtime from '" + importPath + "'\n\n")
-	builder.WriteString("type Exact<Left, Right> = [Left] extends [Right] ? ([Right] extends [Left] ? true : false) : false\n\n")
+	builder.WriteString("type Same<Left, Right> = [Left] extends [Right] ? ([Right] extends [Left] ? true : false) : false\n")
+	builder.WriteString("type Exact<Left, Right> = Same<Left, Right> extends true ? Same<keyof Left, keyof Right> : false\n\n")
 	for _, named := range set.ordered {
 		if !named.library {
 			builder.WriteString("export type " + named.name + " = " + names.expression(named.definition) + "\n")
@@ -99,6 +100,10 @@ export const wrongOptionality: Exact<Omit<GoErrorBody, 'fields'> & { fields: Rec
 export const wrongNullability: Exact<Omit<GoVersion, 'validTo'> & { validTo: string }, runtime.Version<ParityItem>> = true
 // @ts-expect-error a missing member counts
 export const missingMember: Exact<Omit<GoPushFrame, 'seq'>, runtime.PushFrame> = true
+// @ts-expect-error an added optional member counts
+export const addedOptional: Exact<GoErrorBody & { extra?: string }, runtime.ErrorBody> = true
+// @ts-expect-error a missing optional member counts
+export const missingOptional: Exact<Omit<GoErrorBody, 'fields'>, runtime.ErrorBody> = true
 `)
 	return builder.String(), nil
 }

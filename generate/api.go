@@ -2,6 +2,7 @@ package generate
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/govengers/livewire"
@@ -18,7 +19,10 @@ var apiNames = typescriptNames{types: "types.", runtime: "runtime."}
 func renderAPI(api *model) ([]byte, error) {
 	var builder strings.Builder
 	builder.WriteString(typescriptHeader)
-	builder.WriteString("import type * as filters from './filters'\nimport * as runtime from './runtime'\nimport type * as types from './types'\n")
+	builder.WriteString("import type * as filters from './filters'\nimport * as runtime from './runtime'\n")
+	if api.referencesTypes() {
+		builder.WriteString("import type * as types from './types'\n")
+	}
 	identifiers := newIdentifiers("filters", "runtime", "types", "reads", "live", "calls", "uploads", "downloads", "saveFilter", "listFilters", "deleteFilter", "batch")
 	if err := renderReads(&builder, api, identifiers); err != nil {
 		return nil, err
@@ -34,6 +38,32 @@ func renderAPI(api *model) ([]byte, error) {
 	}
 	builder.WriteString(strings.ReplaceAll(libraryRoutes, "{base}", api.basePath))
 	return []byte(builder.String()), nil
+}
+
+// referencesTypes reports whether any read, mutation or upload refers to a declaration of
+// types.ts; a registry of scalars only does not, and an unused import fails noUnusedLocals.
+func (m *model) referencesTypes() bool {
+	var shapes []*shape
+	for _, read := range m.reads {
+		shapes = append(shapes, read.data)
+	}
+	for _, mutation := range m.mutations {
+		shapes = append(shapes, mutation.body, mutation.response)
+	}
+	for _, upload := range m.uploads {
+		shapes = append(shapes, upload.response)
+	}
+	return slices.ContainsFunc(shapes, referencesNamed)
+}
+
+func referencesNamed(value *shape) bool {
+	if value == nil {
+		return false
+	}
+	if value.kind == shapeReference {
+		return true
+	}
+	return referencesNamed(value.element) || slices.ContainsFunc(value.properties, func(member property) bool { return referencesNamed(member.shape) })
 }
 
 // libraryRoutes are the functions of the library's own routes; {base} is the BasePath.

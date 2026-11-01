@@ -57,6 +57,7 @@ type edgeItem struct {
 	Pair   enumArray              `json:"pair" enum:"a,b"`
 	Labels enumMap                `json:"labels" enum:"a,b"`
 	Amount json.Number            `json:"amount"`
+	Exact  json.Number            `json:"exact,string"`
 	First  Wrap[fixture.Part]     `json:"first"`
 	Second Wrap[billing.Part]     `json:"second"`
 }
@@ -133,6 +134,7 @@ func TestEdgeRegistryMapping(t *testing.T) {
 		"pair: ('a' | 'b')[]",                      // through a named array
 		"labels: Record<string, 'a' | 'b'> | null", // through a named map
 		"amount: number",                           // json.Number is a number
+		"exact: string",                            // which the string option quotes
 		"first: WrapFixturePart",                   // type arguments of one name qualified by their packages
 		"second: WrapBillingPart",
 	} {
@@ -170,6 +172,40 @@ type Reviewlower struct {
 	B int `json:"b"`
 }
 
+// addressed is a named struct whose field marshals itself through a pointer receiver only.
+type addressed struct {
+	Text pointerText `json:"text"`
+}
+
+type addressedItem struct {
+	Values map[string]addressed `json:"values"`
+}
+
+// scalarRegistry holds only scalar DTOs: api.ts imports nothing from types.ts.
+func scalarRegistry(t *testing.T) *livewire.Registry {
+	t.Helper()
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(
+		livewire.NewList("words", "/words", &livewire.ListOptions[string, livewire.NoParameters]{
+			Read: authorization.IsUser(), Load: func(context.Context, *livewire.NoParameters) ([]string, error) { return nil, nil },
+		}),
+		livewire.NewMutation("touch", http.MethodPost, "/touch", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, livewire.NoContent]{
+			Check: authorization.IsUser(), Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*livewire.NoContent, error) {
+				return &livewire.NoContent{}, nil
+			},
+		}),
+	))
+	return registry
+}
+
+func TestScalarRegistryImportsNoTypes(t *testing.T) {
+	directory := t.TempDir()
+	require.NoError(t, generate.Write(scalarRegistry(t), &generate.Options{TypeScriptDirectory: directory}))
+	require.NotContains(t, readGenerated(t, directory, "api.ts"), "from './types'")
+	require.Contains(t, readGenerated(t, generateFixture(t), "typescript/api.ts"), "import type * as types from './types'")
+}
+
 type caseItem struct {
 	Lower reviewlower `json:"lower"`
 	Upper Reviewlower `json:"upper"`
@@ -192,6 +228,7 @@ func TestEdgeRegistryRefusals(t *testing.T) {
 			Read: authorization.IsUser(), Load: func(context.Context, *keyPathParameters) (*historyItem, error) { return &historyItem{}, nil },
 		})}, "must be a string query parameter"},
 		{"a map key with a pointer-receiver MarshalText", []livewire.Declaration{objectOf[pointerKeyItem]("keys")}, "with a value receiver"},
+		{"a named struct as a map value whose field marshals itself through a pointer only", []livewire.Declaration{objectOf[addressedItem]("addressed")}, "is a map value"},
 		{"two Go names of one package that differ in case", []livewire.Declaration{objectOf[caseItem]("cases")}, "generate_test.Reviewlower are both named"},
 	}
 	for _, testCase := range testCases {

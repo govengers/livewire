@@ -214,14 +214,24 @@ func (s *typeSet) shapeOf(goType reflect.Type, how use) (*shape, error) {
 	named := goType.Name() != "" && goType.PkgPath() != ""
 	collection := goType.Kind() == reflect.Slice || goType.Kind() == reflect.Array || goType.Kind() == reflect.Map
 	if named && (how.enum == nil || !collection) {
-		reference, err := s.reference(goType, use{})
-		if err != nil {
-			return nil, err
-		}
-		nilable := goType.Kind() == reflect.Slice || goType.Kind() == reflect.Map
-		return &shape{kind: shapeReference, reference: reference, nullable: nilable}, nil
+		return s.referenceShape(goType, how)
 	}
 	return s.structure(goType, how)
+}
+
+// referenceShape refers to the declaration of a named type; a nil-able one may be null.
+func (s *typeSet) referenceShape(goType reflect.Type, how use) (*shape, error) {
+	if how.unaddressable {
+		if err := refuseAddressDependent(goType); err != nil {
+			return nil, err
+		}
+	}
+	reference, err := s.reference(goType, use{})
+	if err != nil {
+		return nil, err
+	}
+	nilable := goType.Kind() == reflect.Slice || goType.Kind() == reflect.Map
+	return &shape{kind: shapeReference, reference: reference, nullable: nilable}, nil
 }
 
 // specialShape covers the types that marshal themselves: time.Time as an RFC 3339 string,
@@ -376,12 +386,33 @@ func (s *typeSet) objectShape(structType reflect.Type, how use) (*shape, error) 
 	return object, nil
 }
 
+// refuseAddressDependent refuses a named struct reached where it is not addressable (a map
+// value) whose field marshals itself only through a pointer receiver: its one definition says
+// how an addressable value marshals, encoding/json writes the field's underlying value there.
+func refuseAddressDependent(goType reflect.Type) error {
+	if goType.Kind() != reflect.Struct {
+		return nil
+	}
+	for _, field := range jsonfield.Of(goType) {
+		fieldType := field.StructField.Type
+		for _, method := range []reflect.Type{jsonMarshalerType, textMarshalerType} {
+			if !fieldType.Implements(method) && reflect.PointerTo(fieldType).Implements(method) {
+				return fmt.Errorf("generate: %s is a map value, where its field %s, which marshals itself through a pointer receiver only, is not addressable: give the method a value receiver or the map pointer values", goType, field.StructField.Name)
+			}
+		}
+	}
+	return nil
+}
+
 // marshalsItself reports whether a field's value (behind one unnamed pointer level, where the
 // `string` option looks) is written by its own marshaler, which takes precedence over the
 // option in encoding/json.
 func marshalsItself(fieldType reflect.Type, unaddressable bool) bool {
 	if fieldType.Name() == "" && fieldType.Kind() == reflect.Pointer {
 		fieldType, unaddressable = fieldType.Elem(), false
+	}
+	if fieldType == jsonNumberType {
+		return false // encoding/json quotes a json.Number under the string option
 	}
 	_, special := specialShape(fieldType, unaddressable)
 	return special

@@ -57,6 +57,7 @@ func TestGeneratedTypeScriptTypeChecks(t *testing.T) {
 	options.TypeScriptDirectory = filepath.Join(directory, "src", "api")
 	require.NoError(t, generate.Write(newRegistry(t), options))
 	require.NoError(t, generate.Write(newEdgeRegistry(t), edgeOptions(filepath.Join(directory, "src", "edge"))))
+	require.NoError(t, generate.Write(scalarRegistry(t), &generate.Options{TypeScriptDirectory: filepath.Join(directory, "src", "scalar")}))
 	parity, err := generate.LibraryParityTypeScript("./api/runtime")
 	require.NoError(t, err)
 	writeFile(t, filepath.Join(directory, "src", "parity.ts"), []byte(parity))
