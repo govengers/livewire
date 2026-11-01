@@ -132,23 +132,47 @@ func Write(registry *livewire.Registry, options *Options) error {
 	if registry == nil {
 		return errors.New("generate: Write needs a registry")
 	}
-	resolved, err := resolveOptions(options)
-	if err != nil {
-		return err
-	}
-	files, err := render(registry, resolved)
+	files, err := Render(registry, options)
 	if err != nil {
 		return err
 	}
 	for _, file := range files {
-		if err := os.MkdirAll(filepath.Dir(file.path), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(file.Path), 0o750); err != nil {
 			return fmt.Errorf("generate: %w", err)
 		}
-		if err := os.WriteFile(file.path, file.content, 0o600); err != nil {
+		if err := os.WriteFile(file.Path, file.Content, 0o600); err != nil {
 			return fmt.Errorf("generate: %w", err)
 		}
 	}
 	return nil
+}
+
+// File is one artifact as Render renders it: the path the options give it and its content.
+type File struct {
+	Path    string
+	Content []byte
+}
+
+// Render renders every file Write would write, with the same validation and refusals, and
+// writes nothing: the paths are the ones the options name, so a test compares each with the
+// committed file at that path (livewiretest.GeneratedIsCurrent, D70).
+func Render(registry *livewire.Registry, options *Options) ([]File, error) {
+	if registry == nil {
+		return nil, errors.New("generate: Render needs a registry")
+	}
+	resolved, err := resolveOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	files, err := render(registry, resolved)
+	if err != nil {
+		return nil, err
+	}
+	rendered := make([]File, len(files))
+	for index, file := range files {
+		rendered[index] = File{Path: file.path, Content: file.content}
+	}
+	return rendered, nil
 }
 
 // file is one rendered artifact.

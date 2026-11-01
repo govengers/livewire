@@ -90,6 +90,13 @@ type (
 	TextReader struct {
 		Name string `json:"name"`
 	}
+	// TextBytes is a byte slice with UnmarshalText only: encoding/json writes it as a base64
+	// string and reads that string back through UnmarshalText, so it decodes.
+	TextBytes []byte
+	// HoldsTextBytes has a TextBytes field.
+	HoldsTextBytes struct {
+		Data TextBytes `json:"data"`
+	}
 	// TextKey is a map key that marshals itself as text only: refused as a key.
 	TextKey struct{ value string }
 	// HoldsTextKeys has a map of TextKey keys.
@@ -125,6 +132,12 @@ func (p *PointerCodec) MarshalJSON() ([]byte, error) { return []byte(strconv.Quo
 
 // UnmarshalJSON reads the value.
 func (p *PointerCodec) UnmarshalJSON(data []byte) error { return json.Unmarshal(data, &p.value) }
+
+// UnmarshalText keeps the text it is given, the base64 encoding/json wrote.
+func (b *TextBytes) UnmarshalText(text []byte) error {
+	*b = append((*b)[:0], text...)
+	return nil
+}
 
 // UnmarshalText reads a name.
 func (t *TextReader) UnmarshalText(text []byte) error {

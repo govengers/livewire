@@ -82,6 +82,32 @@ func TestIdempotencyReservesWithoutBlockingAndReplaysAfterCommit(t *testing.T) {
 	require.NoError(t, againTransaction.Rollback(t.Context()))
 }
 
+// TestIdempotencyReplaysTheRecordedBytes pins D72: the response is stored as bytes, so a body
+// with a NUL escape records (jsonb refused it, failing the mutation) and a replay answers the
+// first answer's very bytes, member order and whitespace included.
+func TestIdempotencyReplaysTheRecordedBytes(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store := newIdempotencyStore(t, database)
+	transactor := newTransactor(t, database.pool)
+	alice := livewire.Owner{Key: "password:alice"}
+	answered := json.RawMessage(`{"title":"a\u0000b", "id":"7"}`)
+
+	first, firstTransaction := inTransaction(t, transactor)
+	record, _, err := store.Reserve(first, alice, idempotencyKey, "createPart")
+	require.NoError(t, err)
+	record.Status, record.Response = http.StatusCreated, answered
+	require.NoError(t, store.Record(first, record))
+	require.NoError(t, firstTransaction.Commit(t.Context()))
+
+	again, againTransaction := inTransaction(t, transactor)
+	replayed, replay, err := store.Reserve(again, alice, idempotencyKey, "createPart")
+	require.NoError(t, err)
+	require.True(t, replay)
+	require.Equal(t, string(answered), string(replayed.Response))
+	require.NoError(t, againTransaction.Rollback(t.Context()))
+}
+
 func TestIdempotencyKeyIsFreeAfterARollback(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)

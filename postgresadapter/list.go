@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -120,8 +121,11 @@ const defaultExportChunkSize = 1000
 // the identity in ctx is left out, header included (D39). It runs on one snapshot like
 // ListPage, in the engine's transaction inside an engine unit of work, and returns how many
 // rows it wrote. Values are written as text: times in RFC 3339 UTC, uuids hyphenated, NULL as
-// an empty field, arrays and json as JSON. It does not neutralize spreadsheet formulas in
-// values.
+// an empty field, arrays and json as JSON. A text value a spreadsheet would run as a formula,
+// one that starts with =, +, -, @, a tab or a carriage return, is written with a single quote
+// in front (D69), so opening the export runs nothing, and so is one that starts with a quote,
+// so a reader drops exactly one leading quote of every text cell that starts with one;
+// numbers, times and every other value are written by their type and keep their form.
 func WriteCSV(ctx context.Context, database DBTX, export *Export, writer io.Writer) (int, error) {
 	chunkSize := export.ChunkSize
 	if chunkSize <= 0 {
@@ -328,11 +332,14 @@ func writeRecords(output *csv.Writer, columns query.Fields, rows []PageRow) erro
 }
 
 func csvValue(value any) string {
+	if text, isText := value.(string); isText {
+		return withoutFormula(text)
+	}
 	switch typed := jsonValue(value).(type) {
 	case nil:
 		return ""
 	case string:
-		return typed
+		return typed // an infinity or a non-finite number as PostgreSQL spells it, never a formula
 	case time.Time:
 		return typed.UTC().Format(time.RFC3339Nano)
 	case bool:
@@ -346,4 +353,18 @@ func csvValue(value any) string {
 		}
 		return string(encoded)
 	}
+}
+
+// formulaStarts are the first characters that make a spreadsheet read a cell as a formula
+// (OWASP's list for CSV injection), and the quote itself, so the quote is reversible: a text
+// cell that starts with a quote had exactly one put in front.
+const formulaStarts = "=+-@\t\r'"
+
+// withoutFormula puts a single quote in front of a text a spreadsheet would run as a formula;
+// the spreadsheet then shows the text as it is.
+func withoutFormula(text string) string {
+	if text != "" && strings.ContainsRune(formulaStarts, rune(text[0])) {
+		return "'" + text
+	}
+	return text
 }

@@ -119,7 +119,8 @@ const (
 // on the resource's Tables, which every version is written with. Export streams every row under scope, filter and sort to
 // the writer for the export route (D35) and returns how many it wrote: the columns are
 // ExportColumns, or every field, without those whose Read check refuses the caller, and a
-// repository passes them to postgresadapter.WriteCSV. Partition names a subscription's
+// repository passes them to postgresadapter.WriteCSV, which writes a text a spreadsheet would
+// run as a formula with a single quote in front (D69). Partition names a subscription's
 // partition (D25); nil means the tenant.
 type ResourceOptions[Item any] struct {
 	Tables          []string

@@ -112,7 +112,7 @@ func (s *IdempotencyStore) Record(ctx context.Context, record *livewire.Idempote
 	if len(record.Response) > 0 {
 		response = record.Response
 	}
-	tag, err := transaction.Exec(ctx, "UPDATE livewire_idempotency SET status = $4, response = $5::jsonb WHERE owner = $1 AND tenant = $2 AND key = $3",
+	tag, err := transaction.Exec(ctx, "UPDATE livewire_idempotency SET status = $4, response = $5 WHERE owner = $1 AND tenant = $2 AND key = $3",
 		record.Owner.Key, record.Owner.Tenant, key, record.Status, response)
 	if err != nil {
 		return fmt.Errorf("postgresadapter: record idempotency key %s: %w", record.Key, err)

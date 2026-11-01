@@ -12,5 +12,7 @@ permissions:
 jobs:
   go-library:
     uses: govengers/.github/.github/workflows/go-library.yml@v1
+    with:
+      bun-version: "1.4.2" # the TypeScript gates (just test-typescript, the e2e suite's runtime, the example's type check)
     permissions:
       contents: write # the badges job pushes test and coverage badges to the badges branch
