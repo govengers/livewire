@@ -157,7 +157,7 @@ type options struct {
 	Zero     int     `json:"zero,omitzero"`
 	Count    int64   `json:"count,string"`
 	Pointer  *bool   `json:"pointer,string"`
-	Ignored  []int   `json:"ignored,string"` // the string option does not apply to a slice
+	Ignored  []int   `json:"ignored,string"` //nolint:staticcheck // SA5008: the string option does not apply to a slice, under test
 	Both     *string `json:"both,omitempty,omitzero"`
 	Untagged int
 }

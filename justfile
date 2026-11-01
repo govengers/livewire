@@ -22,6 +22,10 @@ test:
     go tool cover -func=sandbox/unit.cover > sandbox/unit.func
     awk -v threshold={{coverage_threshold}} '/^total:/ { found = 1; sub("%", "", $3); print "coverage " $3 "%"; if ($3 + 0 < threshold) { print "coverage is below " threshold "%"; exit 1 } } END { if (!found) { print "no coverage total"; exit 1 } }' sandbox/unit.func
 
+# The TypeScript gates of the generator (tsc on the generated client, the runtime's bun tests), failing without bun; the org CI has no bun step yet
+test-typescript:
+    LIVEWIRE_REQUIRE_TYPESCRIPT=1 go test -count=1 -run 'TestGeneratedTypeScriptTypeChecks|TestRuntimeUnitTests' ./generate/
+
 # End-to-end: two engines on one embedded Postgres, the TypeScript runtime driven by bun (build tag e2e)
 test-e2e:
     mkdir -p sandbox
