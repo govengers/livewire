@@ -16,7 +16,8 @@ import (
 // TestTheTypeScriptRuntimeDrivesBothEngines generates the TypeScript client of the suite's
 // registry and runs typescript/scenario.ts under bun against the two engines: REST on engine A,
 // the socket on engine B, the change feed between them, D54's recovery against the real
-// FilterStore on the REST and the subscribe path, and a re-login through the pair model (D66).
+// FilterStore on the REST and the subscribe path, and a real password re-login with cookies
+// across the engines through the pair model (D66).
 // Without bun it skips, unless LIVEWIRE_REQUIRE_TYPESCRIPT=1 (set in CI) makes it fail.
 func TestTheTypeScriptRuntimeDrivesBothEngines(t *testing.T) {
 	t.Parallel()
@@ -29,14 +30,14 @@ func TestTheTypeScriptRuntimeDrivesBothEngines(t *testing.T) {
 	}
 	cluster := newCluster(t)
 	directory := t.TempDir()
-	require.NoError(t, generate.Write(cluster.a.engine.Registry(), &generate.Options{TypeScriptDirectory: filepath.Join(directory, "api"), Presence: true}))
+	require.NoError(t, generate.Write(cluster.first.engine.Registry(), &generate.Options{TypeScriptDirectory: filepath.Join(directory, "api"), Presence: true}))
 	scenario, err := os.ReadFile(filepath.Join("typescript", "scenario.ts"))
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(directory, "scenario.ts"), scenario, 0o600)) //nolint:gosec // G703: a file below t.TempDir
 
 	command := exec.CommandContext(t.Context(), bun, "run", "scenario.ts")
 	command.Dir = directory
-	command.Env = append(os.Environ(), "LIVEWIRE_ENGINE_A="+cluster.a.server.URL, "LIVEWIRE_ENGINE_B="+cluster.b.server.URL)
+	command.Env = append(os.Environ(), "LIVEWIRE_ENGINE_A="+cluster.first.server.URL, "LIVEWIRE_ENGINE_B="+cluster.second.server.URL, "LIVEWIRE_PASSWORD="+e2ePassword)
 	output, err := command.CombinedOutput()
 	require.NoError(t, err, "bun run scenario.ts:\n%s", output)
 	require.Contains(t, string(output), "ok")

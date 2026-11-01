@@ -4,6 +4,7 @@ package e2e_test
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/govengers/auth"
 	"github.com/govengers/auth/authorization"
+	authginadapter "github.com/govengers/auth/ginadapter"
+	"github.com/govengers/auth/password"
+	"github.com/govengers/auth/session"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -87,10 +92,11 @@ func run(m *testing.M) int {
 	defer func() { _ = os.RemoveAll(runtimePath) }() // a temporary directory; a leftover is harmless
 	server := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
 		Port(uint32(postgres.port)). //nolint:gosec // G115: a TCP port fits a uint32
+		Version(embeddedpostgres.V18).
 		RuntimePath(runtimePath).
-		// ponytail: the binaries are extracted once per machine; a run killed mid-extraction
-		// leaves a broken directory, which deleting it repairs.
-		BinariesPath(filepath.Join(os.TempDir(), "livewire-e2e-postgres-binaries")).
+		// ponytail: the binaries are extracted once per machine and version; a run killed
+		// mid-extraction leaves a broken directory, which deleting it repairs.
+		BinariesPath(binariesPath()).
 		Logger(io.Discard))
 	if err := server.Start(); err != nil {
 		return fail("start embedded postgres", err)
@@ -107,6 +113,20 @@ func run(m *testing.M) int {
 		}
 	}
 	return code
+}
+
+// binariesPath is where the PostgreSQL binaries are extracted: per embedded-postgres module
+// version and PostgreSQL version, so an upgrade of either extracts afresh.
+func binariesPath() string {
+	module := "unknown"
+	if build, ok := debug.ReadBuildInfo(); ok {
+		for _, dependency := range build.Deps {
+			if dependency.Path == "github.com/fergusstrange/embedded-postgres" {
+				module = dependency.Version
+			}
+		}
+	}
+	return filepath.Join(os.TempDir(), "livewire-e2e-postgres-"+module+"-"+string(embeddedpostgres.V18))
 }
 
 func fail(what string, err error) int {
@@ -151,8 +171,9 @@ func migrateTemplate() error {
 
 // cluster is one database with two engines on it, each behind a server of its own.
 type cluster struct {
-	pool *pgxpool.Pool // the test's own connection, for assertions
-	a, b *replica
+	pool   *pgxpool.Pool // the test's own connection, for assertions
+	first  *replica      // engine A
+	second *replica      // engine B
 }
 
 // replica is one engine, its pool, its Listener and its server.
@@ -188,7 +209,8 @@ func newCluster(t *testing.T) *cluster {
 	pool, err := pgxpool.New(t.Context(), dsn(name))
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
-	started := &cluster{pool: pool, a: newReplica(t, name), b: newReplica(t, name)}
+	logins := newLogins(t)
+	started := &cluster{pool: pool, first: newReplica(t, name, logins), second: newReplica(t, name, logins)}
 	require.Eventually(t, func() bool {
 		var listening int
 		err := pool.QueryRow(t.Context(), `SELECT count(*) FROM pg_stat_activity
@@ -200,7 +222,7 @@ func newCluster(t *testing.T) *cluster {
 
 // newReplica starts one engine on the database with the postgresadapter's Listener,
 // Transactor and stores, and serves it on gin.
-func newReplica(t *testing.T, database string) *replica {
+func newReplica(t *testing.T, database string, logins *logins) *replica {
 	t.Helper()
 	pool, err := pgxpool.New(t.Context(), dsn(database))
 	require.NoError(t, err)
@@ -218,19 +240,16 @@ func newReplica(t *testing.T, database string) *replica {
 	presences, err := postgresadapter.NewPresenceStore(&postgresadapter.PresenceStoreOptions{Pool: pool})
 	require.NoError(t, err)
 	engine, err := livewire.NewEngine(&livewire.EngineOptions{
-		Registry: registry, ChangeFeed: listener, IdentitySource: apiKeys{}, Transactor: transactor,
+		Registry: registry, ChangeFeed: listener, IdentitySource: logins, Transactor: transactor,
 		FilterStore: filters, IdempotencyStore: idempotency, AuditStore: audit, PresenceStore: presences,
 		SameHostOnly: true, DeliveryBatchWait: 10 * time.Millisecond, RetryInterval: 10 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	router := gin.New()
-	router.Use(func(ginContext *gin.Context) {
-		if identity := identityOf(ginContext.Request); identity != nil {
-			ginContext.Request = ginContext.Request.WithContext(auth.WithIdentity(ginContext.Request.Context(), identity))
-		}
-	})
-	require.NoError(t, ginadapter.RegisterRoutes(router, &ginadapter.Options{Engine: engine}))
-	router.GET("/api/socket", ginadapter.SocketHandler(engine))
+	authginadapter.RegisterRoutes(router, logins.provider.Routes())
+	api := router.Group("", authginadapter.Middleware(logins.middleware))
+	require.NoError(t, ginadapter.RegisterRoutes(api, &ginadapter.Options{Engine: engine}))
+	api.GET("/api/socket", ginadapter.SocketHandler(engine))
 	server := httptest.NewServer(router)
 	ctx, cancel := context.WithCancel(context.Background())
 	running := make(chan error, 1)
@@ -247,14 +266,64 @@ func newReplica(t *testing.T, database string) *replica {
 	return &replica{engine: engine, server: server, filter: filters}
 }
 
-// apiKeys re-validates a socket by the API key of its upgrade request (D6).
-type apiKeys struct{}
+// The password users of every cluster; their password hash is computed once.
+var (
+	users        = map[string]uuid.UUID{"alice": uuid.MustParse("0198c0de-0000-7000-8000-00000000a11c"), "bob": uuid.MustParse("0198c0de-0000-7000-8000-000000000b0b")}
+	passwordHash = sync.OnceValues(func() (string, error) { return password.Hash(e2ePassword, password.DefaultParameters()) })
+)
 
-func (apiKeys) Identify(_ context.Context, request *http.Request) (*auth.Identity, error) {
+// e2ePassword is every password user's password.
+const e2ePassword = "correct horse battery staple"
+
+// logins are the password login, the sessions and the API keys both engines of a cluster
+// share, as two replicas share a session backend.
+type logins struct {
+	provider *password.Provider
+	guard    *session.Guard
+}
+
+func newLogins(t *testing.T) *logins {
+	t.Helper()
+	hash, err := passwordHash()
+	require.NoError(t, err)
+	storage := password.NewMemoryStorage()
+	for name, id := range users {
+		require.NoError(t, storage.CreateUser(t.Context(), &password.User{ID: id, Username: new(name), PasswordHash: hash}))
+	}
+	backend, err := session.NewMemoryBackend(nil)
+	require.NoError(t, err)
+	key := make([]byte, 32)
+	_, err = rand.Read(key)
+	require.NoError(t, err)
+	store, err := session.NewStore(&session.StoreOptions{Backend: backend, EncryptionKey: key, InsecureCookie: true})
+	require.NoError(t, err)
+	provider, err := password.New(&password.Options{Sessions: store, Storage: storage})
+	require.NoError(t, err)
+	guard, err := session.NewGuard(&session.GuardOptions{Store: store})
+	require.NoError(t, err)
+	return &logins{provider: provider, guard: guard}
+}
+
+// middleware authenticates an API request by its API key, else by its session.
+func (l *logins) middleware(next http.Handler) http.Handler {
+	keyed := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if identity := identityOf(request); identity != nil {
+			request = request.WithContext(auth.WithIdentity(request.Context(), identity))
+		}
+		l.guard.RequireAPI()(next).ServeHTTP(writer, request)
+	})
+	return keyed
+}
+
+// Identify re-validates a socket by the API key of its upgrade request, else by its session (D6).
+func (l *logins) Identify(ctx context.Context, request *http.Request) (*auth.Identity, error) {
 	if identity := identityOf(request); identity != nil {
 		return identity, nil
 	}
-	return nil, auth.ErrUnauthenticated
+	if strings.HasPrefix(request.Header.Get("Authorization"), "Bearer ") {
+		return nil, auth.ErrUnauthenticated
+	}
+	return l.guard.Identify(ctx, request)
 }
 
 func identityOf(request *http.Request) *auth.Identity {

@@ -27,39 +27,39 @@ func TestAWriteOnOneEngineReRunsASubscriptionOnTheOther(t *testing.T) {
 	cluster := newCluster(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	pushes, err := client.Subscribe[livewire.ListResponse[note]](ctx, clientOf(t, cluster.b, "alice-key"), "notes", nil)
+	pushes, err := client.Subscribe[livewire.ListResponse[note]](ctx, clientOf(t, cluster.second, "alice-key"), "notes", nil)
 	require.NoError(t, err)
 	require.Empty(t, nextPush(t, pushes).Data.Items)
 
-	created := createNote(t, clientOf(t, cluster.a, "alice-key"), createNoteBody{Title: "from engine a"}, "")
-	diff := nextPush(t, pushes)
-	require.Equal(t, livewire.PushListChange, diff.Kind, "LISTEN fans the write on engine A out to engine B")
-	require.Equal(t, []note{*created}, diff.Data.Items)
+	created := createNote(t, clientOf(t, cluster.first, "alice-key"), createNoteBody{Title: "from engine a"}, "")
+	change := nextPush(t, pushes)
+	require.Equal(t, livewire.PushListChange, change.Kind, "LISTEN fans the write on engine A out to engine B")
+	require.Equal(t, []note{*created}, change.Data.Items)
 
-	createNote(t, clientOf(t, cluster.a, "bob-key"), createNoteBody{Title: "bob's"}, "")
-	createNote(t, clientOf(t, cluster.b, "alice-key"), createNoteBody{Title: "second"}, "")
-	require.Len(t, nextPush(t, pushes).Data.Items, 2, "bob's note re-runs the subscription but changes nothing alice reads")
+	createNote(t, clientOf(t, cluster.first, "bob-key"), createNoteBody{Title: "bob's"}, "")
+	second := createNote(t, clientOf(t, cluster.second, "alice-key"), createNoteBody{Title: "second"}, "")
+	require.Equal(t, []note{*created, *second}, nextPush(t, pushes).Data.Items, "alice reads her two notes, bob's stays out")
 }
 
 func TestAnIdempotencyKeyReplaysOnTheOtherEngine(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
 	key := client.NewIdempotencyKey()
-	first := createNote(t, clientOf(t, cluster.a, "alice-key"), createNoteBody{Title: "once"}, key)
-	replayed := createNote(t, clientOf(t, cluster.b, "alice-key"), createNoteBody{Title: "once"}, key)
+	first := createNote(t, clientOf(t, cluster.first, "alice-key"), createNoteBody{Title: "once"}, key)
+	replayed := createNote(t, clientOf(t, cluster.second, "alice-key"), createNoteBody{Title: "once"}, key)
 	require.Equal(t, first, replayed, "engine B answers what engine A recorded (D16)")
 	var rows int
 	require.NoError(t, cluster.pool.QueryRow(t.Context(), "SELECT count(*) FROM notes").Scan(&rows))
 	require.Equal(t, 1, rows)
 
-	other := createNote(t, clientOf(t, cluster.b, "bob-key"), createNoteBody{Title: "bob's"}, key)
+	other := createNote(t, clientOf(t, cluster.second, "bob-key"), createNoteBody{Title: "bob's"}, key)
 	require.NotEqual(t, first.ID, other.ID, "a key of another owner is a fresh key (section 6)")
 }
 
 func TestTheGoClientRecoversAFilterTheStoreEvicted(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
-	alice := clientOf(t, cluster.a, "alice-key")
+	alice := clientOf(t, cluster.first, "alice-key")
 	createNote(t, alice, createNoteBody{Title: "apples"}, "")
 	createNote(t, alice, createNoteBody{Title: "pears"}, "")
 	saved, err := alice.SaveFilter(t.Context(), &livewire.FilterRequest{Resource: "notes", Filter: json.RawMessage(`{"search":"apples"}`)})
@@ -81,7 +81,7 @@ func TestTheGoClientRecoversAFilterTheStoreEvicted(t *testing.T) {
 func TestARecreatedNoteStartsANewHistoryAcrossEngines(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
-	onA, onB := clientOf(t, cluster.a, "alice-key"), clientOf(t, cluster.b, "alice-key")
+	onA, onB := clientOf(t, cluster.first, "alice-key"), clientOf(t, cluster.second, "alice-key")
 	id := client.NewUUIDv7()
 	createNote(t, onA, createNoteBody{ID: id, Title: "first life"}, "")
 	require.NoError(t, onB.Call(t.Context(), &client.Call{Method: http.MethodPatch, Path: "/notes/{id}", Parameters: client.Parameters{"id": id.String()}, Body: renameNoteBody{Title: "renamed"}}, nil))
@@ -100,7 +100,7 @@ func TestARecreatedNoteStartsANewHistoryAcrossEngines(t *testing.T) {
 func TestABatchNamesEachCallInTheHistory(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
-	alice := clientOf(t, cluster.a, "alice-key")
+	alice := clientOf(t, cluster.first, "alice-key")
 	id := client.NewUUIDv7()
 	results, err := alice.Batch(t.Context(), []livewire.BatchCall{
 		{Target: "createNote", Body: json.RawMessage(`{"id":"` + id.String() + `","title":"batched"}`)},
@@ -110,7 +110,7 @@ func TestABatchNamesEachCallInTheHistory(t *testing.T) {
 	require.Equal(t, http.StatusCreated, results[0].Status)
 	require.Equal(t, http.StatusOK, results[1].Status)
 
-	history := readHistory(t, clientOf(t, cluster.b, "alice-key"), id)
+	history := readHistory(t, clientOf(t, cluster.second, "alice-key"), id)
 	require.Len(t, history.Items, 2)
 	require.Equal(t, "createNote", history.Items[0].Mutation, "CallDescriber names each call (D58)")
 	require.Equal(t, "renameNote", history.Items[1].Mutation)
@@ -121,15 +121,15 @@ func TestABatchNamesEachCallInTheHistory(t *testing.T) {
 func TestPresenceJoinedOnOneEngineIsReadOnTheOther(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
-	created := createNote(t, clientOf(t, cluster.a, "alice-key"), createNoteBody{Title: "shared"}, "")
+	created := createNote(t, clientOf(t, cluster.first, "alice-key"), createNoteBody{Title: "shared"}, "")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	presences, err := client.Subscribe[livewire.ListResponse[livewire.PresenceItem]](ctx, clientOf(t, cluster.b, "alice-key"), "notes.presence",
+	presences, err := client.Subscribe[livewire.ListResponse[livewire.PresenceItem]](ctx, clientOf(t, cluster.second, "alice-key"), "notes.presence",
 		client.Parameters{livewire.ParameterPresenceKey: created.ID.String()})
 	require.NoError(t, err)
 	require.Empty(t, nextPush(t, presences).Data.Items)
 
-	socket := dial(t, cluster.a, "alice-key")
+	socket := dial(t, cluster.first, "alice-key")
 	joined := socket.request(t, livewire.RequestFrame{
 		Operation: livewire.OperationJoin, Target: "notes",
 		Parameters: map[string]string{livewire.ParameterPresenceKey: created.ID.String()}, Body: json.RawMessage(`{"editing":"title"}`),
@@ -148,8 +148,8 @@ func TestEveryCallLeavesAnAuditRow(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
 	key := client.NewIdempotencyKey()
-	created := createNote(t, clientOf(t, cluster.a, "alice-key"), createNoteBody{Title: "audited"}, key)
-	err := clientOf(t, cluster.b, "bob-key").Call(t.Context(), &client.Call{Method: http.MethodDelete, Path: "/notes/{id}", Parameters: client.Parameters{"id": created.ID.String()}}, nil)
+	created := createNote(t, clientOf(t, cluster.first, "alice-key"), createNoteBody{Title: "audited"}, key)
+	err := clientOf(t, cluster.second, "bob-key").Call(t.Context(), &client.Call{Method: http.MethodDelete, Path: "/notes/{id}", Parameters: client.Parameters{"id": created.ID.String()}}, nil)
 	require.Error(t, err, "bob may not delete alice's note")
 	rows, err := cluster.pool.Query(t.Context(), "SELECT mutation, actor, status, coalesce(idempotency_key::text, '') FROM livewire_audit ORDER BY at")
 	require.NoError(t, err)
@@ -174,12 +174,12 @@ func TestEveryCallLeavesAnAuditRow(t *testing.T) {
 func TestTheExportStreamsEveryRowWithItsTrailer(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
-	alice := clientOf(t, cluster.a, "alice-key")
+	alice := clientOf(t, cluster.first, "alice-key")
 	for _, title := range []string{"=1+1", "b", "c", "d", "e"} { // chunks of two, the first a formula (D69)
 		createNote(t, alice, createNoteBody{Title: title}, "")
 	}
 	var exported bytes.Buffer
-	rows, err := clientOf(t, cluster.b, "alice-key").Export(t.Context(), "/notes/export", client.Parameters{livewire.ParameterSort: "title"}, &exported)
+	rows, err := clientOf(t, cluster.second, "alice-key").Export(t.Context(), "/notes/export", client.Parameters{livewire.ParameterSort: "title"}, &exported)
 	require.NoError(t, err, "the Livewire-Export-Rows trailer arrived (D60)")
 	require.Equal(t, 5, rows)
 	records, err := csv.NewReader(&exported).ReadAll()
@@ -196,7 +196,7 @@ func TestTheGoClientReconnectsAcrossADeploy(t *testing.T) {
 	t.Parallel()
 	cluster := newCluster(t)
 	var serving atomic.Pointer[http.Handler]
-	serving.Store(&cluster.a.server.Config.Handler)
+	serving.Store(&cluster.first.server.Config.Handler)
 	front := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		(*serving.Load()).ServeHTTP(writer, request)
 	}))
@@ -209,11 +209,11 @@ func TestTheGoClientReconnectsAcrossADeploy(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, livewire.PushSnapshot, nextPush(t, pushes).Kind)
 
-	serving.Store(&cluster.b.server.Config.Handler) // the deploy: new sockets reach engine B
+	serving.Store(&cluster.second.server.Config.Handler) // the deploy: new sockets reach engine B
 	closing, closeCancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer closeCancel()
-	require.NoError(t, cluster.a.engine.Close(closing), "engine A ends its sockets with 1001")
-	createNote(t, clientOf(t, cluster.b, "alice-key"), createNoteBody{Title: "after the deploy"}, "")
+	require.NoError(t, cluster.first.engine.Close(closing), "engine A ends its sockets with 1001")
+	createNote(t, clientOf(t, cluster.second, "alice-key"), createNoteBody{Title: "after the deploy"}, "")
 	for {
 		push := nextPush(t, pushes)
 		if len(push.Data.Items) == 1 {
