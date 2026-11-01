@@ -31,11 +31,12 @@ type Version[Item any] struct {
 
 // HistoryFields are the fields a history read filters and sorts by (D34), named as Version
 // marshals them and written over the columns of `<table>_history`: the loader's FROM is the
-// history table alone. The default sort is by version, oldest first.
+// history table alone. The default sort is by version, oldest first. The operation is insert
+// or update: the history is read through the item, so a deleted item has none (D56).
 func HistoryFields() query.Fields {
 	return query.Fields{
 		{Name: "id", Type: query.TypeInteger, SQL: "version", Filter: true, Sort: true},
-		{Name: "operation", Type: query.TypeEnum, SQL: "operation", Enum: []string{string(ChangeInsert), string(ChangeUpdate), string(ChangeDelete)}, Filter: true},
+		{Name: "operation", Type: query.TypeEnum, SQL: "operation", Enum: []string{string(ChangeInsert), string(ChangeUpdate)}, Filter: true},
 		{Name: "validFrom", Type: query.TypeTime, SQL: "valid_from", Filter: true, Sort: true},
 		{Name: "validTo", Type: query.TypeTime, SQL: "valid_to", Nullable: true, Filter: true, Sort: true},
 		{Name: "actor", Type: query.TypeString, SQL: "actor", Nullable: true, Filter: true},
@@ -56,10 +57,11 @@ func (r *Resource) HistoryPath() string {
 	return r.ItemPath() + "/history"
 }
 
-// HistoryQuery is the loader's query of a history read (D34): the reserved filter, sort and
-// page parameters over HistoryFields, and the item key's value from source as the scope
-// `id = key` over the history table. A history pages by offset; `after` is refused.
-func (r *Resource) HistoryQuery(source ParameterSource, parameters *ReadParameters) (*query.ListQuery, error) {
+// historyQuery is the loader's query of a history read (D34): the reserved filter, sort and
+// page parameters over HistoryFields, the item key's value from source as the scope
+// `id = key` over the history table and the resource's CountCap (D14). A history pages by
+// offset; `after` is refused.
+func (r *Resource) historyQuery(source ParameterSource, parameters *ReadParameters) (*query.ListQuery, error) {
 	key, ok := source.Path(r.item.Parameter)
 	if !ok || key == "" {
 		return nil, invalidParameter(r.item.Parameter, "required")
@@ -87,23 +89,19 @@ func (r *Resource) HistoryQuery(source ParameterSource, parameters *ReadParamete
 		return nil, err
 	}
 	scope := func(builder *query.Builder) { builder.WriteString("id = ").Argument(key) }
-	return query.Compile(fields, document, sort, page, scope)
-}
-
-// LoadHistory runs the History loader; the page is the loader's *Page[Version[Item]], a copy
-// whose Items are never nil.
-func (r *Resource) LoadHistory(ctx context.Context, listQuery *query.ListQuery) (any, error) {
-	if r.history == nil {
-		return nil, NotFound()
+	listQuery, err := query.Compile(fields, document, sort, page, scope)
+	if err != nil {
+		return nil, err
 	}
-	return r.history(ctx, listQuery)
+	listQuery.CountCap = r.countCap
+	return listQuery, nil
 }
 
 // loadHistory answers a history read: the item read first, under the caller, so the scope
 // and the loader's ownership decide who sees the history; then the versions, each one's data
 // stripped of the fields the caller may not read (D39).
 func loadHistory(ctx context.Context, resource *Resource, source ParameterSource, parameters *ReadParameters) (*readResult, error) {
-	listQuery, err := resource.HistoryQuery(source, parameters)
+	listQuery, err := resource.historyQuery(source, parameters)
 	if err != nil {
 		return nil, err
 	}

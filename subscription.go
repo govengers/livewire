@@ -260,7 +260,8 @@ func isTimeDependent(resolved *resolvedRead) (bool, error) {
 	if resource == nil || resolved.readParameters == nil || len(resolved.readParameters.Filter) == 0 {
 		return false, nil
 	}
-	document, err := query.Parse(resource.Fields(), resolved.readParameters.Filter)
+	fields, _ := resolved.filterScope()
+	document, err := query.Parse(fields, resolved.readParameters.Filter)
 	if err != nil {
 		return false, err
 	}
@@ -280,7 +281,8 @@ func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead, liv
 	if !inline || !hasOwner || store == nil {
 		return "", nil
 	}
-	document, err := query.Parse(resolved.plan.resource.Fields(), parameters.Filter)
+	fields, target := resolved.filterScope()
+	document, err := query.Parse(fields, parameters.Filter)
 	if err != nil {
 		return "", err
 	}
@@ -308,7 +310,7 @@ func (s *socket) registerFilter(ctx context.Context, resolved *resolvedRead, liv
 	var stored *StoredFilter
 	err = recovering(func() error {
 		var saveError error
-		stored, saveError = store.Save(ctx, &StoredFilter{Owner: owner, Resource: resolved.request.Target, Document: canonical, Hash: hash})
+		stored, saveError = store.Save(ctx, &StoredFilter{Owner: owner, Resource: target, Document: canonical, Hash: hash})
 		return saveError
 	})
 	if err != nil {
@@ -481,7 +483,7 @@ func (s *subscription) rerunWith(marks rerunMarks) {
 	if s.isOver() {
 		return // ended while a mark was pending: nothing runs for it
 	}
-	unit := startUnit(OutcomeRerun, "", s.request.Target)
+	unit := startUnit(OutcomeRerun, "", s.request.target())
 	unit.subscription = s.id
 	ctx := withQueryWait(s.ctx)
 	identity, err := s.socket.rerunIdentity(ctx)

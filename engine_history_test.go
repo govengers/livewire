@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/govengers/auth"
 	"github.com/govengers/auth/authorization"
@@ -75,11 +76,14 @@ func TestHistorySubscriptionReRunsOnItsTable(t *testing.T) {
 
 	bed.addVersion(document{ID: documentID, Title: "final"}, livewire.ChangeUpdate)
 	bed.feed.publish(livewire.Change{Table: "documents", Operation: livewire.ChangeUpdate, ID: documentID})
-	diff := socket.push()
-	require.Equal(t, livewire.PushListChange, diff.Kind, "the history is diffed by version")
-	change := changeOf(t, diff.Payload)
+	changes := socket.push()
+	require.Equal(t, livewire.PushListChange, changes.Kind, "the history is diffed by version")
+	change := changeOf(t, changes.Payload)
 	require.Len(t, change.Upserts, 1)
 	require.Contains(t, string(change.Upserts[0]), `"id":2`)
+	require.Eventually(t, func() bool {
+		return outcomeWith(bed, livewire.OutcomeRerun, func(outcome livewire.Outcome) bool { return outcome.Target == "documents.history" })
+	}, frameWait, time.Millisecond, "a re-run names its read kind like its subscribe and end")
 }
 
 func TestHistoryDeclarationMistakes(t *testing.T) {
@@ -97,14 +101,9 @@ func TestHistoryDeclarationMistakes(t *testing.T) {
 
 	versioned := partOptions()
 	versioned.Versioned, versioned.History = true, history
-	versioned.Read = authorization.IsUser()
 	resource := newParts(t, versioned)
 	require.Equal(t, "/parts/{id}/history", resource.HistoryPath())
-	page, err := resource.LoadHistory(userContext(), &query.ListQuery{})
-	require.NoError(t, err)
-	require.Equal(t, &livewire.Page[livewire.Version[part]]{Items: []livewire.Version[part]{}}, page)
-	_, err = newParts(t, partOptions()).LoadHistory(userContext(), &query.ListQuery{})
-	requireError(t, err, http.StatusNotFound, livewire.CodeNotFound, "")
+	require.Empty(t, newParts(t, partOptions()).HistoryPath(), "no History loader, no route")
 	require.NoError(t, livewire.HistoryFields().Validate())
 }
 
@@ -183,4 +182,82 @@ func TestHistoryIsScopedByTheItemsOwnID(t *testing.T) {
 	payload, err := history("alice")
 	require.NoError(t, err)
 	require.Contains(t, string(payload), `"owner":"alice"`)
+}
+
+func TestHistoryFiltersOverHistoryFieldsOnEveryPath(t *testing.T) {
+	bed := newTestbed(t, func(options *livewire.EngineOptions) { options.SafetyTickInterval = 5 * time.Millisecond })
+	bed.addVersion(document{ID: documentID, Title: "draft"}, livewire.ChangeInsert)
+	bed.addVersion(document{ID: documentID, Title: "final"}, livewire.ChangeUpdate)
+	socket := bed.dial("ada")
+	updates := `{"where":{"field":"operation","op":"eq","value":"update"}}`
+	inline := socket.do(livewire.OperationSubscribe, "documents.history", map[string]string{"id": documentID, "filter": updates}, nil)
+	subscribed(t, inline)
+	require.NotEmpty(t, inline.FilterID, "the inline history filter is registered under documents.history")
+	require.Equal(t, livewire.PushSnapshot, socket.push().Kind)
+	bed.filters.mutex.Lock()
+	stored, ok := bed.filters.filters[inline.FilterID]
+	bed.filters.mutex.Unlock()
+	require.True(t, ok)
+	require.Equal(t, "documents.history", stored.Resource)
+
+	byID := socket.do(livewire.OperationSubscribe, "documents.history", map[string]string{"id": documentID, "filterId": inline.FilterID}, nil)
+	subscribed(t, byID)
+	socket.push()
+	refused := socket.do(livewire.OperationQuery, "documents", map[string]string{"filterId": inline.FilterID}, nil)
+	require.Equal(t, http.StatusNotFound, refused.Status, "a history filter is not the resource's")
+
+	recent := `{"where":{"field":"validFrom","op":"gt","value":{"relative":"-7d"}}}`
+	subscribed(t, socket.do(livewire.OperationSubscribe, "documents.history", map[string]string{"id": documentID, "filter": recent}, nil))
+	socket.push()
+	loads := len(bed.historyQueriesSoFar())
+	require.Eventually(t, func() bool { return len(bed.historyQueriesSoFar()) > loads }, frameWait, time.Millisecond, "a relative time re-runs on the safety tick")
+
+	ctx := auth.WithIdentity(t.Context(), person("ada", roleReader))
+	payload, err := bed.engine.SaveFilter(ctx, []byte(`{"resource":"documents.history","name":"Updates","filter":`+updates+`}`))
+	require.NoError(t, err, "POST /filters stores a history filter")
+	require.Contains(t, string(payload), `"resource":"documents.history"`)
+	_, err = bed.engine.SaveFilter(ctx, []byte(`{"resource":"gadgets.history","filter":{}}`))
+	requireStatus(t, err, http.StatusBadRequest)
+}
+
+func TestDeletedItemHasNoHistory(t *testing.T) {
+	bed := newTestbed(t, nil)
+	bed.addVersion(document{ID: documentID, Title: "draft"}, livewire.ChangeInsert)
+	ctx := auth.WithIdentity(t.Context(), person("ada", roleReader))
+	read := func(parameters livewire.MapSource) error {
+		_, err := bed.engine.Read(ctx, livewire.ReadRequest{Target: "documents", Kind: livewire.ReadHistory, Source: parameters})
+		return err
+	}
+	deletes := `{"where":{"field":"operation","op":"eq","value":"delete"}}`
+	requireStatus(t, read(livewire.MapSource{"id": documentID, "filter": deletes}), http.StatusBadRequest)
+
+	socket := bed.dial("ada")
+	subscribed(t, socket.do(livewire.OperationSubscribe, "documents.history", map[string]string{"id": documentID}, nil))
+	socket.push()
+	bed.deleteDocument(documentID)
+	bed.addVersion(document{ID: documentID, Title: "draft"}, livewire.ChangeDelete)
+	bed.feed.publish(livewire.Change{Table: "documents", Operation: livewire.ChangeDelete, ID: documentID})
+	ended := socket.push()
+	require.Equal(t, livewire.PushError, ended.Kind, "the history of a deleted item ends with its item (D56)")
+	require.Equal(t, livewire.CodeNotFound, errorOf(t, ended.Payload).Code)
+	requireStatus(t, read(livewire.MapSource{"id": documentID}), http.StatusNotFound)
+}
+
+func TestHistoryQueryCarriesTheCountCap(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	var caps []int
+	options := partOptions()
+	options.Versioned, options.CountCap = true, 2
+	options.History = func(_ context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[part]], error) {
+		caps = append(caps, listQuery.CountCap)
+		return &livewire.Page[livewire.Version[part]]{Total: 3}, nil
+	}
+	require.NoError(t, registry.Add(livewire.NewResource("parts", "/parts", options)))
+	engine, err := livewire.NewEngine(&livewire.EngineOptions{Registry: registry, IdentitySource: newFakeIdentities(), Transactor: &fakeTransactor{}, SameHostOnly: true})
+	require.NoError(t, err)
+	payload, err := engine.Read(userContext(), livewire.ReadRequest{Target: "parts", Kind: livewire.ReadHistory, Source: livewire.MapSource{"id": documentID}})
+	require.NoError(t, err)
+	require.Equal(t, []int{2}, caps, "the loader counts at most CountCap + 1 (D14)")
+	require.Contains(t, string(payload), `"total":3`)
 }

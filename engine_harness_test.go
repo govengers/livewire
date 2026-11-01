@@ -77,6 +77,7 @@ type testbed struct {
 	// loader was asked.
 	versionMutex    sync.Mutex
 	versions        map[string][]livewire.Version[document]
+	deleted         map[string]bool
 	historyQueries  []*query.ListQuery
 	registryOptions livewire.RegistryOptions
 }
@@ -394,6 +395,23 @@ func (b *testbed) addVersion(item document, operation livewire.ChangeOperation) 
 	})
 }
 
+// historyQueriesSoFar copies what the History loader was asked so far.
+func (b *testbed) historyQueriesSoFar() []*query.ListQuery {
+	b.versionMutex.Lock()
+	defer b.versionMutex.Unlock()
+	return slices.Clone(b.historyQueries)
+}
+
+// deleteDocument deletes a document: its versions stay, its item read is 404.
+func (b *testbed) deleteDocument(id string) {
+	b.versionMutex.Lock()
+	defer b.versionMutex.Unlock()
+	if b.deleted == nil {
+		b.deleted = map[string]bool{}
+	}
+	b.deleted[id] = true
+}
+
 // documents is versioned with a history (D34); its secret is the admin's.
 func (b *testbed) documents() *livewire.Resource {
 	return livewire.NewResource("documents", "/documents", &livewire.ResourceOptions[document]{
@@ -414,7 +432,7 @@ func (b *testbed) documents() *livewire.Resource {
 			b.versionMutex.Lock()
 			defer b.versionMutex.Unlock()
 			for _, argument := range arguments {
-				if versions := b.versions[fmt.Sprint(argument)]; len(versions) > 0 {
+				if versions := b.versions[fmt.Sprint(argument)]; len(versions) > 0 && !b.deleted[fmt.Sprint(argument)] {
 					return versions[len(versions)-1].Data, nil
 				}
 			}

@@ -263,11 +263,21 @@ func (e *Engine) resolveStoredFilter(ctx context.Context, resolved *resolvedRead
 	if err != nil {
 		return fmt.Errorf("livewire: the stored filter %q of %s: %w", parameters.FilterID, resolved.request.Target, err)
 	}
-	if stored.Resource != resolved.request.Target {
+	if _, target := resolved.filterScope(); stored.Resource != target {
 		return NotFound()
 	}
 	parameters.Filter = stored.Document
 	return nil
+}
+
+// filterScope is what a read's filter document names and belongs to: the resource's fields
+// and name, or for a history read HistoryFields and "name.history", the target its stored
+// and registered filters are kept under (D13, D56).
+func (r *resolvedRead) filterScope() (query.Fields, string) {
+	if r.plan.kind == ReadHistory {
+		return HistoryFields(), r.request.target()
+	}
+	return r.plan.resource.Fields(), r.request.Target
 }
 
 // load runs a resolved read in a read-only engine transaction (D45). A presence read runs

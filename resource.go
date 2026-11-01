@@ -110,9 +110,10 @@ const (
 // DistinctMaximum caps a distinct read (default 1000). Cursor allows keyset pagination with
 // the `after` parameter and answers the Next of List's Page as ListResponse.next (D38, D55).
 // Versioned marks the item as carrying `version` (D34); History, which needs Versioned and
-// the Item key on the uuid field "id" (its SQL the table's id column), reads one item's versions for the history route (HistoryQuery
-// says what it gets) and the subscription of it re-runs on the resource's Tables, which
-// every version is written with. Export streams every row under scope, filter and sort to
+// the Item key on the uuid field "id" (its SQL the table's id column), reads one item's
+// versions for the history route: its query is the reserved filter, sort and page over
+// HistoryFields, scoped to the history table's `id = key`, and the subscription of it re-runs
+// on the resource's Tables, which every version is written with. Export streams every row under scope, filter and sort to
 // the writer for the export route (D35) and returns how many it wrote: the columns are
 // ExportColumns, or every field, without those whose Read check refuses the caller, and a
 // repository passes them to postgresadapter.WriteCSV. Partition names a subscription's
