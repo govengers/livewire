@@ -115,6 +115,12 @@ func TestGoClientRefusesWhatItCannotImport(t *testing.T) {
 		{"a client id it cannot fill", createRegistry[fixture.Note](t), "", "fills in a client id"},
 		{"a type that marshals itself as text only", objectRegistry[fixture.TextOnly](t), "", "fixture.TextOnly: it has MarshalText but no UnmarshalText"},
 		{"a field that does", objectRegistry[fixture.HoldsTextOnly](t), "", "fixture.HoldsTextOnly.Inner[]: it has MarshalText but no UnmarshalText"},
+		{"a type with MarshalJSON only", objectRegistry[fixture.JSONOnly](t), "", "fixture.JSONOnly: it has MarshalJSON but neither UnmarshalJSON nor UnmarshalText"},
+		{"a struct with UnmarshalText only", objectRegistry[fixture.TextReader](t), "", "fixture.TextReader: encoding/json writes it as its struct"},
+		{"a text map key", objectRegistry[fixture.HoldsTextKeys](t), "", "the keys of fixture.HoldsTextKeys.Counts: fixture.TextKey has MarshalText"},
+		{"an interface with methods", objectRegistry[fixture.HoldsStringer](t), "", "fixture.HoldsStringer.Hook: an interface with methods"},
+		{"a mutation response", responseRegistry[fixture.TextOnly](t, false), "", "(the mutation answer)"},
+		{"an upload response", responseRegistry[fixture.TextOnly](t, true), "", "(the upload answer)"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {

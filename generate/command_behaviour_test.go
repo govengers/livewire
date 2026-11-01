@@ -66,6 +66,28 @@ func TestCommandLineIdempotencyKeys(t *testing.T) {
 	require.Len(t, served.backend.sorted(), 1)
 }
 
+// TestUsageErrorsGoToStderr keeps stdout for JSON (D68): a command-line mistake writes its
+// diagnostic and a hint on stderr and nothing on stdout; explicit --help is stdout's.
+func TestUsageErrorsGoToStderr(t *testing.T) {
+	for _, arguments := range [][]string{
+		{"stats", "list", "--board", ""},
+		{"stats", "list", "--nope"},
+		{"stats", "list"},
+		{"filters", "delete", "--id", ""},
+		{"create-part", "--idempotency-key", "x", "--body", "{}"},
+	} {
+		var output, diagnostics bytes.Buffer
+		code := fixturecommand.Run(t.Context(), append([]string{"fixture", "--base-url", "http://127.0.0.1:1/api/v1", "--api-key", userKey}, arguments...), strings.NewReader(""), &output, &diagnostics)
+		require.Equal(t, fixturecommand.ExitUsage, code, "%v: %s", arguments, diagnostics.String())
+		require.Empty(t, output.String(), "%v writes no usage text on stdout", arguments)
+		require.Contains(t, diagnostics.String(), "fixture: see --help\n", arguments)
+	}
+	var output, diagnostics bytes.Buffer
+	require.Equal(t, fixturecommand.ExitSuccess, fixturecommand.Run(t.Context(), []string{"fixture", "stats", "list", "--help"}, strings.NewReader(""), &output, &diagnostics))
+	require.Contains(t, output.String(), "--board")
+	require.Empty(t, diagnostics.String())
+}
+
 func TestAnEmptyRequiredParameterIsAUsageError(t *testing.T) {
 	served := startFixtureServer(t)
 	served.backend.put(fixture.Part{ID: newPartID(), Name: "x"})

@@ -215,12 +215,16 @@ func (p *presences) List(_ context.Context, tenant, target, key string) ([]livew
 
 func (p *presences) Sweep(context.Context, time.Duration) (int, error) { return 0, nil }
 
-// changeFeed hands the backend's writes to the engine.
+// changeFeed hands the backend's writes to the engine; running closes once the engine runs
+// it, when every goroutine of Engine.Run is started.
 type changeFeed struct {
 	changes chan livewire.Change
+	running chan struct{}
+	once    sync.Once
 }
 
 func (f *changeFeed) Run(ctx context.Context, onChange func(livewire.Change), onResync func()) error {
+	f.once.Do(func() { close(f.running) })
 	onResync()
 	for {
 		select {
@@ -248,7 +252,7 @@ func startFixtureServer(t *testing.T) *fixtureServer {
 	ignore := goleak.IgnoreCurrent()
 	t.Cleanup(func() { goleak.VerifyNone(t, ignore) })
 	backend := newFixtureBackend()
-	feed := &changeFeed{changes: make(chan livewire.Change, 256)}
+	feed := &changeFeed{changes: make(chan livewire.Change, 256), running: make(chan struct{})}
 	backend.changed = func(table string) { feed.changes <- livewire.Change{Table: table, Operation: livewire.ChangeUpdate} }
 	keys := &apiKeys{identities: map[string]*auth.Identity{
 		userKey:  {Provider: "apikey", Subject: "user", Active: true},
@@ -266,6 +270,7 @@ func startFixtureServer(t *testing.T) *fixtureServer {
 	ctx, cancel := context.WithCancel(context.Background())
 	running := make(chan error, 1)
 	go func() { running <- engine.Run(ctx) }()
+	<-feed.running // the engine's goroutines exist before a test takes a goroutine snapshot
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(func(ginContext *gin.Context) { // stands in for the application's API-key resolver

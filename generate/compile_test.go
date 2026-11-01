@@ -60,6 +60,11 @@ func TestGeneratedGoCompilesInAnApplicationModule(t *testing.T) {
 		GoClient: generate.GoClientOptions{Directory: filepath.Join(directory, "embeddedclient"), ImportPath: compiledModule + "/embeddedclient"},
 	}))
 	require.Contains(t, readGenerated(t, directory, "embeddedclient/client.go"), "if body.Primary.ID == uuid.Nil {")
+	// An id promoted through an unexported embedded struct is written as body.ID, which
+	// compiles from another package.
+	require.NoError(t, generate.Write(createRegistry[fixture.CreateHidden](t), &generate.Options{
+		GoClient: generate.GoClientOptions{Directory: filepath.Join(directory, "hiddenclient"), ImportPath: compiledModule + "/hiddenclient"},
+	}))
 	module := "module " + compiledModule + "\n\ngo 1.26.0\n\nrequire github.com/govengers/livewire v0.0.0\n\nreplace github.com/govengers/livewire => " + root + "\n"
 	writeFile(t, filepath.Join(directory, "go.mod"), []byte(module))
 	writeFile(t, filepath.Join(directory, "go.sum"), readFile(t, filepath.Join(root, "go.sum")))

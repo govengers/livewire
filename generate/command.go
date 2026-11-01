@@ -131,7 +131,7 @@ func (c *commandLine) rootCommands() (string, error) {
 	}
 	fmt.Fprintf(&root, "\t\t\tbatchCommand(),\n\t\t\tfiltersCommand(%s),\n", goStrings(c.filterTargets()))
 	fmt.Fprintf(&root, "\t\t\t{Name: \"subscribe\", Usage: \"streams a live read as NDJSON, one push per line, until interrupted\", Commands: []*cli.Command{\n%s\t\t\t}},\n", live.String())
-	return root.String() + "\t\t},\n\t}\n}\n", nil
+	return root.String() + "\t\t},\n\t})\n}\n", nil
 }
 
 func (c *commandLine) writes(root *strings.Builder, names *commandNames) error {
@@ -322,9 +322,11 @@ func (w *lockedWriter) close() {
 	w.closed = true
 }
 
-// Command is the root command {name}; Run runs it with the given streams.
+// Command is the root command {name}; Run runs it with the given streams. A command line
+// mistake is returned without urfave's help text, which would land on stdout: the
+// diagnostic goes to stderr, explicit --help to stdout.
 func Command() *cli.Command {
-	return &cli.Command{
+	return quietUsage(&cli.Command{
 		Name:  "{name}",
 		Usage: "the API at {base}",
 		Flags: []cli.Flag{
@@ -405,8 +407,21 @@ func exitCode(err error) int {
 	}
 }
 
+// quietUsage makes every command of the tree return its usage errors instead of printing
+// them with its help.
+func quietUsage(command *cli.Command) *cli.Command {
+	command.OnUsageError = func(_ context.Context, _ *cli.Command, err error, _ bool) error { return err }
+	for _, subcommand := range command.Commands {
+		quietUsage(subcommand)
+	}
+	return command
+}
+
 func report(diagnostics io.Writer, err error) {
 	_, _ = fmt.Fprintf(diagnostics, "{name}: %v\n", err)
+	if exitCode(err) == ExitUsage {
+		_, _ = fmt.Fprintln(diagnostics, "{name}: see --help")
+	}
 	var refusal *client.Error
 	if !errors.As(err, &refusal) {
 		return
@@ -635,12 +650,8 @@ func exportCommand(name, usage, path string, parameters []parameter) *cli.Comman
 			return usagef("--output: %w", err)
 		}
 		rows, err := runtime.Export(ctx, path, wireOf(command, parameters), created)
-		if closeErr := created.Close(); err == nil && closeErr != nil {
-			err = &failure{err: fmt.Errorf("--output: %w", closeErr)} // a file that did not close is not written
-		}
-		if err != nil {
-			_ = os.Remove(outputPath)
-			return failed(err)
+		if err := finishOutput(created, outputPath, err); err != nil {
+			return err
 		}
 		_, _ = fmt.Fprintf(command.Root().ErrWriter, "%d rows\n", rows)
 		return nil
@@ -776,7 +787,12 @@ func filtersCommand(targets []string) *cli.Command {
 		}
 		return writeJSONOf(command, listed)
 	}}
-	remove := &cli.Command{Name: "delete", Usage: "removes a filter (DELETE {base}/filters/{id})", Flags: []cli.Flag{&cli.StringFlag{Name: "id", Usage: "the filter's id", Required: true}}, Action: func(ctx context.Context, command *cli.Command) error {
+	remove := &cli.Command{Name: "delete", Usage: "removes a filter (DELETE {base}/filters/{id})", Flags: []cli.Flag{&cli.StringFlag{Name: "id", Usage: "the filter's id", Required: true, Validator: func(value string) error {
+		if value == "" {
+			return errors.New("--id must not be empty")
+		}
+		return nil
+	}}}, Action: func(ctx context.Context, command *cli.Command) error {
 		runtime, err := runtimeOf(command)
 		if err != nil {
 			return err
@@ -784,6 +800,19 @@ func filtersCommand(targets []string) *cli.Command {
 		return failedOrNil(runtime.DeleteFilter(ctx, command.String("id")))
 	}}
 	return &cli.Command{Name: "filters", Usage: "the stored filters (D13)", Commands: []*cli.Command{save, list, remove}}
+}
+
+// finishOutput closes the file an export wrote and removes it when the export failed or the
+// file did not close: a file that did not close is not written.
+func finishOutput(file io.Closer, path string, err error) error {
+	if closeErr := file.Close(); err == nil && closeErr != nil {
+		err = &failure{err: fmt.Errorf("--output: %w", closeErr)}
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return failed(err)
+	}
+	return nil
 }
 
 func failedOrNil(err error) error {

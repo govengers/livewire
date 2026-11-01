@@ -543,28 +543,35 @@ func (g *goClient) clientID(source *goSource, mutation *mutationModel, bodyType 
 // selector that reaches it through every embedded struct on its way, so a Go field name two
 // embedded structs share stays unambiguous.
 func clientIDField(requestType reflect.Type) (jsonfield.Field, string, error) {
+	var fields []jsonfield.Field
 	if requestType.Kind() == reflect.Struct {
-		for _, field := range jsonfield.Of(requestType) {
-			if field.Name != "id" {
-				continue
-			}
-			fieldType := field.StructField.Type
-			if fieldType.Kind() == reflect.Pointer {
-				fieldType = fieldType.Elem()
-			}
-			fits := fieldType == uuidType || (fieldType.Kind() == reflect.String && !marshalsItselfAnyway(fieldType))
-			selector, reachable := fieldSelector(requestType, field.StructField.Index)
-			if fits && reachable && !reachedThroughPointer(requestType, field.StructField.Index) {
-				return field, selector, nil
-			}
+		fields = jsonfield.Of(requestType)
+	}
+	for _, field := range fields {
+		fieldType := field.StructField.Type
+		if fieldType.Kind() == reflect.Pointer {
+			fieldType = fieldType.Elem()
+		}
+		fits := fieldType == uuidType || (fieldType.Kind() == reflect.String && !marshalsItselfAnyway(fieldType))
+		if field.Name != "id" || !fits || reachedThroughPointer(requestType, field.StructField.Index) {
+			continue // a nil embedded pointer has no field to fill
+		}
+		if selector, reachable := fieldSelector(requestType, field.StructField.Index); reachable {
+			return field, selector, nil
 		}
 	}
 	return jsonfield.Field{}, "", fmt.Errorf("generate: the Go client fills in a client id (D18) only in a struct body whose JSON field id is a uuid.UUID or a string kind (or a pointer to one), reached through exported fields and no embedded pointer; %s has none", requestType)
 }
 
-// fieldSelector is the selector "body.Outer.Inner.ID" of a field by its index path, and
-// whether another package can write it: every field on the path is exported.
+// fieldSelector is the selector of a field by its index path, and whether another package
+// can write it: "body.ID" when Go's own selector resolves the name to that path (promotion
+// through unexported embedded structs included), else the full path "body.Outer.Inner.ID",
+// every step exported. The path has no embedded pointer (reachedThroughPointer).
 func fieldSelector(structType reflect.Type, index []int) (string, bool) {
+	leaf := structType.FieldByIndex(index)
+	if promoted, ok := structType.FieldByName(leaf.Name); ok && leaf.IsExported() && slices.Equal(promoted.Index, index) {
+		return "body." + leaf.Name, true
+	}
 	selector, current := "body", structType
 	for _, position := range index {
 		field := current.Field(position)
@@ -577,24 +584,36 @@ func fieldSelector(structType reflect.Type, index []int) (string, bool) {
 	return selector, true
 }
 
-// unmarshalsItself refuses a type that marshals itself without the matching unmarshaler on
-// its pointer.
-func unmarshalsItself(goType reflect.Type, path string) error {
-	pointer := reflect.PointerTo(goType)
-	switch {
-	case implements(goType, jsonMarshalerType, false) && !pointer.Implements(jsonUnmarshalerType):
-		return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalJSON but no UnmarshalJSON", path)
-	case !implements(goType, jsonMarshalerType, false) && !pointer.Implements(jsonUnmarshalerType) && !pointer.Implements(textUnmarshalerType):
-		return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalText but no UnmarshalText", path)
-	default:
-		return nil
-	}
-}
-
 var (
 	jsonUnmarshalerType = reflect.TypeFor[json.Unmarshaler]()
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
+
+// decodesItself mirrors how encoding/json decodes a type with methods (its indirect): an
+// UnmarshalJSON on the pointer decodes anything, so nothing below it matters; an UnmarshalText
+// decodes a JSON string, which a MarshalText writes (and a MarshalJSON may), but a value
+// encoding/json writes by its kind (an object, an array, a number) it refuses to read back
+// into UnmarshalText; a MarshalText of a string kind is read back as the string. It reports
+// whether the methods decide the type, and the refusal when they cannot decode it.
+func decodesItself(goType reflect.Type, path string) (bool, error) {
+	pointer := reflect.PointerTo(goType)
+	textDecoder := pointer.Implements(textUnmarshalerType)
+	jsonEncoder := implements(goType, jsonMarshalerType, false)
+	switch {
+	case pointer.Implements(jsonUnmarshalerType):
+		return true, nil
+	case marshalsItselfAnyway(goType) && (textDecoder || (!jsonEncoder && goType.Kind() == reflect.String)):
+		return true, nil
+	case jsonEncoder:
+		return true, fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalJSON but neither UnmarshalJSON nor UnmarshalText", path)
+	case marshalsItselfAnyway(goType):
+		return true, fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalText but no UnmarshalText", path)
+	case textDecoder && goType.Kind() != reflect.String:
+		return true, fmt.Errorf("generate: the Go client cannot decode %s: encoding/json writes it as its %s and reads only a JSON string into its UnmarshalText", path, goType.Kind())
+	default:
+		return false, nil
+	}
+}
 
 // refuseUndecodable refuses a type the Go client cannot decode what the server wrote into:
 // one that marshals itself (MarshalJSON, MarshalText) without the matching unmarshaler on its
@@ -612,8 +631,8 @@ func undecodable(goType reflect.Type, path string, visited map[reflect.Type]bool
 	if goType.Kind() == reflect.Pointer {
 		return undecodable(goType.Elem(), path, visited) // encoding/json allocates and decodes the value
 	}
-	if marshalsItselfAnyway(goType) {
-		return unmarshalsItself(goType, path)
+	if decodes, err := decodesItself(goType, path); decodes || err != nil {
+		return err
 	}
 	switch goType.Kind() {
 	case reflect.Pointer, reflect.Slice, reflect.Array:
@@ -783,6 +802,26 @@ type filterConstant struct {
 // them: one per enum field (<Resource><Field>), the sort terms (<Resource>SortTerm) and,
 // except for history, the distinct fields (<Resource>DistinctField).
 func filterTypes(resource *resourceModel) []filterType {
+	taken := map[string]bool{resource.name + "Field": true, resource.filterType(): true}
+	for _, function := range filterFunctions(resource) {
+		taken[function.name] = true
+	}
+	for _, field := range resource.fields {
+		if field.Filter && field.Type == query.TypeEnum {
+			taken[resource.name+goIdentifier(field.Name)] = true
+		}
+	}
+	taken[resource.name+"SortTerm"], taken[resource.name+"DistinctField"] = true, true
+	// constant numbers a name another identifier of the vocabulary took ("nut" and "Nut",
+	// "+1" and "1"), in declaration order, so every value keeps a constant.
+	constant := func(base, value string) filterConstant {
+		name := base
+		for number := 2; taken[name]; number++ {
+			name = base + strconv.Itoa(number)
+		}
+		taken[name] = true
+		return filterConstant{name: name, value: value}
+	}
 	var declared []filterType
 	for _, field := range resource.fields {
 		if !field.Filter || field.Type != query.TypeEnum {
@@ -791,21 +830,20 @@ func filterTypes(resource *resourceModel) []filterType {
 		name := resource.name + goIdentifier(field.Name)
 		enum := filterType{name: name, description: "a value of the enum field " + field.Name}
 		for _, value := range field.Enum {
-			enum.constants = append(enum.constants, filterConstant{name: name + goIdentifier(value), value: value})
+			enum.constants = append(enum.constants, constant(name+goIdentifier(value), value))
 		}
 		declared = append(declared, enum)
 	}
 	sort := filterType{name: resource.name + "SortTerm", description: "a sort term: a sortable field, with a leading - descending"}
 	for _, field := range resource.sortFields() {
 		sort.constants = append(sort.constants,
-			filterConstant{name: resource.name + "Sort" + goIdentifier(field), value: field},
-			filterConstant{name: resource.name + "Sort" + goIdentifier(field) + "Descending", value: "-" + field})
+			constant(resource.name+"Sort"+goIdentifier(field), field), constant(resource.name+"Sort"+goIdentifier(field)+"Descending", "-"+field))
 	}
 	declared = append(declared, sort)
 	if !resource.history {
 		distinct := filterType{name: resource.name + "DistinctField", description: "a field a distinct read counts the values of (D15)"}
 		for _, field := range resource.distinctFields() {
-			distinct.constants = append(distinct.constants, filterConstant{name: resource.name + "Distinct" + goIdentifier(field), value: field})
+			distinct.constants = append(distinct.constants, constant(resource.name+"Distinct"+goIdentifier(field), field))
 		}
 		declared = append(declared, distinct)
 	}
