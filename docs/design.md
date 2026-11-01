@@ -17,7 +17,7 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D7 | Close code 4401 only when the identity is gone (no session, expired, revoked). A changed identity re-runs subscriptions under the new rights; a subscription the new identity may not read ends with an `error` push `forbidden`. |
 | D8 | Static gate first, data second: a declaration's `Check` runs before parameters are resolved against the database and before a body is read; data-dependent authorization lives in the loader or handler (AUTH-005). No `Context` hook, no per-declaration middleware. |
 | D9 | Origin allowlist is a required engine option; the request's own host is always allowed. |
-| D10 | Per-socket limits: 64 subscriptions, 16 in-flight requests, 8 MiB queued bytes, 64 KiB frame. Per engine: bounded query semaphore shared by loads and identity checks (default 32), optional sockets per owner. |
+| D10 | Per-socket limits: 64 subscriptions, 16 in-flight requests, 8 MiB queued bytes, 64 KiB frame. Per engine: bounded query semaphore shared by loads and identity checks (default 32), optional sockets per owner. *Superseded in part by D52: the query semaphore bounds socket work only.* |
 | D11 | Filterable resources declare `Fields` (name, type, SQL expression, filterable, sortable, searchable, nullable, enum values), `DefaultSort`, `Scope`, `MaximumLimit`, `CountCap`. `Nullable` must be true whenever the SQL can yield NULL (the keyset relies on it); the root package derives it from the DTO field type (pointer) and the declaration may override it. The `query` package validates and compiles filter documents; the app's repository executes the page and count SQL with pgx and hydrates rows by id with sqlc. |
 | D12 | Filter document: `and`, `or`, `not`, per-type operators (databridge's set), `search`, relative times (`-7d`), limits: depth 8, nodes 200, list values 500, string 1 KiB, document 16 KiB. |
 | D13 | Stored filters are library-owned: table `livewire_filters`, content-addressed dedup per owner, resource and context, routes `POST /filters`, `GET /filters`, `DELETE /filters/{id}`, `filterId` on every filterable read, inline `filter` registered on subscribe. Owner key is `provider:subject`. Unnamed filters unused for 30 days are swept. Owner-only visibility. |
@@ -28,10 +28,10 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D18 | Creates may accept a client-generated `id`: `ClientID(UUIDv7)` or `ClientID(UUIDv4)` per create, validated by version; without the option no `id` is accepted. |
 | D19 | Generated artifacts: TypeScript (`types.ts`, `api.ts`, `filters.ts`, runtime, `vue.ts`), OpenAPI 3.0.3 with `x-websocket`, a Go client package importing the app's DTO package, a CLI on `github.com/urfave/cli/v3`. |
 | D20 | CLI and Go client authenticate with an API key only (flag or environment variable). |
-| D21 | `useLive` keeps its localStorage snapshot, keyed by identity (`config.identity()`), cleared on identity change. `useLiveList` holds filter, sort and page state. Vue only, no Quasar. |
+| D21 | `useLive` keeps its localStorage snapshot, keyed by identity (`config.identity()`), cleared on identity change. `useLiveList` holds filter, sort and page state. Vue only, no Quasar. *Superseded in part by D62 and D66: `LiveOptions.identity()`, read once per instance, which serves one identity.* |
 | D22 | Trigger and table DDL ship as exported SQL for the app's goose migrations; nothing runs DDL at startup. |
-| D23 | Contract gates: `livewiretest.GeneratedIsCurrent`, `livewiretest.Parity` (REST body equals socket snapshot), `livewiretest.Stale` (a write to a declared table re-runs the subscription), and an `oasdiff breaking` recipe against the previous tag's spec. |
-| D24 | Engine tests run on embedded-postgres; the e2e suite runs two engines on one database plus the TypeScript runtime under bun, build tag `e2e`. |
+| D23 | Contract gates: `livewiretest.GeneratedIsCurrent`, `livewiretest.Parity` (REST body equals socket snapshot), `livewiretest.Stale` (a write to a declared table re-runs the subscription), and an `oasdiff breaking` recipe against the previous tag's spec. *The recipe is `just openapi-breaking` (WP9).* |
+| D24 | Engine tests run on embedded-postgres; the e2e suite runs two engines on one database plus the TypeScript runtime under bun, build tag `e2e`. *Superseded in part by D48: the engine suite runs on fakes, Postgres in WP4 and WP8.* |
 | D25 | Partitioned fan-out stays: a `Partition` function names a subscription's partition, partitioned triggers carry the row's column. |
 | D26 | OpenAPI 3.0.3 (`nullable: true`, no `anyOf null`), served by the app if it wants to; the generator only writes the file. |
 | D27 | Module path `github.com/govengers/livewire`, release v1.0.0 with a migration table from mxcd v0.2.x; mxcd/livewire archived with a notice. |
@@ -52,7 +52,7 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D42 | Tenant as a first-class engine concept (MaPa, 31.10.2026): `RegistryOptions.Tenant func(ctx, parameters any) (string, error)` resolves the tenant once per request or subscription after the static check (path parameter, header or identity; nil parameters for filterable resource reads); the engine puts it in the context (`livewire.TenantFrom(ctx)`), uses it as the default partition (D25), passes it to `Scope`, and sets `SET LOCAL livewire.tenant` in every engine transaction, reads included, so an app may enforce isolation with Row Level Security policies (`USING (tenant_id = current_setting('livewire.tenant')::uuid)`). Filters, presence, audit and idempotency rows carry the tenant; a stored filter is scoped to owner and tenant. `livewiretest.TenantIsolation` runs every filterable resource as two tenants and fails when rows cross (DAT-017). `Tenant` nil is single-tenant and changes nothing. |
 | D43 | Declarations are values: `NewResource`, `NewList`, `NewObject`, `NewMutation`, `NewUpload` return the declaration only and never panic; a declaration mistake surfaces as the error of `Registry.Add`, which `main` checks, so the registry stays one expression (section 3). Filed as a DES-001 exception in `.govengers.yml`. |
 | D44 | Request bodies are validated in the core decoder with go-playground/validator on the `validate` tag (not gin's `binding` tag: the core is transport-neutral and the socket never passes gin); a tag the validator cannot parse is a declaration error surfaced by `Add`. Field errors are reported by JSON path. Section 3's "binding/validator tags" wording is superseded. |
-| D45 | The transaction in the context is a query handle, never the commit handle: `livewire.TransactionFrom(ctx)` returns the adapter's query-only value (`postgresadapter.TransactionFrom(ctx)` types it as sqlc's `DBTX`), only the engine holds Commit and Rollback. Every engine unit of work gets a transaction, reads included (so `livewire.tenant` is set for RLS on reads, D42); outside an engine unit of work the handle is nil and a repository falls back to its pool. Section 7's snippet reads `queries := r.queries.WithTx(postgresadapter.TransactionFrom(ctx))`. |
+| D45 | The transaction in the context is a query handle, never the commit handle: `livewire.TransactionFrom(ctx)` returns the adapter's query-only value (`postgresadapter.TransactionFrom(ctx)` types it as sqlc's `DBTX`), only the engine holds Commit and Rollback. Every engine unit of work gets a transaction, reads included (so `livewire.tenant` is set for RLS on reads, D42); outside an engine unit of work the handle is nil and a repository falls back to its pool. Section 7's snippet reads `queries := r.queries.WithTx(postgresadapter.TransactionFrom(ctx))`. *Its snippet is superseded by D53.* |
 | D46 | Socket targets are the declaration name with an optional kind suffix: `name` (list or object), `name.item`, `name.distinct`, `name.presence`; `join` and `leave` name the declaration and carry the record under the `key` parameter. The REST adapter maps its routes to the same `ReadRequest{Target, Kind, Source}`, so both transports run one read pipeline. |
 | D47 | Batch wire format: `POST /batch` and the socket op `batch` carry a JSON array of `{target, params, body}` and answer `[{status, payload}]` in order; one transaction, all or nothing; a refusal names the failing call under `calls.<index>` in `fields`. Uploads are excluded. |
 | D48 | The engine's own test suite runs on in-memory fakes of the adapter contracts (fast, deterministic, race-checked); the engine against embedded Postgres (real transactions, LISTEN feed, advisory locks) is the `postgresadapter` suite of WP4 plus the two-engine e2e of WP8. D24's "engine tests on embedded-postgres" is satisfied there, not in WP3. |
@@ -81,6 +81,7 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D71 | The example is a module of its own (WP8, completes D28): `examples/todo` is `github.com/govengers/livewire/examples/todo` with `replace github.com/govengers/livewire => ../..`, so goose, govengers/jobs and govengers/config, which only an application needs, stay out of the library's `go.mod` and its consumers' module graphs. It is a service under the standards' service rules: `cmd/todo` wires every layer in `main` (repositories on sqlc and the postgresadapter, livewire's stores, services, the registry with its Observer feeding prometheusadapter and one wide event per socket or background outcome, the engine, the govengers/jobs worker with the maintenance schedules, the gin router), and its tests in package `main` run that wiring on embedded Postgres, so the gates and the generated Go client and CLI check the application as it ships. `just test` runs its tests after the library's on embedded Postgres, `just test-e2e` runs its SQL check chain after the e2e suite (`just db-check-example`, DAT-016: squawk on the migrations, `sqlc generate` leaving no file changed or new, the build, `sqlc vet` on a fresh database its own migrator migrated), `just lint` and `just vulncheck` cover it, `just generate-example` regenerates its queries and clients. CI installs bun (the org workflow's `bun-version`): `just test-typescript` runs there, and with `CI` set the example's frontend type check and the e2e suite's TypeScript run fail instead of skipping. |
 | D72 | An idempotency record keeps the answer's bytes (WP8, completes D16; changes WP4's `IdempotencySQL`): `livewire_idempotency.response` is `bytea`, not `jsonb`, so a replay answers the first answer's very bytes (member order and whitespace included) and a response that carries a `\u0000` escape, which jsonb refuses, no longer fails the mutation it records. An application that ran the earlier `IdempotencySQL` upgrades in two steps: first it deploys this version to every replica (its store reads and writes the old jsonb column too, while the earlier code, which casts to jsonb, fails every idempotent mutation once the column is bytea), then it alters the column in a migration of its own (`SET LOCAL lock_timeout = '5s'; ALTER TABLE livewire_idempotency ALTER COLUMN response TYPE bytea USING convert_to(response::text, 'UTF8')`), which rewrites the table under an ACCESS EXCLUSIVE lock, so mutations wait for it; the table holds the store's Window of records only (default 24 h), and a lock timeout keeps a busy table from stalling the deploy. |
 | D73 | A typed list's `limit` is the count of its items (WP8, completes D14 for `NewList`): a typed list has no page, so its `ListResponse.limit` says how many items it answered, and a diff carries no `limit`, so a client's state keeps the snapshot's (the TypeScript runtime and the Go client both do). A view shows `items.length`, not `limit`, for a typed list; a resource's `limit` is the applied page and does not change between pushes. |
+| D74 | D72's upgrade invalidates prepared statements (WP9, completes D72): the `ALTER` changes the result type of the IdempotencyStore's statements, so every pooled connection that prepared them before fails its next reservation once with SQLSTATE 0A000 (`cached plan must not change result type`) and pgx prepares the statement again after it. The upgrade is therefore: deploy to every replica, migrate, roll the replicas; without the roll each connection answers one idempotent call 500, which a retry with the same key repairs. `TestTheEarlierJSONBRecordsReplayBeforeAndAfterTheUpgrade` pins both steps on the earlier jsonb table. |
 
 ## 2. Packages
 
@@ -95,6 +96,8 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | `livewire/livewiretest` | contract gate helpers for app test suites | testing |
 | `examples/todo` | one app: gin, auth password login, sqlc, goose, embedded-postgres, generated client, CLI | |
 | `test/e2e` | two engines, one database, bun-driven runtime | |
+
+*Superseded in part: `ginadapter.RegisterRoutes(router, &ginadapter.Options{Engine})` (D60); the Go client's runtime is the package `livewire/client` (D67); `postgresadapter` also holds the transactor, the audit and presence stores and the list, history and export helpers (D53, D57).*
 
 ## 3. Declarations
 
@@ -130,6 +133,8 @@ registry.Add(
 )
 ```
 
+*The snippet is superseded by D55 (`List` returns a `*livewire.Page[Item]`) and by the generic options as built (`ResourceOptions[Item]`, `ListOptions[Item, Parameters]`, `ObjectOptions[Item, Parameters]`, `MutationOptions[Parameters, Request, Response]`, `UploadOptions[Parameters, Response]`); docs/wiki/Declarations.md quotes the tested code.*
+
 - Paths use `{name}` (OpenAPI style); adapters translate.
 - Params structs use `path:"id"` and `query:"status"` tags, embedded structs flattened; unsupported fields fail at `Add`.
 - `NewResource` is the filterable kind: list, item, distinct routes, `filter`/`filterId`/`sort`/`limit`/`offset` parameters, stored filters. `NewList` and `NewObject` are typed-params reads. All three are live when `Tables` is set.
@@ -141,20 +146,22 @@ registry.Add(
 
 Request `{id, op, target, params, body?, idempotencyKey?}`; response `{id, ok, status, payload | error, subscription?, filterId?}`; push `{sub, seq, kind, payload}` with kinds `snapshot`, `diff`, `replace`, `error`. A payload is byte-for-byte the REST body. Diff: `{upserts, removes, order?, total?}`. Ops: `query` (one read), `subscribe`, `unsubscribe`, `call` (a mutation; uploads are REST only), `ping`. Close codes: 1000 normal, 1013 too slow, 4401 identity gone.
 
+*Superseded in part: the ops are D2's (`batch` D47, `join` and `leave` D37), targets carry the read kind (D46), and the close codes include 1001 (section 5) and 1009 (a frame past `FrameBytes`).*
+
 ## 5. Live engine
 
 - One `ChangeFeed` per replica (`postgresadapter.NewListener`): LISTEN with reconnect; every successful connect, the first included, triggers a resync of all subscriptions.
 - A change names table, op, id, partition. Subscriptions index by table and partition; a change marks matching ones dirty; a dirty subscription re-runs once, changes during a re-run collapse into one follow-up.
 - Re-run: identity via `IdentitySource` (cached per socket for the tick interval), `Check`, `Scope`, load, then snapshot on first push or resync, else diff (lists) or replace (objects). 5xx retries with backoff, 4xx ends with an `error` push.
 - Time-dependent subscriptions (relative times) re-run on a safety tick (default 30 s).
-- Query semaphore gates loads and identity checks. A panicking loader costs that subscription one retry, never the process.
+- Query semaphore gates loads and identity checks. A panicking loader costs that subscription one retry, never the process. *Superseded in part by D52: socket work only.*
 - `Engine.Close(ctx)` ends every socket with 1001 and waits for goroutines.
 
 ## 6. Security model
 
 | Concern | Mechanism |
 |---------|-----------|
-| Who | `auth.Identity` from the upgrade request (behind `Guard.RequireAPI` or an API-key resolver); re-validated by `IdentitySource` on every op, re-run and tick (D6). |
+| Who | `auth.Identity` from the upgrade request (behind `Guard.RequireAPI` or an API-key resolver); re-validated by `IdentitySource` on every op, re-run and tick (D6). *Superseded in part by D51: ping and unsubscribe are exempt.* |
 | Whether | `Check` (static) then loader or handler (data-dependent). Same code on both transports. |
 | Impersonation | checks see the effective identity; `Observer` outcomes carry `identity.Real()`; `Real(...)` checks work unchanged. |
 | Revocation | 4401 when gone; rights change re-runs (D7). `Engine.RevalidateAll()` and `RevalidateOwner(key)` for push-driven revocation. |
@@ -207,6 +214,8 @@ func (r *Repository) ListParts(ctx context.Context, listQuery *query.ListQuery) 
 }
 ```
 
+*The snippet is superseded by D55: the loader returns `postgresadapter.ListPage`'s `*livewire.Page[part.Item]` as it is.*
+
 `postgresadapter.ListPage` (D53): one `REPEATABLE READ` read-only snapshot (the engine's transaction inside an engine unit of work, even when the pool is passed, else one of its own), the page query (ids, derived columns), the count (capped), the hydration by ids in page order. `partSQL` is a `query.ResourceSQL{From, IDColumn, Derived}`.
 
 ## 9. Generated artifacts
@@ -215,27 +224,30 @@ func (r *Repository) ListParts(ctx context.Context, listQuery *query.ListQuery) 
 - OpenAPI 3.0.3: every route, `ListResponse` schemas, filter document schema per resource, `x-websocket: {target, ops}` on live operations, security scheme from options.
 - Go client: package `<app>client`, imports the app's public DTO package, `Client{BaseURL, APIKey, HTTP}`; one method per declaration; `Subscribe` returns a channel of typed pushes; filter types mirror `filters.ts`.
 - CLI: urfave/cli v3, one command per declaration, params as flags, body from `--body` JSON or stdin, `--filter` JSON, `subscribe` streams NDJSON, `--api-key` or `<APP>_API_KEY`.
+- *Superseded in part by D61 to D68: no global `config` and one `Client` and `LiveConnection` pair per identity (D62, D66), `useLivePresence` (D37), the Go client's `New(&client.Options{...})` (D67), the CLI's tree and flags (D68).*
 - All output carries `Code generated by livewire. DO NOT EDIT.` and is committed; `livewiretest.GeneratedIsCurrent` fails the app's tests on drift.
 
 ## 10. Work packages
 
-| WP | Delivers | Gate |
-|----|----------|------|
-| WP0 | repo skeleton: module rename, `.govengers.yml`, `.golangci.yml`, justfile, org CI, docs stubs | `just check` green on empty packages |
-| WP1 | `query` package: fields, document, validate, canonical, hash, compile, page/count builders, sort, relative time | table tests, 90 % coverage |
-| WP2 | core registry and declarations, params, errors, wire frames, diff, `ListResponse`, client IDs | unit tests |
-| WP3 | engine on net/http: sockets, ops, subscriptions, re-run, limits, identity source, observer, revalidation | embedded-postgres tests, race |
-| WP4 | `postgresadapter`: listener, trigger SQL, transactor, audit, filter store, idempotency store, history SQL, `ListPage`, cursor mode, export | embedded-postgres tests |
-| WP5 | `ginadapter`, `prometheusadapter`, uploads, batch, presence | tests |
-| WP6 | `generate`: TypeScript + runtime + vue, OpenAPI 3.0.3 | tsc gate, bun unit tests |
-| WP7 | `generate`: Go client, CLI | compiled against `examples/todo` |
-| WP8 | `livewiretest`, `examples/todo`, `test/e2e` (two engines, bun runtime) | e2e green in CI |
-| WP9 | docs, llms.txt, migration table, v1.0.0 | dual review |
-| WP10 | `xlsxadapter` | optional, cut first |
+| WP | Delivers | Gate | Status |
+|----|----------|------|--------|
+| WP0 | repo skeleton: module rename, `.govengers.yml`, `.golangci.yml`, justfile, org CI, docs stubs | `just check` green on empty packages | done (7e0bcf7) |
+| WP1 | `query` package: fields, document, validate, canonical, hash, compile, page/count builders, sort, relative time | table tests, 90 % coverage | done (#1) |
+| WP2 | core registry and declarations, params, errors, wire frames, diff, `ListResponse`, client IDs | unit tests | done (#2) |
+| WP3 | engine on net/http: sockets, ops, subscriptions, re-run, limits, identity source, observer, revalidation | embedded-postgres tests, race | done (#3) |
+| WP4 | `postgresadapter`: listener, trigger SQL, transactor, audit, filter store, idempotency store, history SQL, `ListPage`, cursor mode, export | embedded-postgres tests | done (#4) |
+| WP5 | `ginadapter`, `prometheusadapter`, uploads, batch, presence | tests | done (#5) |
+| WP6 | `generate`: TypeScript + runtime + vue, OpenAPI 3.0.3 | tsc gate, bun unit tests | done (#6) |
+| WP7 | `generate`: Go client, CLI | compiled against `examples/todo` | done (#7) |
+| WP8 | `livewiretest`, `examples/todo`, `test/e2e` (two engines, bun runtime) | e2e green in CI | done (#8) |
+| WP9 | docs, llms.txt, migration table, v1.0.0 | dual review | docs done (wp/9-docs); the v1.0.0 tag follows its merge |
+| WP10 | `xlsxadapter` | optional, cut first | optional, not done: Excel export is parked in TODO.md (MaPa, 31.10.2026) |
 
 Each WP: own branch, `just check` green, dual review (Codex and Fable) before merge.
 
 ## 11. Migration from mxcd/livewire v0.2.x
+
+*Superseded by the table as built in docs/wiki/Migration.md: `RegisterRoutes(router, &Options{Engine})` (D60), the Observer on the registry (D49), `NewMutation[Parameters, Request, Response]` with generic options, the Postgres SQL in migrations (D22, D53).*
 
 | v0.2 | v1 |
 |------|----|
