@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { createApp, effectScope, nextTick, reactive, ref, shallowRef } from 'vue'
+import { createApp, effectScope, nextTick, reactive, ref, shallowRef, watch } from 'vue'
 import { FakeClock, fakeSockets, settle } from './fakes'
 import { LiveConnection, createLivePair, liveRead, mutation, type ListResponse, type LivePair, type PresenceItem } from './runtime'
 import { livePairKey, livePlugin, useLive, useLiveConnection, useLiveList, useLivePair, useLivePresence, useLiveStatus, type SnapshotStorage } from './vue'
@@ -117,7 +117,7 @@ describe('useLive', () => {
     expect([...storage.values.keys()]).toEqual(['livewire:identity'])
     expect(storage.getItem('livewire:identity')).toBe('password:bob')
 
-    storage.setItem('livewire:password:bob:dashboard:[["board","z"]]', '{broken')
+    storage.setItem('livewire:["password:bob","dashboard",[["board","z"]]]', '{broken')
     const broken = effectScope().run(() => useLive(dashboard, { board: 'z' }, { connection: connect('password:bob').connection, cache: true, storage }))!
     expect(broken.data.value).toBeUndefined()
   })
@@ -125,7 +125,7 @@ describe('useLive', () => {
   test('without an identity nothing is cached, and a cache of somebody before is cleared (D21)', () => {
     const storage = new MemoryStorage()
     storage.setItem('livewire:identity', 'password:alice')
-    storage.setItem('livewire:password:alice:dashboard:[["board","a"]]', '{"title":"secret of alice"}')
+    storage.setItem('livewire:["password:alice","dashboard",[["board","a"]]]', '{"title":"secret of alice"}')
     const nobody = connect(null)
     const live = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: nobody.connection, cache: true, storage }))!
     expect(live.data.value).toBeUndefined()
@@ -554,14 +554,14 @@ describe('the end in the views (D66)', () => {
     root.current().open()
     root.current().answer('subscribe', { subscription: 's1' })
     root.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'secret of root' } })
-    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:password:root:'))).toBe(true)
+    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:["password:root"'))).toBe(true)
     root.connection.end()
-    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:password:root:'))).toBe(false)
+    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:["password:root"'))).toBe(false)
 
-    storage.setItem('livewire:password:root:dashboard:[["board","a"]]', '{"title":"secret of root"}')
+    storage.setItem('livewire:["password:root","dashboard",[["board","a"]]]', '{"title":"secret of root"}')
     const gap = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: root.connection, cache: true, storage }))!
     expect(gap.data.value).toBeUndefined()
-    expect(storage.getItem('livewire:password:root:dashboard:[["board","a"]]')).toBeNull()
+    expect(storage.getItem('livewire:["password:root","dashboard",[["board","a"]]]')).toBeNull()
   })
 
   test('a pair replaced without ending the old one drops the old data before the new push', async () => {
@@ -590,5 +590,63 @@ describe('the end in the views (D66)', () => {
       if (descriptor === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
       else Object.defineProperty(globalThis, 'localStorage', descriptor)
     }
+  })
+})
+
+describe('snapshot ownership and the end, last round (D66)', () => {
+  const pairOf = (identity: string, fakes = fakeSockets()) =>
+    createLivePair({ identity: () => identity, client: { baseURL: 'https://x', fetch: (async () => new Response('{}')) as unknown as typeof fetch }, connection: { url: 'wss://x', WebSocket: fakes.Socket, clock: new FakeClock() } })
+
+  test('the plugin removes an ended pair\'s snapshots with no cached view mounted', () => {
+    const storage = new MemoryStorage()
+    const fakes = fakeSockets()
+    const pair = shallowRef<LivePair>(pairOf('password:root', fakes))
+    const app = createApp({})
+    app.use(livePlugin(pair, { storage }))
+    const view = effectScope()
+    view.run(() => useLive(dashboard, { board: 'a' }, { connection: pair.value.connection, cache: true, storage }))
+    fakes.current().open()
+    fakes.current().answer('subscribe', { subscription: 's1' })
+    fakes.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'secret of root' } })
+    view.stop()
+    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:["password:root"'))).toBe(true)
+    pair.value.end()
+    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:["password:root"'))).toBe(false)
+  })
+
+  test('no snapshot is written once a watcher of the data ended the connection', () => {
+    const storage = new MemoryStorage()
+    const { connection, current } = connect('password:root')
+    effectScope().run(() => {
+      const live = useLive(dashboard, { board: 'a' }, { connection, cache: true, storage })
+      watch(live.data, () => connection.end(), { flush: 'sync' })
+    })
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'secret of root' } })
+    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:["password:root"'))).toBe(false)
+  })
+
+  test('the end of provider:a keeps the snapshots of provider:a:b', () => {
+    const storage = new MemoryStorage()
+    const other = 'livewire:["provider:a:b","private",[]]'
+    storage.setItem(other, '{"secret":"of a:b"}')
+    const pair = shallowRef<LivePair>(pairOf('provider:a'))
+    createApp({}).use(livePlugin(pair, { storage }))
+    pair.value.end()
+    expect(storage.getItem(other)).toBe('{"secret":"of a:b"}')
+  })
+
+  test('a Client that detects another identity ends the pair: a mounted view drops its data at once', async () => {
+    let identity = 'password:alice'
+    const fakes = fakeSockets()
+    const pair = createLivePair({ identity: () => identity, client: { baseURL: 'https://x', fetch: (async () => new Response('{}')) as unknown as typeof fetch }, connection: { url: 'wss://x', WebSocket: fakes.Socket, clock: new FakeClock() } })
+    const view = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: pair.connection }))!
+    fakes.current().open()
+    fakes.current().answer('subscribe', { subscription: 's1' })
+    fakes.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'of alice' } })
+    identity = 'password:bob'
+    await pair.client.read(dashboard, { board: 'a' }).catch(() => {})
+    expect([pair.connection.ended, view.data.value]).toEqual([true, undefined])
   })
 })

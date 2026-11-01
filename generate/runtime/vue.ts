@@ -37,13 +37,31 @@ import {
 /** The key the application provides its current pair under (livePlugin does). */
 export const livePairKey: InjectionKey<Readonly<Ref<LivePair>>> = Symbol('livewire pair')
 
+export interface LivePluginOptions {
+  /** The storage the cached views keep their snapshots in (localStorage by default); the plugin cleans it up. */
+  storage?: SnapshotStorage
+}
+
 /**
  * A Vue plugin that provides the current pair (D66): app.use(livePlugin(pair)), where pair is a
  * ref the application replaces with a new pair (createLivePair) on every identity change. Every
- * composable follows it: it ends its subscriptions on the old pair and subscribes on the new.
+ * composable follows it: it ends its subscriptions on the old pair and subscribes on the new. The
+ * plugin owns the snapshots (D21): every pair it was given removes its identity's snapshots from
+ * the storage when it ends, whether or not a cached view is mounted then.
  */
-export function livePlugin(pair: Readonly<Ref<LivePair>>): Plugin {
-  return { install: (app) => void app.provide(livePairKey, pair) }
+export function livePlugin(pair: Readonly<Ref<LivePair>>, options: LivePluginOptions = {}): Plugin {
+  return {
+    install: (app) => {
+      app.provide(livePairKey, pair)
+      const storage = options.storage ?? defaultStorage()
+      if (storage === undefined) return
+      watch(pair, (current) => {
+        current.connection.onStatus((status) => {
+          if (status === 'ended') removeSnapshots(storage, current.identity)
+        })
+      }, { immediate: true })
+    },
+  }
 }
 
 /** The provided pair reference. */
@@ -109,19 +127,33 @@ function defaultStorage(): SnapshotStorage | undefined {
   }
 }
 
-/** Removes every snapshot of an identity (its connection ended, D66); a storage that fails keeps them for the next identity's cleanup. */
+/**
+ * Removes every snapshot of an identity (its connection ended, D66), matched by the identity the
+ * key encodes, never by a prefix (provider:a is no part of provider:a:b); a storage that fails
+ * keeps them for the next identity's cleanup.
+ */
 function removeSnapshots(storage: SnapshotStorage, identity: string): void {
   if (identity === '') return
   try {
-    const prefix = `${snapshotPrefix}${identity}:`
     const keys: string[] = []
     for (let index = 0; index < storage.length; index++) {
       const key = storage.key(index)
-      if (key?.startsWith(prefix) === true) keys.push(key)
+      if (key !== null && snapshotIdentity(key) === identity) keys.push(key)
     }
     for (const key of keys) storage.removeItem(key)
   } catch {
     // a blocked storage: forgetOtherIdentities clears them on the next identity's first read
+  }
+}
+
+/** The identity a snapshot key belongs to, undefined for another key. */
+function snapshotIdentity(key: string): string | undefined {
+  if (!key.startsWith(snapshotPrefix) || key === identityKey) return undefined
+  try {
+    const parts: unknown = JSON.parse(key.slice(snapshotPrefix.length))
+    return Array.isArray(parts) && typeof parts[0] === 'string' ? parts[0] : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -162,8 +194,9 @@ function forgetOtherIdentities(storage: SnapshotStorage, identity: string): void
   storage.setItem(identityKey, identity)
 }
 
+/** A snapshot's key: the identity, the target and the parameters as one JSON tuple, so no identity is a prefix of another's keys. */
 function snapshotKey(identity: string, target: string, parameters: Record<string, string>): string {
-  return `${snapshotPrefix}${identity}:${target}:${JSON.stringify(Object.entries(parameters).sort())}`
+  return snapshotPrefix + JSON.stringify([identity, target, Object.entries(parameters).sort()])
 }
 
 /** Calls listener with the status of the current connection, following it when it is replaced; the result stops. */
@@ -242,8 +275,9 @@ function liveRead<Parameters extends object, Data>(
         filterId.value = state.filterId
         error.value = undefined
         stale.value = live.status !== 'open'
-        // The state belongs to the identity of the connection that delivered it.
-        if (storage !== undefined) writeSnapshot(storage, state.identity, snapshotKey(state.identity, target.target, wire), state.data)
+        // The state belongs to the identity of the connection that delivered it; nothing is
+        // written once that connection ended, a watcher of data.value having ended it included.
+        if (storage !== undefined && !live.ended) writeSnapshot(storage, state.identity, snapshotKey(state.identity, target.target, wire), state.data)
       },
       error: (refusal) => {
         if (token === owned) error.value = refusal

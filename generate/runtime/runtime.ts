@@ -481,6 +481,8 @@ export interface ClientOptions {
   onUnauthorized?: (error: ApiError) => void
   /** Where the unnamed filters this client stores are remembered (D54); share it with the LiveConnection. */
   filters?: FilterMemory
+  /** Called once when the client ends, whoever ended it (end(), another identity): createLivePair ends the connection with it. */
+  onEnd?: () => void
 }
 
 export interface RequestOptions {
@@ -544,8 +546,10 @@ export class Client {
    * the cookie, so a request between the change and the end would go out with the new one.
    */
   end(): void {
+    if (this.ended) return
     this.lifetime.abort()
     this.unnamedFilters.end()
+    this.options.onEnd?.()
   }
 
   /** Ends the client when the session's identity is no longer the one it serves. */
@@ -723,7 +727,7 @@ export class Client {
       // a body that is not JSON (a proxy's page) stays text
     }
     const error = new ApiError(response.status, body)
-    if (error.status === 401) this.options.onUnauthorized?.(error)
+    if (error.status === 401 && !this.ended) this.options.onUnauthorized?.(error)
     throw error
   }
 }
@@ -867,6 +871,8 @@ export interface PushFrame {
 
 interface PendingRequest {
   frame: RequestFrame
+  /** Whether the frame was written to a socket: a call that was may have run on the server. */
+  sent: boolean
   resolve(frame: ResponseFrame): void
   reject(error: Error): void
 }
@@ -1014,12 +1020,12 @@ export class LiveConnection {
       this.detach(socket)
       socket.close(CloseCode.normal)
     }
-    const error = new EndedError('livewire: the connection ended', true)
     const lost = [...this.pending.values()]
     this.pending.clear()
     this.outbox.length = 0
     this.filters.end()
-    for (const request of lost) request.reject(error)
+    for (const request of lost) request.reject(new EndedError(`livewire: the connection ended before ${request.frame.op} was answered`, request.sent))
+    const error = new EndedError('livewire: the connection ended')
     const subscriptions = [...this.subscriptions]
     this.subscriptions.clear()
     this.byServerID.clear()
@@ -1036,15 +1042,21 @@ export class LiveConnection {
     for (const listener of [...this.statusListeners]) this.notify(() => listener('ended'))
   }
 
-  /** Runs a callback of the application; what it throws goes to onError, else is thrown again in a microtask. */
+  /**
+   * Runs a callback of the application; what it throws goes to onError, else is thrown again in a
+   * microtask; what onError throws is thrown again in a microtask. Nothing a callback or onError
+   * throws stops the notifying.
+   */
   private notify(callback: () => void): void {
     try {
       callback()
     } catch (error) {
-      if (this.options.onError !== undefined) this.options.onError(error)
-      else queueMicrotask(() => {
-        throw error
-      })
+      try {
+        if (this.options.onError === undefined) rethrowLater(error)
+        else this.options.onError(error)
+      } catch (reporterError) {
+        rethrowLater(reporterError)
+      }
     }
   }
 
@@ -1179,7 +1191,10 @@ export class LiveConnection {
   private setStatus(status: LiveStatus): void {
     if (status === this.currentStatus || this.isEnded) return
     this.currentStatus = status
-    for (const listener of [...this.statusListeners]) this.notify(() => listener(status))
+    for (const listener of [...this.statusListeners]) {
+      if (this.currentStatus !== status) return // a listener ended it or moved it on: the rest hear the newer status only
+      this.notify(() => listener(status))
+    }
   }
 
   private needed(): boolean {
@@ -1229,6 +1244,7 @@ export class LiveConnection {
       signal?.addEventListener('abort', abort, { once: true })
       this.pending.set(identified.id, {
         frame: identified,
+        sent: false,
         resolve: (response) => {
           finish()
           resolve(response)
@@ -1250,10 +1266,16 @@ export class LiveConnection {
     const encoded = JSON.stringify(frame)
     if (this.socket?.readyState === socketOpen) {
       this.socket.send(encoded)
+      this.markSent(frame.id)
       return
     }
     this.outbox.push({ id: frame.id, encoded })
     this.ensureConnecting()
+  }
+
+  private markSent(id: string): void {
+    const request = this.pending.get(id)
+    if (request !== undefined) request.sent = true
   }
 
   /** Opens a socket for the identity the connection serves; under another one the connection ends instead. */
@@ -1284,7 +1306,10 @@ export class LiveConnection {
     this.attempt = 0
     this.setStatus('open')
     this.lastMessage = this.clock.now()
-    for (const entry of this.outbox.splice(0)) socket.send(entry.encoded)
+    for (const entry of this.outbox.splice(0)) {
+      socket.send(entry.encoded)
+      this.markSent(entry.id)
+    }
     for (const subscription of this.subscriptions) if (!subscription.ended) this.sendSubscribe(subscription)
     for (const record of this.presences.values()) this.sendJoin(record)
     this.schedulePing(socket)
@@ -1393,6 +1418,7 @@ export class LiveConnection {
     }, timeout)
     this.pending.set(frame.id, {
       frame,
+      sent: false,
       resolve: (response) => {
         this.clock.clearTimeout(timer)
         this.pending.delete(frame.id)
@@ -1598,6 +1624,13 @@ export class LiveConnection {
   }
 }
 
+/** Throws error again outside the current call, after it finished. */
+function rethrowLater(error: unknown): void {
+  queueMicrotask(() => {
+    throw error
+  })
+}
+
 /** The server's list with the optimistic changes not yet replaced by a push, applied in the order the calls started. */
 function overlaid(subscription: Subscription): unknown {
   if (subscription.overlay.length === 0) return subscription.data
@@ -1648,19 +1681,22 @@ export interface LivePairOptions {
 export function createLivePair(options: LivePairOptions): LivePair {
   const filters = new FilterMemory()
   const identity = options.identity?.() ?? ''
-  const clientOptions: ClientOptions = { ...options.client, filters }
+  let connection: LiveConnection | undefined
+  // Either side's end ends the pair: the client's (another identity before a REST call) ends the connection.
+  const clientOptions: ClientOptions = { ...options.client, filters, onEnd: () => connection?.end() }
   if (options.identity !== undefined) clientOptions.identity = options.identity
   const client = new Client(clientOptions)
   const connectionOptions: LiveOptions = { ...options.connection, filters }
   if (options.identity !== undefined) connectionOptions.identity = options.identity
-  const connection = new LiveConnection(connectionOptions)
-  connection.onStatus((status) => {
+  connection = new LiveConnection(connectionOptions)
+  const live = connection
+  live.onStatus((status) => {
     if (status === 'ended') client.end()
   })
   return {
-    identity, client, connection, filters,
+    identity, client, connection: live, filters,
     end: () => {
-      connection.end()
+      live.end()
       client.end()
     },
   }

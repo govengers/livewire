@@ -927,7 +927,8 @@ describe('Client ends instead of switching identity (D66)', () => {
     const call = client.call(createPart, {}, { name: 'a' }).catch((error: unknown) => error)
     await settle()
     client.end()
-    const ended = await call
+    // Fail fast: the end must settle the call at once, not leave it to the test's timeout.
+    const ended = await Promise.race([call, new Promise((resolve) => setTimeout(() => resolve('still pending'), 50))])
     expect([ended instanceof EndedError, (ended as EndedError).sent]).toEqual([true, false])
     release({ Authorization: 'Bearer of bob' })
     await settle()
@@ -1008,9 +1009,11 @@ describe('ending is one step (D66)', () => {
     let ends = 0
     connection.subscribe(parts, {}, { next: () => {}, error: () => {}, end: () => void ends++ })
     current().open()
-    const owed = connection.query(notes, {}).catch((error: unknown) => error)
+    // A mutation owed, which no D54 wrapper turns into an EndedError.
+    const owed = connection.call(deletePart, { id: 'a' }, undefined).catch((error: unknown) => error)
     current().end(4401)
-    expect(await owed).toBeInstanceOf(EndedError)
+    const ended = await owed
+    expect([ended instanceof EndedError, (ended as EndedError).sent]).toEqual([true, true])
     expect([connection.status, ends, errors.length]).toEqual(['ended', 1, 1])
   })
 
@@ -1066,5 +1069,78 @@ describe('ending is one step (D66)', () => {
     identity = 'password:bob'
     await expect(client.read(notes, {})).rejects.toBeInstanceOf(EndedError)
     expect([calls.length, client.ended, client.identity]).toEqual([0, true, 'password:alice'])
+  })
+})
+
+describe('the end path, last round (D66)', () => {
+  const base = 'https://example.com/api/v1'
+
+  test('a throwing listener and a throwing onError stop no notifying: every listener ends and the pair\'s client too', () => {
+    const pair = createLivePair({ client: { baseURL: base }, connection: { url: 'wss://x', WebSocket: fakeSockets().Socket, onError: () => { throw new Error('a broken reporter') } } })
+    let secondEnded = false
+    pair.connection.subscribe(parts, {}, { next: () => {}, error: () => {}, end: () => { throw new Error('a broken listener') } })
+    pair.connection.subscribe(parts, {}, { next: () => {}, error: () => {}, end: () => void (secondEnded = true) })
+    const rethrown: unknown[] = []
+    const original = globalThis.queueMicrotask
+    globalThis.queueMicrotask = (callback) => {
+      try {
+        callback()
+      } catch (error) {
+        rethrown.push(error)
+      }
+    }
+    try {
+      pair.connection.end()
+    } finally {
+      globalThis.queueMicrotask = original
+    }
+    expect([secondEnded, pair.client.ended, rethrown.length]).toEqual([true, true, 1])
+  })
+
+  test('a Client that detects another identity ends the pair\'s connection too', async () => {
+    let identity = 'password:alice'
+    const pair = createLivePair({ identity: () => identity, client: { baseURL: base, fetch: fakeFetch(json({})).fetch }, connection: { url: 'wss://x', WebSocket: fakeSockets().Socket } })
+    identity = 'password:bob'
+    await expect(pair.client.read(notes, {})).rejects.toBeInstanceOf(EndedError)
+    expect(pair.connection.ended).toBe(true)
+  })
+
+  test('once a status listener ended the connection, no listener hears an older status', () => {
+    const { connection } = connect()
+    const heard: string[] = []
+    connection.onStatus((status) => {
+      if (status === 'connecting') connection.end()
+    })
+    connection.onStatus((status) => void heard.push(status))
+    connection.subscribe(parts, {}, listener())
+    expect(heard).toEqual(['idle', 'ended'])
+  })
+
+  test('EndedError.sent on the socket says whether the frame was written', async () => {
+    const queued = connect()
+    const unsent = queued.connection.call(deletePart, { id: 'a' }, undefined).catch((error: unknown) => error)
+    queued.connection.end()
+    expect(((await unsent) as EndedError).sent).toBe(false)
+
+    const open = connect()
+    const written = open.connection.call(deletePart, { id: 'a' }, undefined).catch((error: unknown) => error)
+    open.current().open()
+    open.connection.end()
+    expect(((await written) as EndedError).sent).toBe(true)
+  })
+
+  test('onUnauthorized does not fire for a 401 whose body the end cut', async () => {
+    let body: (text: string) => void = () => {}
+    const unauthorized = new Response('', { status: 401 })
+    Object.defineProperty(unauthorized, 'text', { value: () => new Promise<string>((resolve) => (body = resolve)) })
+    let calls = 0
+    const client = new Client({ baseURL: base, fetch: fakeFetch(unauthorized).fetch, onUnauthorized: () => void calls++ })
+    const read = client.read(notes, {}).catch((error: unknown) => error)
+    await settle()
+    client.end()
+    body('{"code":"unauthenticated","message":"login"}')
+    await settle()
+    expect(await read).toBeInstanceOf(EndedError)
+    expect(calls).toBe(0)
   })
 })

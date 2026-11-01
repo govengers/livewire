@@ -43,13 +43,17 @@ export const plugin = livePlugin(pair)
 /**
  * An account switch (login and logout alike): end the old pair first, before the request that
  * changes the session cookie, since neither instance can see the cookie and a request in between
- * would go out with the new one; then provide the new pair through the plugin's reference.
+ * would go out with the new one; then provide a new pair through the plugin's reference, for the
+ * new session or, when the change failed (a wrong password, the network), for the one still there.
  */
 export async function switchAccount(next: string, changeSession: () => Promise<void>): Promise<void> {
   pair.value.end()
-  await changeSession()
-  session = next
-  pair.value = pairOf()
+  try {
+    await changeSession()
+    session = next
+  } finally {
+    pair.value = pairOf()
+  }
 }
 
 export async function rest(): Promise<void> {
