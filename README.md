@@ -14,6 +14,7 @@ Declare an API once in Go and serve it three ways: as REST routes, as a WebSocke
 | `livewire/postgresadapter` | LISTEN feed, trigger and table SQL, transactor, audit, filter, idempotency and presence stores | pgx/v5 |
 | `livewire/prometheusadapter` | engine metrics on a `prometheus.Registerer` | client_golang |
 | `livewire/generate` | TypeScript, OpenAPI, Go client and CLI emitters | standard library |
+| `livewire/client` | the runtime the generated Go client and CLI stand on: REST with an API key, one socket for every subscription | gorilla/websocket |
 | `livewire/livewiretest` | contract gates for application test suites | testing |
 
 ```sh
