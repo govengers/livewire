@@ -545,3 +545,50 @@ describe('useLiveList limits and cursors', () => {
     expect(live.error.value).toBeUndefined()
   })
 })
+
+describe('the end in the views (D66)', () => {
+  test('a cached view mounted on an ended connection reads no snapshot, and the end removes that identity\'s snapshots', () => {
+    const storage = new MemoryStorage()
+    const root = connect('password:root')
+    effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: root.connection, cache: true, storage }))
+    root.current().open()
+    root.current().answer('subscribe', { subscription: 's1' })
+    root.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'secret of root' } })
+    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:password:root:'))).toBe(true)
+    root.connection.end()
+    expect([...storage.values.keys()].some((key) => key.startsWith('livewire:password:root:'))).toBe(false)
+
+    storage.setItem('livewire:password:root:dashboard:[["board","a"]]', '{"title":"secret of root"}')
+    const gap = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: root.connection, cache: true, storage }))!
+    expect(gap.data.value).toBeUndefined()
+    expect(storage.getItem('livewire:password:root:dashboard:[["board","a"]]')).toBeNull()
+  })
+
+  test('a pair replaced without ending the old one drops the old data before the new push', async () => {
+    const alice = connect('password:alice')
+    const followed = shallowRef(alice.connection)
+    const live = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: followed }))!
+    alice.current().open()
+    alice.current().answer('subscribe', { subscription: 's1' })
+    alice.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'of alice' } })
+    followed.value = connect('password:bob').connection
+    await nextTick()
+    expect(live.data.value).toBeUndefined()
+  })
+
+  test('a browser that blocks storage (the getter throws) is a cache miss', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, get: () => { throw new Error('SecurityError') } })
+    try {
+      const { connection, current } = connect()
+      const live = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection, cache: true }))!
+      current().open()
+      current().answer('subscribe', { subscription: 's1' })
+      current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'A' } })
+      expect(live.data.value?.title).toBe('A')
+    } finally {
+      if (descriptor === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
+      else Object.defineProperty(globalThis, 'localStorage', descriptor)
+    }
+  })
+})

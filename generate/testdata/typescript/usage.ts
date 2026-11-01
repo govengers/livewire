@@ -36,18 +36,24 @@ const pairOf = (): LivePair => createLivePair({
   client: { baseURL: 'https://example.com/api/v1', headers: () => ({ Authorization: 'Bearer key' }) },
   connection: { url: 'wss://example.com/api/v1/socket' },
 })
+/** The plugin's reference: replacing its pair is how every composable moves to a new identity. */
 const pair = shallowRef(pairOf())
 export const plugin = livePlugin(pair)
-const { client, connection } = pair.value
 
-/** An account switch: end the old pair, provide the new one; the composables follow it. */
-export function switchAccount(next: string): void {
+/**
+ * An account switch (login and logout alike): end the old pair first, before the request that
+ * changes the session cookie, since neither instance can see the cookie and a request in between
+ * would go out with the new one; then provide the new pair through the plugin's reference.
+ */
+export async function switchAccount(next: string, changeSession: () => Promise<void>): Promise<void> {
   pair.value.end()
+  await changeSession()
   session = next
   pair.value = pairOf()
 }
 
 export async function rest(): Promise<void> {
+  const client = pair.value.client
   const page: ListResponse<FixturePart> = await getParts(client)
   const next: string | undefined = page.next
   const filter: PartsFilter = {
@@ -134,6 +140,7 @@ export async function rest(): Promise<void> {
 }
 
 export function socket(): void {
+  const connection = pair.value.connection
   connection.onStatus((status) => console.log(status))
   const subscription = connection.subscribe(live.parts, { limit: 10 }, {
     next: (state) => console.log(state.data.items.length, state.pending, state.filterId, state.identity),
@@ -150,7 +157,7 @@ export function socket(): void {
   const prepared = prepareCall(calls.createPart, { name: 'a', kind: 'bolt' })
   void connection.call(calls.createPart, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey, signal: new AbortController().signal })
   connection.checkIdentity()
-  console.log(connection.ended, client.ended, client.identity, new EndedError('x') instanceof NetworkError)
+  console.log(connection.ended, pair.value.client.ended, pair.value.client.identity, new EndedError('x', true).sent)
   // @ts-expect-error notes is not live
   connection.subscribe(live.notes, {}, { next: () => {}, error: () => {} })
   // @ts-expect-error a mutation's body
@@ -158,12 +165,13 @@ export function socket(): void {
 }
 
 export function composables(): void {
+  const connection = () => pair.value.connection
   effectScope().run(() => {
     const parts = useLive(live.parts, { limit: 10 }, { cache: true, connection })
     const first: FixturePart | undefined = parts.data.value?.items[0]
     const loading: boolean = parts.loading.value
-    const dashboard = useLive(live.dashboard, () => ({ board: 'b' }), { connection: () => pair.value.connection })
-    console.log(useLiveConnection(() => pair.value.connection).value.identity())
+    const dashboard = useLive(live.dashboard, () => ({ board: 'b' }), { connection })
+    console.log(useLiveConnection(connection).value.identity())
     const list = useLiveList(live.parts, { connection, mode: 'cursor', limit: 20, sort: ['-createdAt'] })
     list.filter.value = { where: { field: 'name', op: 'startsWith', value: 'b' } }
     list.loadMore()

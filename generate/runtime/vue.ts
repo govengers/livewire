@@ -75,7 +75,8 @@ export interface UseLiveOptions {
   /**
    * Keep the last data in storage and show it, stale, before the socket answers (D21). The
    * snapshot belongs to the identity of the connection that delivered it: without one nothing is
-   * kept, and another identity clears every snapshot of the one before.
+   * kept, an ended connection's views read none and its end removes its identity's snapshots,
+   * and another identity clears every snapshot of the one before.
    */
   cache?: boolean
   storage?: SnapshotStorage
@@ -99,8 +100,29 @@ export interface LiveRead<Data> {
 const snapshotPrefix = 'livewire:'
 const identityKey = `${snapshotPrefix}identity`
 
+/** localStorage, or none where there is none or the browser blocks it (its getter throws). */
 function defaultStorage(): SnapshotStorage | undefined {
-  return typeof localStorage === 'undefined' ? undefined : localStorage
+  try {
+    return typeof localStorage === 'undefined' ? undefined : localStorage
+  } catch {
+    return undefined
+  }
+}
+
+/** Removes every snapshot of an identity (its connection ended, D66); a storage that fails keeps them for the next identity's cleanup. */
+function removeSnapshots(storage: SnapshotStorage, identity: string): void {
+  if (identity === '') return
+  try {
+    const prefix = `${snapshotPrefix}${identity}:`
+    const keys: string[] = []
+    for (let index = 0; index < storage.length; index++) {
+      const key = storage.key(index)
+      if (key?.startsWith(prefix) === true) keys.push(key)
+    }
+    for (const key of keys) storage.removeItem(key)
+  } catch {
+    // a blocked storage: forgetOtherIdentities clears them on the next identity's first read
+  }
 }
 
 /**
@@ -203,7 +225,8 @@ function liveRead<Parameters extends object, Data>(
     if (subscribedOn !== undefined && subscribedOn !== live) forget()
     subscribedOn = live
     const wire = wireParameters(current())
-    if (storage !== undefined) {
+    if (storage !== undefined && live.ended) removeSnapshots(storage, live.identity())
+    else if (storage !== undefined) {
       const cached = readSnapshot(storage, live.identity(), snapshotKey(live.identity(), target.target, wire))
       if (cached !== undefined) data.value = cached as Data
     }
@@ -227,6 +250,7 @@ function liveRead<Parameters extends object, Data>(
       },
       end: () => {
         if (token === owned) forget()
+        if (storage !== undefined) removeSnapshots(storage, live.identity())
       },
     })
   }

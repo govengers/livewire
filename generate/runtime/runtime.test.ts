@@ -923,12 +923,14 @@ describe('Client ends instead of switching identity (D66)', () => {
   test('a mutation still awaiting its headers when the client ends is never sent', async () => {
     let release: (headers: Record<string, string>) => void = () => {}
     const { fetch, calls } = fakeFetch(json({ id: 'p', name: 'a' }, 201))
-    const client = new Client({ baseURL: base, fetch, identity: 'password:alice', headers: () => new Promise((resolve) => (release = resolve)) })
-    const call = client.call(createPart, {}, { name: 'a' })
+    const client = new Client({ baseURL: base, fetch, identity: () => 'password:alice', headers: () => new Promise((resolve) => (release = resolve)) })
+    const call = client.call(createPart, {}, { name: 'a' }).catch((error: unknown) => error)
     await settle()
     client.end()
+    const ended = await call
+    expect([ended instanceof EndedError, (ended as EndedError).sent]).toEqual([true, false])
     release({ Authorization: 'Bearer of bob' })
-    await expect(call).rejects.toBeInstanceOf(EndedError)
+    await settle()
     expect(calls).toHaveLength(0)
     expect([client.identity, client.ended]).toEqual(['password:alice', true])
     await expect(client.read(notes, {})).rejects.toBeInstanceOf(EndedError)
@@ -966,5 +968,103 @@ describe('Client ends instead of switching identity (D66)', () => {
     const second = createLivePair({ client: { baseURL: base }, connection: { url: 'wss://x' } })
     second.end()
     expect([second.identity, second.client.ended, second.connection.ended]).toEqual(['', true, true])
+  })
+})
+
+describe('ending is one step (D66)', () => {
+  const base = 'https://example.com/api/v1'
+
+  test('everything has ended before any listener is told, and a throwing status listener changes nothing of it', async () => {
+    const errors: unknown[] = []
+    const { connection, current } = connect({ onError: (error) => void errors.push(error) })
+    let ends = 0
+    connection.subscribe(parts, {}, { next: () => {}, error: () => {}, end: () => void ends++ })
+    current().open()
+    const owed = connection.query(notes, {}).catch((error: unknown) => error)
+    const seen: unknown[] = []
+    connection.onStatus((status) => {
+      if (status !== 'ended') return
+      seen.push(ends, current().closedWith, connection.ended)
+      throw new Error('a broken status listener')
+    })
+    connection.end()
+    expect(seen).toEqual([1, 1000, true])
+    expect(errors).toHaveLength(1)
+    expect(await owed).toBeInstanceOf(EndedError)
+  })
+
+  test('an end from the connecting status constructs no socket', () => {
+    const { connection, sockets } = connect()
+    connection.onStatus((status) => {
+      if (status === 'connecting') connection.end()
+    })
+    connection.subscribe(parts, {}, listener())
+    expect([sockets.length, connection.status]).toEqual([0, 'ended'])
+  })
+
+  test('a 4401 rejects what was owed with EndedError and ends even when onUnauthorized throws', async () => {
+    const errors: unknown[] = []
+    const { connection, current } = connect({ onUnauthorized: () => { throw new Error('a broken callback') }, onError: (error) => void errors.push(error) })
+    let ends = 0
+    connection.subscribe(parts, {}, { next: () => {}, error: () => {}, end: () => void ends++ })
+    current().open()
+    const owed = connection.query(notes, {}).catch((error: unknown) => error)
+    current().end(4401)
+    expect(await owed).toBeInstanceOf(EndedError)
+    expect([connection.status, ends, errors.length]).toEqual(['ended', 1, 1])
+  })
+
+  test('a connection with its own FilterMemory ends it', () => {
+    const filters = new FilterMemory()
+    const { connection, current } = connect({ filters })
+    connection.subscribe(parts, { filter: { search: 'x' } }, listener())
+    current().open()
+    current().answer('subscribe', { subscription: 's1', filterId: 'f1' })
+    expect(filters.document('f1')).toBe('{"search":"x"}')
+    connection.end()
+    expect(filters.document('f1')).toBeUndefined()
+  })
+
+  test('a join in flight when the connection ends reports no error', async () => {
+    const errors: Error[] = []
+    const { connection, current } = connect()
+    const registration = connection.join(presence, { key: 'k' }, {}, { onError: (error) => void errors.push(error) })
+    current().open()
+    connection.end()
+    await expect(registration.ready).rejects.toBeInstanceOf(EndedError)
+    await settle()
+    expect(errors).toEqual([])
+  })
+
+  test('a REST response that arrives after the end, and one whose body the end cuts, settle with EndedError(sent)', async () => {
+    let answer: (response: Response) => void = () => {}
+    const pendingFetch = (() => new Promise<Response>((resolve) => (answer = resolve))) as unknown as typeof fetch
+    const late = new Client({ baseURL: base, fetch: pendingFetch })
+    const call = late.call(createPart, {}, { name: 'a' }).catch((error: unknown) => error)
+    await settle()
+    late.end()
+    answer(json({ id: 'p', name: 'a' }, 201))
+    const lateError = await call
+    expect([lateError instanceof EndedError, (lateError as EndedError).sent]).toEqual([true, true])
+
+    let body: (text: string) => void = () => {}
+    const halfRead = new Response('')
+    Object.defineProperty(halfRead, 'text', { value: () => new Promise<string>((resolve) => (body = resolve)) })
+    const cut = new Client({ baseURL: base, fetch: fakeFetch(halfRead).fetch })
+    const read = cut.read(notes, {}).catch((error: unknown) => error)
+    await settle()
+    cut.end()
+    body('{}')
+    const cutError = await read
+    expect([cutError instanceof EndedError, (cutError as EndedError).sent]).toEqual([true, true])
+  })
+
+  test('a Client whose session answers another identity ends before sending', async () => {
+    let identity = 'password:alice'
+    const { fetch, calls } = fakeFetch(json({}))
+    const client = new Client({ baseURL: base, fetch, identity: () => identity })
+    identity = 'password:bob'
+    await expect(client.read(notes, {})).rejects.toBeInstanceOf(EndedError)
+    expect([calls.length, client.ended, client.identity]).toEqual([0, true, 'password:alice'])
   })
 })

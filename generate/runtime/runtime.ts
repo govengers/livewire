@@ -252,12 +252,17 @@ export class NetworkError extends Error {
 /**
  * The one error of an ended instance (D66): a Client or LiveConnection serves one identity, and
  * once it ended (its identity changed, a 4401, end()) every request it had not answered and every
- * request after fails with it. Make a new pair for the next identity.
+ * request after fails with it. Make a new pair for the next identity. `sent` says whether the
+ * request had gone out: a mutation that was sent may have run on the server, so retry it with the
+ * same Idempotency-Key (prepareCall) once a new pair serves the identity again.
  */
 export class EndedError extends NetworkError {
-  constructor(message: string) {
+  readonly sent: boolean
+
+  constructor(message: string, sent = false) {
     super(message)
     this.name = 'EndedError'
+    this.sent = sent
   }
 }
 
@@ -458,8 +463,13 @@ function requireDuration(value: number | undefined, name: string, minimum: numbe
 }
 
 export interface ClientOptions {
-  /** Who the client acts as, "provider:subject" or any stable key; fixed for its life (D66). */
-  identity?: string
+  /**
+   * Who the application's session acts as now, "provider:subject" or any stable key. The client
+   * serves the identity it answers at construction, for its whole life (D66): when it answers
+   * another before a request goes out, the client ends instead of sending it. It cannot see a
+   * session cookie, so end the client before the request that changes the cookie.
+   */
+  identity?: () => string
   /** The registry's BasePath, absolute ("https://api.example.com/api/v1") or below the page's origin ("/api/v1"). */
   baseURL: string
   fetch?: typeof fetch
@@ -501,34 +511,73 @@ const exportRowsTrailer = 'Livewire-Export-Rows'
 
 /**
  * The REST client of one identity (D66): every route of the generated api.ts runs through one.
- * end() ends it for good: a request not yet sent (one still awaiting its headers included) or in
- * flight fails with an EndedError, a D54 retry is not made, nothing is remembered after.
+ * end() ends it for good: every request it has not answered settles with an EndedError, whether
+ * it still awaited its headers, was on its way or had its response half read, and so does every
+ * request after; a D54 retry is not made, nothing is remembered after.
  */
 export class Client {
   private readonly options: ClientOptions
   private readonly unnamedFilters: FilterMemory
   private readonly lifetime = new AbortController()
+  private readonly servedIdentity: string
 
   /** Validates and copies the options: a baseURL is required. */
   constructor(options: ClientOptions) {
     requireText(options.baseURL, 'ClientOptions.baseURL')
     this.options = { ...options }
     this.unnamedFilters = options.filters ?? new FilterMemory()
+    this.servedIdentity = options.identity?.() ?? ''
   }
 
-  /** The identity the client was made for, "" without one. */
+  /** The identity the client serves, fixed at construction, "" for nobody. */
   get identity(): string {
-    return this.options.identity ?? ''
+    return this.servedIdentity
   }
 
   get ended(): boolean {
     return this.lifetime.signal.aborted
   }
 
-  /** Ends the client and its FilterMemory (logout, an identity change). */
+  /**
+   * Ends the client and its FilterMemory for good (logout, an identity change). Call it before
+   * the request that changes the session cookie (login, logout, switch): the client cannot see
+   * the cookie, so a request between the change and the end would go out with the new one.
+   */
   end(): void {
     this.lifetime.abort()
     this.unnamedFilters.end()
+  }
+
+  /** Ends the client when the session's identity is no longer the one it serves. */
+  private checkIdentity(): void {
+    if (!this.ended && this.options.identity !== undefined && this.options.identity() !== this.servedIdentity) this.end()
+  }
+
+  /**
+   * Runs one request's work and settles it with an EndedError the moment the client ends: the
+   * end settles it first, so whatever the work answers later (a response, a cut body, headers
+   * that resolved) is never delivered. progress.sent records whether the request went out.
+   */
+  private untilEnd<Result>(method: string, path: string, work: (progress: { sent: boolean }) => Promise<Result>): Promise<Result> {
+    this.checkIdentity()
+    const progress = { sent: false }
+    const ended = (): EndedError => new EndedError(`livewire: ${method} ${path}: the client ended`, progress.sent)
+    if (this.ended) return Promise.reject(ended())
+    return new Promise<Result>((resolve, reject) => {
+      const onEnd = (): void => reject(ended())
+      this.lifetime.signal.addEventListener('abort', onEnd, { once: true })
+      const done = (): void => this.lifetime.signal.removeEventListener('abort', onEnd)
+      work(progress).then(
+        (result) => {
+          done()
+          resolve(result)
+        },
+        (error: unknown) => {
+          done()
+          reject(error)
+        },
+      )
+    })
   }
 
   async read<Parameters extends object, Data>(target: ReadTarget<Parameters, Data>, parameters: NoInfer<Parameters>, options: RequestOptions = {}): Promise<Data> {
@@ -609,18 +658,23 @@ export class Client {
    * evicted unnamed filterId is sent inline once (D54).
    */
   async download<Query extends object>(target: ExportTarget<Query>, query: NoInfer<Query>, options: RequestOptions = {}): Promise<ExportDownload> {
-    const response = await recoveringEvictedFilter(wireParameters(query), this.unnamedFilters, () => this.ended, (wire) => this.fetch('GET', routeOf(target.path, [], wire), options))
-    let blob: Blob
-    try {
-      blob = await response.blob()
-    } catch (cause) {
-      throw new NetworkError('livewire: the export was cut off', { cause })
-    }
-    const trailer = (response as { trailer?: Promise<Headers> }).trailer
-    if (trailer === undefined) return { blob, rows: null }
-    const rows = (await trailer).get(exportRowsTrailer)
-    if (rows === null) throw new NetworkError('livewire: the export ended without its row count')
-    return { blob, rows: Number(rows) }
+    return recoveringEvictedFilter(wireParameters(query), this.unnamedFilters, () => this.ended, (wire) => {
+      const path = routeOf(target.path, [], wire)
+      return this.untilEnd('GET', path, async (progress) => {
+        const response = await this.fetch('GET', path, options, {}, progress)
+        let blob: Blob
+        try {
+          blob = await response.blob()
+        } catch (cause) {
+          throw new NetworkError('livewire: the export was cut off', { cause })
+        }
+        const trailer = (response as { trailer?: Promise<Headers> }).trailer
+        if (trailer === undefined) return { blob, rows: null }
+        const rows = (await trailer).get(exportRowsTrailer)
+        if (rows === null) throw new NetworkError('livewire: the export ended without its row count')
+        return { blob, rows: Number(rows) }
+      })
+    })
   }
 
   private url(path: string): URL {
@@ -628,37 +682,36 @@ export class Client {
     return new URL(this.options.baseURL.replace(/\/$/, '') + path, origin)
   }
 
-  private async request(method: string, path: string, options: RequestOptions, outgoing: RequestInit = {}): Promise<unknown> {
-    const response = await this.fetch(method, path, options, outgoing)
-    if (response.status === 204) return undefined
-    let text: string
-    try {
-      text = await response.text()
-    } catch (cause) {
-      throw new NetworkError('livewire: the response was cut off', { cause })
-    }
-    return text === '' ? undefined : JSON.parse(text)
-  }
-
-  private refuseEnded(method: string, path: string): void {
-    if (this.ended) throw new EndedError(`livewire: ${method} ${path}: the client ended`)
+  private request(method: string, path: string, options: RequestOptions, outgoing: RequestInit = {}): Promise<unknown> {
+    return this.untilEnd(method, path, async (progress) => {
+      const response = await this.fetch(method, path, options, outgoing, progress)
+      if (response.status === 204) return undefined
+      let text: string
+      try {
+        text = await response.text()
+      } catch (cause) {
+        throw new NetworkError('livewire: the response was cut off', { cause })
+      }
+      return text === '' ? undefined : JSON.parse(text)
+    })
   }
 
   /**
    * Sends one request and answers the response of a success; a refusal is thrown as an ApiError.
-   * An ended client sends nothing, not even a request whose headers resolved after the end.
+   * Nothing goes out once the client ended or the session's identity changed, not even a request
+   * whose headers resolved after it (untilEnd settles the caller then).
    */
-  private async fetch(method: string, path: string, options: RequestOptions, outgoing: RequestInit = {}): Promise<Response> {
-    this.refuseEnded(method, path)
+  private async fetch(method: string, path: string, options: RequestOptions, outgoing: RequestInit, progress: { sent: boolean }): Promise<Response> {
     const headers = { ...(await this.options.headers?.()), ...(outgoing.headers as Record<string, string> | undefined) }
-    this.refuseEnded(method, path)
+    this.checkIdentity()
+    if (this.ended) throw new EndedError(`livewire: ${method} ${path}: the client ended`)
     const signal = options.signal === undefined ? this.lifetime.signal : AbortSignal.any([options.signal, this.lifetime.signal])
     const request: RequestInit = { ...outgoing, method, headers, credentials: this.options.credentials ?? 'same-origin', signal }
+    progress.sent = true
     let response: Response
     try {
       response = await (this.options.fetch ?? fetch)(this.url(path), request)
     } catch (cause) {
-      this.refuseEnded(method, path)
       throw new NetworkError(`livewire: ${method} ${path} got no answer`, { cause })
     }
     if (response.ok) return response
@@ -759,8 +812,10 @@ export interface LiveOptions {
    * identity and never without one (D21).
    */
   identity?: () => string
-  /** Called on close code 4401 (the identity is gone), right before the connection ends. */
+  /** Called on close code 4401 (the identity is gone), right after the connection ended. */
   onUnauthorized?: () => void
+  /** Gets what an application callback threw (a status listener, a listener's end, onUnauthorized); without it the error is thrown again in a microtask. */
+  onError?: (error: unknown) => void
   /** The first reconnect delay in ms (default 1000), doubling up to maximumReconnectDelay (default 30000), with jitter. */
   reconnectDelay?: number
   maximumReconnectDelay?: number
@@ -883,6 +938,7 @@ export class LiveConnection {
   private readonly clock: Clock
   private readonly filters: FilterMemory
   private readonly servedIdentity: string
+  private isEnded = false
   private socket: WebSocketLike | undefined
   private currentStatus: LiveStatus = 'idle'
   private readonly statusListeners = new Set<(status: LiveStatus) => void>()
@@ -919,7 +975,7 @@ export class LiveConnection {
   }
 
   get ended(): boolean {
-    return this.currentStatus === 'ended'
+    return this.isEnded
   }
 
   /** The identity the connection serves, fixed at construction, "" for nobody. */
@@ -940,21 +996,25 @@ export class LiveConnection {
   }
 
   /**
-   * Ends the connection for good (D66): the socket closes, the reconnect stops, every queued and
-   * pending request fails with an EndedError, the FilterMemory ends, every subscription's listener
-   * gets end() and every presence registration's ready fails. Logout and an identity change call
-   * it; make a new LiveConnection (and Client) for the next identity.
+   * Ends the connection for good (D66), in one step: it is marked ended, the reconnect stops,
+   * the socket closes, every queued and pending request fails with an EndedError, the FilterMemory
+   * ends, every subscription drops its data and every presence registration's ready fails; only
+   * then are the listeners (end()) and the status listeners ('ended') told, each under recovery, so
+   * a callback that throws or ends again changes nothing of the ending. Logout and an identity
+   * change call it; end the pair before the request that changes the session cookie (login,
+   * logout, switch), since the connection cannot see the cookie, and make a new pair for the next
+   * identity.
    */
   end(): void {
-    if (this.ended) return
-    this.setStatus('ended')
+    if (this.isEnded) return
+    this.isEnded = true
     this.cancelReconnect()
     const socket = this.socket
     if (socket !== undefined) {
       this.detach(socket)
       socket.close(CloseCode.normal)
     }
-    const error = new EndedError('livewire: the connection ended')
+    const error = new EndedError('livewire: the connection ended', true)
     const lost = [...this.pending.values()]
     this.pending.clear()
     this.outbox.length = 0
@@ -966,12 +1026,26 @@ export class LiveConnection {
     for (const subscription of subscriptions) {
       // Without data nothing is delivered again: not a rollback, a settle or a reconcile window.
       delete subscription.data
-      subscription.listener.end?.()
     }
     for (const record of this.presences.values()) {
       for (const holder of record.holders) holder.settle?.(error)
     }
     this.presences.clear()
+    this.currentStatus = 'ended'
+    for (const subscription of subscriptions) this.notify(() => subscription.listener.end?.())
+    for (const listener of [...this.statusListeners]) this.notify(() => listener('ended'))
+  }
+
+  /** Runs a callback of the application; what it throws goes to onError, else is thrown again in a microtask. */
+  private notify(callback: () => void): void {
+    try {
+      callback()
+    } catch (error) {
+      if (this.options.onError !== undefined) this.options.onError(error)
+      else queueMicrotask(() => {
+        throw error
+      })
+    }
   }
 
   subscribe<Parameters extends object, Data>(
@@ -1103,9 +1177,9 @@ export class LiveConnection {
   }
 
   private setStatus(status: LiveStatus): void {
-    if (status === this.currentStatus) return
+    if (status === this.currentStatus || this.isEnded) return
     this.currentStatus = status
-    for (const listener of this.statusListeners) listener(status)
+    for (const listener of [...this.statusListeners]) this.notify(() => listener(status))
   }
 
   private needed(): boolean {
@@ -1187,6 +1261,7 @@ export class LiveConnection {
     this.checkIdentity()
     if (this.ended) return
     this.setStatus(this.attempt === 0 ? 'connecting' : 'reconnecting')
+    if (this.ended) return // a status listener ended it: no socket
     const url = typeof this.options.url === 'function' ? this.options.url() : this.options.url
     const SocketClass = this.options.WebSocket ?? (globalThis.WebSocket as unknown as new (url: string) => WebSocketLike)
     const socket = new SocketClass(url)
@@ -1246,6 +1321,12 @@ export class LiveConnection {
    * the next socket, requests queued for it wait for that socket. A 4401 ends the connection.
    */
   private closed(code: number): void {
+    if (code === CloseCode.identityGone) {
+      // The identity is gone: end first (everything owed fails with EndedError), then tell the application.
+      this.end()
+      this.notify(() => this.options.onUnauthorized?.())
+      return
+    }
     const error = new NetworkError(`livewire: the socket closed (${code}) before the request was answered`)
     const lost = [...this.pending.values()]
     this.pending.clear()
@@ -1259,11 +1340,6 @@ export class LiveConnection {
       if (record.leaving) this.presences.delete(record.key) // its presence is gone with the socket
     }
     for (const request of lost) request.reject(error)
-    if (code === CloseCode.identityGone) {
-      this.options.onUnauthorized?.()
-      this.end()
-      return
-    }
     if (!this.needed()) {
       this.attempt = 0
       this.setStatus('idle')
@@ -1562,14 +1638,19 @@ export interface LivePairOptions {
 }
 
 /**
- * Makes the pair of the identity the session has now. Make a new one on every identity change
- * (login, logout, account switch) and end the old one; the Vue composables follow the pair
- * livePlugin provides. The connection ending by itself (checkIdentity, a 4401) ends the client too.
+ * Makes the pair of the identity the session has now. On every identity change (login, logout,
+ * account switch): end the old pair first, before the request that changes the session cookie,
+ * since neither instance can see the cookie and a request in between would go out with the new
+ * one; then make the new pair once the session answers the new identity, and put it into the
+ * reference livePlugin provides, which the Vue composables follow. The connection ending by
+ * itself (checkIdentity, a 4401) ends the client too.
  */
 export function createLivePair(options: LivePairOptions): LivePair {
   const filters = new FilterMemory()
   const identity = options.identity?.() ?? ''
-  const client = new Client({ ...options.client, identity, filters })
+  const clientOptions: ClientOptions = { ...options.client, filters }
+  if (options.identity !== undefined) clientOptions.identity = options.identity
+  const client = new Client(clientOptions)
   const connectionOptions: LiveOptions = { ...options.connection, filters }
   if (options.identity !== undefined) connectionOptions.identity = options.identity
   const connection = new LiveConnection(connectionOptions)
