@@ -254,6 +254,7 @@ func TestUploadRoute(t *testing.T) {
 		{"a multipart part of another name", "ada", unnamed, unnamedType, http.StatusBadRequest},
 		{"a multipart part without a type", "ada", untyped, untypedType, http.StatusBadRequest},
 		{"a malformed content type", "ada", strings.NewReader("png"), "image/png;;", http.StatusBadRequest},
+		{"a malformed multipart type", "ada", strings.NewReader("png"), "multipart/form-data; boundary=x; broken", http.StatusBadRequest},
 	}
 	for _, refusal := range refusals {
 		t.Run(refusal.name, func(t *testing.T) {

@@ -102,8 +102,10 @@ const multipartOverhead = 64 << 10
 func readFile(ginContext *gin.Context, upload *livewire.Upload) (*livewire.File, error) {
 	request := ginContext.Request
 	limit := upload.MaximumBytes()
-	// A malformed Content-Type is no multipart type: it is read as a raw body, whose type the
-	// engine then refuses as not declared (400 at "file").
+	// The parse error is not needed: a malformed Content-Type either yields no media type and
+	// is read as a raw body, whose type the engine refuses as not declared, or a multipart
+	// type without parameters, whose missing boundary fails the first part; both are 400 at
+	// "file".
 	mediaType, parameters, _ := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if mediaType != "multipart/form-data" {
 		if request.ContentLength >= 0 {
