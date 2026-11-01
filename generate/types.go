@@ -410,6 +410,9 @@ func addressDependent(goType reflect.Type, path string, visited map[reflect.Type
 		return addressValue(goType.Elem(), path+"[]", visited)
 	case reflect.Struct:
 		for _, field := range jsonfield.Of(goType) {
+			if reachedThroughPointer(goType, field.StructField.Index) {
+				continue // encoding/json dereferences the embedded pointer: what it reaches is addressable
+			}
 			if err := addressValue(field.StructField.Type, path+"."+field.StructField.Name, visited); err != nil {
 				return err
 			}

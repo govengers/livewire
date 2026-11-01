@@ -199,6 +199,25 @@ type arrayedItem struct {
 	Values map[string]arrayed `json:"values"`
 }
 
+// viaPointer reaches the address-dependent field through an embedded pointer, which
+// encoding/json dereferences to an addressable value: valid in a map value.
+type viaPointer struct {
+	*addressed
+}
+
+type viaPointerItem struct {
+	Values map[string]viaPointer `json:"values"`
+}
+
+func TestEmbeddedPointerInAMapValueIsAddressable(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(objectOf[viaPointerItem]("via")))
+	directory := t.TempDir()
+	require.NoError(t, generate.Write(registry, &generate.Options{TypeScriptDirectory: directory}))
+	require.Contains(t, readGenerated(t, directory, "types.ts"), "export interface ViaPointer {\n  text?: string\n}")
+}
+
 // textKind is a named string type that marshals itself as text.
 type textKind string
 
