@@ -2,6 +2,7 @@ package livewiretest_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -190,11 +191,18 @@ func TestTenantIsolationNeedsRowsOfBothTenants(t *testing.T) {
 // isolationFailures runs TenantIsolation as north and south on an application broken as told.
 func isolationFailures(t *testing.T, broken brokenBy) []string {
 	t.Helper()
+	return sharedIsolationFailures(t, broken, nil)
+}
+
+// sharedIsolationFailures is isolationFailures with the rows both tenants may read.
+func sharedIsolationFailures(t *testing.T, broken brokenBy, shared func(string, json.RawMessage) bool) []string {
+	t.Helper()
 	application := newApplication(t, broken)
 	return gateFailures(func(t testing.TB) {
 		livewiretest.TenantIsolation(t, &livewiretest.TenantIsolationOptions{
 			Application: application.Application,
 			Tenants:     [2]livewiretest.Tenant{{Name: "north", Authenticate: as("alice")}, {Name: "south", Authenticate: as("bob")}},
+			Shared:      shared,
 		})
 	})
 }
@@ -203,12 +211,13 @@ func isolationFailures(t *testing.T, broken brokenBy) []string {
 // leaking: each passed the first version of the gate.
 func TestTenantIsolationFindsEachSelectiveLeak(t *testing.T) {
 	t.Parallel()
-	require.Empty(t, isolationFailures(t, brokenBy{notesPerTenant: 12, pageSize: 2, countCap: 3}), "a sound application passes")
+	require.Empty(t, isolationFailures(t, brokenBy{notesPerTenant: 12, pageSize: 2, countCap: 3, formulaCodes: true}), "a sound application passes, a field filterable in SQL only and keys D69 quotes in its export included")
 	for name, testCase := range map[string]struct {
 		broken brokenBy
 		parts  []string
 	}{
-		"a distinct read":                   {brokenBy{leakingDistinct: true}, []string{"north's distinct title counts", "its own rows 0 times"}},
+		"a distinct read":                   {brokenBy{leakingDistinct: true}, []string{"north's distinct title counts", "its own rows 0 times", "north's distinct shelf counts 2 rows, but it lists 1"}},
+		"a respelled distinct value":        {brokenBy{respelledDistinct: true}, []string{"north's distinct version counts 1.0 1 times, its own rows 0 times"}},
 		"a tenant's own history":            {brokenBy{leakingHistory: true}, []string{"/notes/{id}/history of north's row", "answers the row", "of south"}},
 		"rows past the capped total":        {brokenBy{notesPerTenant: 3, pageSize: 2, countCap: 1, leakingPastCap: true}, []string{"north lists the row", "of south"}},
 		"the eleventh foreign item":         {brokenBy{notesPerTenant: 12, leakingItemsFrom: 10}, []string{"north reads /notes/{id} of south's row"}},
@@ -220,6 +229,19 @@ func TestTenantIsolationFindsEachSelectiveLeak(t *testing.T) {
 			requireFailure(t, isolationFailures(t, testCase.broken), testCase.parts...)
 		})
 	}
+}
+
+// TestTenantIsolationAcceptsRowsSharedOnPurpose pins both directions of Shared: reference data
+// every tenant reads fails without it and passes with it, while a leaking tenant resource still
+// fails with it.
+func TestTenantIsolationAcceptsRowsSharedOnPurpose(t *testing.T) {
+	t.Parallel()
+	categories := func(resource string, _ json.RawMessage) bool { return resource == "categories" }
+	requireFailure(t, isolationFailures(t, brokenBy{sharedCategories: true}), "categories: north lists the row bolts of south")
+	require.Empty(t, sharedIsolationFailures(t, brokenBy{sharedCategories: true}, categories))
+	failures := sharedIsolationFailures(t, brokenBy{sharedCategories: true, leakingTenants: true}, categories)
+	requireFailure(t, failures, "notes: north lists the row")
+	require.NotContains(t, strings.Join(failures, "\n"), "categories:")
 }
 
 func TestStaleComparesAnObjectWhole(t *testing.T) {

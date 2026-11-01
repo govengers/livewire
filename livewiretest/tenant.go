@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/query"
@@ -25,10 +25,15 @@ type Tenant struct {
 }
 
 // TenantIsolationOptions configures TenantIsolation: the application and two tenants, each
-// with rows of every filterable resource its identity reads.
+// with rows of every filterable resource its identity reads. Shared, when set, names the rows
+// both tenants may read on purpose (reference data, public rows): it is asked for every listed
+// row with the resource's name and the row's JSON, and a row it answers true for is no other
+// tenant's, so either tenant may list, read and export it. A shared resource is one whose every
+// row it accepts; every other row of every resource is still checked.
 type TenantIsolationOptions struct {
 	Application Application
 	Tenants     [2]Tenant
+	Shared      func(resource string, row json.RawMessage) bool
 }
 
 // maximumIsolationPages bounds the pages TenantIsolation reads of one list; a list that has
@@ -65,7 +70,7 @@ func TenantIsolation(tb testing.TB, options *TenantIsolationOptions) {
 	ctx := context.Background()
 	for _, declaration := range options.Application.Engine.Registry().Declarations() {
 		if resource, filterable := declaration.(*livewire.Resource); filterable {
-			for _, err := range isolateResource(ctx, server, resource, options.Tenants) {
+			for _, err := range isolateResource(ctx, server, resource, options) {
 				tb.Errorf("livewiretest: TenantIsolation: %s: %v", resource.Name(), err)
 			}
 		}
@@ -78,14 +83,15 @@ type tenantRows struct {
 	server *testServer
 	keys   []string
 	rows   map[string]map[string]json.RawMessage
+	shared map[string]bool // the rows both tenants may read (TenantIsolationOptions.Shared)
 }
 
 // isolateResource checks one resource as both tenants.
-func isolateResource(ctx context.Context, server *testServer, resource *livewire.Resource, tenants [2]Tenant) []error {
+func isolateResource(ctx context.Context, server *testServer, resource *livewire.Resource, options *TenantIsolationOptions) []error {
 	var listed [2]*tenantRows
 	var failures []error
-	for index, tenant := range tenants {
-		rows, err := listTenantRows(ctx, server.as(tenant.Authenticate), resource, tenant)
+	for index, tenant := range options.Tenants {
+		rows, err := listTenantRows(ctx, server.as(tenant.Authenticate), resource, tenant, options.Shared)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("as %s: %w", tenant.Name, err))
 			continue
@@ -114,12 +120,12 @@ func keyField(resource *livewire.Resource) string {
 }
 
 // listTenantRows reads every row of the resource's list as the tenant.
-func listTenantRows(ctx context.Context, server *testServer, resource *livewire.Resource, tenant Tenant) (*tenantRows, error) {
+func listTenantRows(ctx context.Context, server *testServer, resource *livewire.Resource, tenant Tenant, shared func(string, json.RawMessage) bool) (*tenantRows, error) {
 	items, err := listAll(ctx, server, resource.Path(), nil)
 	if err != nil {
 		return nil, err
 	}
-	rows := &tenantRows{tenant: tenant, server: server, rows: map[string]map[string]json.RawMessage{}}
+	rows := &tenantRows{tenant: tenant, server: server, rows: map[string]map[string]json.RawMessage{}, shared: map[string]bool{}}
 	for _, item := range items {
 		members, key, err := keyedRow(item, keyField(resource))
 		if err != nil {
@@ -127,6 +133,7 @@ func listTenantRows(ctx context.Context, server *testServer, resource *livewire.
 		}
 		rows.keys = append(rows.keys, key)
 		rows.rows[key] = members
+		rows.shared[key] = shared != nil && shared(resource.Name(), item)
 	}
 	return rows, nil
 }
@@ -192,7 +199,7 @@ type isolation struct {
 func (i isolation) run(ctx context.Context) []error {
 	var failures []error
 	for _, key := range i.reader.keys {
-		if _, foreign := i.owner.rows[key]; foreign {
+		if i.foreign(key) {
 			failures = append(failures, fmt.Errorf("%s lists the row %s of %s", i.reader.tenant.Name, key, i.owner.tenant.Name))
 		}
 	}
@@ -259,8 +266,14 @@ func versionData(versions []json.RawMessage) []json.RawMessage {
 }
 
 // ownership names the owner of a key in a failure message.
+// foreign reports whether a key is a row of the owner that is not shared.
+func (i isolation) foreign(key string) bool {
+	_, owned := i.owner.rows[key]
+	return owned && !i.owner.shared[key]
+}
+
 func (i isolation) ownership(key string) string {
-	if _, foreign := i.owner.rows[key]; foreign {
+	if i.foreign(key) {
 		return " of " + i.owner.tenant.Name
 	}
 	return ""
@@ -271,6 +284,9 @@ func (i isolation) foreignReads(ctx context.Context, route string) []error {
 	parameter := i.resource.Item().Parameter
 	var failures []error
 	for _, key := range i.owner.keys {
+		if !i.foreign(key) {
+			continue
+		}
 		status, body, err := i.reader.server.get(ctx, i.reader.server.restURL(route, map[string]string{parameter: key}))
 		switch {
 		case err != nil:
@@ -316,11 +332,10 @@ func (i isolation) export(ctx context.Context) []error {
 			failures = append(failures, fmt.Errorf("%s's export has a record without its %q", i.reader.tenant.Name, field))
 			continue
 		}
-		key := record[column]
-		_, foreign := i.owner.rows[key]
+		key := strings.TrimPrefix(record[column], "'") // D69 put one quote in front of a text that starts with a formula character or a quote
 		_, own := i.reader.rows[key]
 		switch {
-		case foreign:
+		case i.foreign(key):
 			failures = append(failures, fmt.Errorf("%s's export writes the row %s of %s", i.reader.tenant.Name, key, i.owner.tenant.Name))
 		case !own:
 			failures = append(failures, fmt.Errorf("%s's export writes the row %s, which it does not list", i.reader.tenant.Name, key))
@@ -359,14 +374,17 @@ func (i isolation) distinct(ctx context.Context) []error {
 	return failures
 }
 
+// distinctValues compares one distinct read with the reader's rows. When every row carries the
+// field, each value (as JSON, byte for byte) must be counted as often as the rows carry it; a
+// field that is filterable in SQL but not in every item can only be counted: the values may
+// count no more rows than the reader lists.
 func (i isolation) distinctValues(field string, body []byte) []error {
 	own := map[string]int{}
+	carried := true
 	for _, row := range i.reader.rows {
 		value, present := row[field]
-		if !present {
-			return []error{fmt.Errorf("%s's rows carry no member %q, so its distinct read cannot be checked", i.reader.tenant.Name, field)}
-		}
-		own[comparableValue(value)]++
+		carried = carried && present
+		own[compactJSON(value)]++
 	}
 	var values []struct {
 		Value json.RawMessage `json:"value"`
@@ -375,36 +393,30 @@ func (i isolation) distinctValues(field string, body []byte) []error {
 	if err := json.Unmarshal(body, &values); err != nil {
 		return []error{fmt.Errorf("%s's distinct %s is no list of values: %w", i.reader.tenant.Name, field, err)}
 	}
+	if !carried {
+		total := 0
+		for _, value := range values {
+			total += value.Count
+		}
+		if total > len(i.reader.rows) {
+			return []error{fmt.Errorf("%s's distinct %s counts %d rows, but it lists %d", i.reader.tenant.Name, field, total, len(i.reader.rows))}
+		}
+		return nil
+	}
 	var failures []error
 	for _, value := range values {
-		if counted := own[comparableValue(value.Value)]; counted != value.Count {
+		if counted := own[compactJSON(value.Value)]; counted != value.Count {
 			failures = append(failures, fmt.Errorf("%s's distinct %s counts %s %d times, its own rows %d times", i.reader.tenant.Name, field, value.Value, value.Count, counted))
 		}
 	}
 	return failures
 }
 
-// comparableValue is a JSON scalar as distinct and the rows can both spell it: a time as an
-// instant, a number by its value.
-func comparableValue(raw json.RawMessage) string {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var value any
-	if decoder.Decode(&value) != nil {
+// compactJSON is a JSON value without insignificant whitespace, otherwise as it was spelled.
+func compactJSON(raw json.RawMessage) string {
+	var compacted bytes.Buffer
+	if json.Compact(&compacted, raw) != nil {
 		return string(raw)
 	}
-	switch typed := value.(type) {
-	case string:
-		if instant, err := time.Parse(time.RFC3339Nano, typed); err == nil {
-			return "time:" + instant.UTC().Format(time.RFC3339Nano)
-		}
-		return "text:" + typed
-	case json.Number:
-		if number, err := typed.Float64(); err == nil {
-			return "number:" + strconv.FormatFloat(number, 'g', -1, 64)
-		}
-		return "number:" + typed.String()
-	default:
-		return fmt.Sprint(typed)
-	}
+	return compacted.String()
 }

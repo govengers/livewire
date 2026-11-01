@@ -3,6 +3,7 @@ package livewiretest_test
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -64,19 +65,22 @@ type (
 
 // brokenBy names the ways the application is broken; the zero value is a sound application.
 type brokenBy struct {
-	notesPerTenant   int      // the notes of each tenant (default 1)
-	leakingTenants   bool     // the notes list, item and export ignore the tenant
-	leakingDistinct  bool     // the distinct read ignores the tenant
-	leakingHistory   bool     // a note's history carries every note's version
-	leakingItemsFrom int      // above zero: the item read answers the other tenant's notes from this position on
-	leakingPastCap   bool     // the list appends the other tenant's notes after its own
-	pageSize         int      // the notes' MaximumLimit (default 100)
-	countCap         int      // the notes' CountCap
-	exportWithoutKey bool     // the export writes the title only
-	keylessMemos     bool     // a resource memos whose rows carry no key
-	boardObject      bool     // an object board whose limit counts the tags but lists notes only
-	summaryTables    []string // the summary's Tables instead of notes and tags
-	unstableNotes    bool     // every notes list read answers another title
+	notesPerTenant    int      // the notes of each tenant (default 1)
+	leakingTenants    bool     // the notes list, item and export ignore the tenant
+	leakingDistinct   bool     // the distinct read ignores the tenant
+	leakingHistory    bool     // a note's history carries every note's version
+	leakingItemsFrom  int      // above zero: the item read answers the other tenant's notes from this position on
+	leakingPastCap    bool     // the list appends the other tenant's notes after its own
+	pageSize          int      // the notes' MaximumLimit (default 100)
+	countCap          int      // the notes' CountCap
+	exportWithoutKey  bool     // the export writes the title only
+	keylessMemos      bool     // a resource memos whose rows carry no key
+	boardObject       bool     // an object board whose limit counts the tags but lists notes only
+	summaryTables     []string // the summary's Tables instead of notes and tags
+	unstableNotes     bool     // every notes list read answers another title
+	respelledDistinct bool     // distinct version counts the other tenant's notes as 1.0
+	sharedCategories  bool     // a resource categories whose rows every tenant reads on purpose
+	formulaCodes      bool     // a resource codes keyed by texts a spreadsheet would run (D69)
 }
 
 // notesApplication is the running application and its data.
@@ -163,7 +167,8 @@ func (a *notesApplication) registry() (*livewire.Registry, error) {
 			Fields: query.Fields{
 				{Name: "id", Type: query.TypeUUID, SQL: "notes.id", Filter: true, Sort: true},
 				{Name: "title", Type: query.TypeText, SQL: "notes.title", Filter: true, Sort: true},
-				{Name: "version", Type: query.TypeInteger, SQL: "notes.version"},
+				{Name: "version", Type: query.TypeInteger, SQL: "notes.version", Filter: true},
+				{Name: "shelf", Type: query.TypeText, SQL: "notes.shelf", Filter: true}, // in SQL, not in the item
 			},
 			DefaultSort:  []query.SortTerm{{Field: "title"}},
 			MaximumLimit: a.broken.pageSize,
@@ -204,6 +209,28 @@ func (a *notesApplication) registry() (*livewire.Registry, error) {
 			},
 		}))
 	}
+	if a.broken.sharedCategories {
+		declarations = append(declarations, livewire.NewResource("categories", "/categories", &livewire.ResourceOptions[category]{
+			Read:   authorization.IsUser(),
+			Fields: query.Fields{{Name: "id", Type: query.TypeString, SQL: "categories.id", Filter: true}},
+			Item:   &livewire.ItemKey{Parameter: "id", Field: "id"},
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[category], error) {
+				return &livewire.Page[category]{Items: sharedCategories(), Total: 2}, nil
+			},
+			Get: func(_ context.Context, listQuery *query.ListQuery) (*category, error) {
+				_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "categories", IDColumn: "categories.id"})
+				for _, shared := range sharedCategories() {
+					if slices.ContainsFunc(arguments, func(argument any) bool { return fmt.Sprint(argument) == shared.ID }) {
+						return &shared, nil
+					}
+				}
+				return nil, livewire.NotFound()
+			},
+		}))
+	}
+	if a.broken.formulaCodes {
+		declarations = append(declarations, a.codes())
+	}
 	if a.broken.keylessMemos {
 		declarations = append(declarations, livewire.NewResource("memos", "/memos", &livewire.ResourceOptions[memo]{
 			Read:   authorization.IsUser(),
@@ -214,6 +241,52 @@ func (a *notesApplication) registry() (*livewire.Registry, error) {
 		}))
 	}
 	return registry, registry.Add(declarations...)
+}
+
+// category is reference data every tenant reads.
+type category struct {
+	ID string `json:"id"`
+}
+
+func sharedCategories() []category { return []category{{ID: "bolts"}, {ID: "nuts"}} }
+
+// code is a row keyed by a text a spreadsheet would run, which an export writes quoted (D69).
+type code struct {
+	Code string `json:"code"`
+}
+
+// codes is a tenant's resource of codes keyed by "=<tenant>-<n>", with a CSV export that
+// quotes them as postgresadapter.WriteCSV does.
+func (a *notesApplication) codes() *livewire.Resource {
+	codesOf := func(ctx context.Context) []code {
+		tenant := livewire.TenantFrom(ctx)
+		return []code{{Code: "=" + tenant + "-1"}, {Code: "=" + tenant + "-2"}}
+	}
+	return livewire.NewResource("codes", "/codes", &livewire.ResourceOptions[code]{
+		Read:   authorization.IsUser(),
+		Fields: query.Fields{{Name: "code", Type: query.TypeString, SQL: "codes.code", Filter: true}},
+		Item:   &livewire.ItemKey{Parameter: "code", Field: "code"},
+		List: func(ctx context.Context, _ *query.ListQuery) (*livewire.Page[code], error) {
+			return &livewire.Page[code]{Items: codesOf(ctx), Total: 2}, nil
+		},
+		Get: func(ctx context.Context, listQuery *query.ListQuery) (*code, error) {
+			_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "codes", IDColumn: "codes.id"})
+			for _, own := range codesOf(ctx) {
+				if slices.ContainsFunc(arguments, func(argument any) bool { return fmt.Sprint(argument) == own.Code }) {
+					return &own, nil
+				}
+			}
+			return nil, livewire.NotFound()
+		},
+		Export: func(ctx context.Context, _ *query.ListQuery, _ query.Fields, writer io.Writer) (int, error) {
+			output := csv.NewWriter(writer)
+			records := [][]string{{"code"}}
+			for _, own := range codesOf(ctx) {
+				records = append(records, []string{"'" + own.Code})
+			}
+			return len(records) - 1, output.WriteAll(records)
+		},
+	})
 }
 
 // notesOf are the notes the request's tenant reads, with every other tenant's after them when
@@ -289,13 +362,21 @@ func (a *notesApplication) noteHistory(ctx context.Context, listQuery *query.Lis
 }
 
 func (a *notesApplication) distinctNotes(ctx context.Context, field string, _ *query.ListQuery) ([]livewire.DistinctValue, error) {
-	counts := map[string]int{}
+	counts := map[any]int{}
 	for _, visible := range a.notesOf(ctx, a.broken.leakingDistinct) {
-		value := visible.Title
-		if field == "id" {
-			value = visible.ID.String()
+		switch field {
+		case "id":
+			counts[visible.ID.String()]++
+		case "version":
+			counts[visible.Version]++
+		case "shelf": // filterable in SQL, not in the item
+			counts["shelf of "+livewire.TenantFrom(ctx)]++
+		default:
+			counts[visible.Title]++
 		}
-		counts[value]++
+	}
+	if a.broken.respelledDistinct && field == "version" {
+		counts[json.Number("1.0")] = len(a.foreignNotes(ctx)) // the other tenant's ones, spelled apart
 	}
 	values := make([]livewire.DistinctValue, 0, len(counts))
 	for value, count := range counts {
