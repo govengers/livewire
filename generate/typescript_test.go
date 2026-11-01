@@ -12,8 +12,8 @@ import (
 )
 
 // requireTypeScript is the bun executable; without bun the TypeScript gates skip, unless
-// LIVEWIRE_REQUIRE_TYPESCRIPT=1 (just test-typescript) makes them fail instead. The org's CI
-// workflow has no bun step yet.
+// LIVEWIRE_REQUIRE_TYPESCRIPT=1 (just test-typescript, which CI runs with bun installed)
+// makes them fail instead.
 func requireTypeScript(t *testing.T) string {
 	t.Helper()
 	bun, err := exec.LookPath("bun")

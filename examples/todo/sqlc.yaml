@@ -1,0 +1,37 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: internal/database/migrations
+    queries: internal/repository/queries
+    database:
+      uri: ${SQLC_DATABASE_URL}
+    analyzer:
+      database: false
+    rules: [sqlc/db-prepare, no-unbounded-list, no-delete-without-where]
+    gen:
+      go:
+        package: sqlc
+        out: internal/repository/internal/sqlc
+        sql_package: pgx/v5
+        emit_pointers_for_null_types: true
+        emit_enum_valid_method: true
+        emit_all_enum_values: true
+        emit_empty_slices: true
+        overrides:
+          - db_type: uuid
+            go_type: github.com/google/uuid.UUID
+          - db_type: uuid
+            nullable: true
+            go_type: {import: github.com/google/uuid, type: UUID, pointer: true}
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type: {type: time.Time, pointer: true}
+rules:
+  - name: no-unbounded-list
+    message: ":many query without LIMIT - paginate or bound it"
+    rule: query.cmd == "many" && !query.sql.matches("(?i)\\bLIMIT\\b") && !query.sql.matches("(?i)= ANY\\(")
+  - name: no-delete-without-where
+    message: "DELETE or UPDATE without WHERE"
+    rule: query.sql.matches("(?i)^\\s*(DELETE\\s+FROM|UPDATE)\\s") && !query.sql.matches("(?i)\\bWHERE\\b")
