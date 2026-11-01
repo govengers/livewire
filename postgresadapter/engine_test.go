@@ -84,6 +84,14 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 				return postgresadapter.WriteCSV(ctx, database.pool, export, writer)
 			},
 		}),
+		livewire.NewMutation("importPart", http.MethodPost, "/parts/import", &livewire.MutationOptions[livewire.NoParameters, createPartBody, livePart]{
+			Check: authorization.IsUser(),
+			Handle: func(ctx context.Context, _ *livewire.NoParameters, body *createPartBody) (*livePart, error) {
+				imported := livePart{Name: body.Name}
+				err := postgresadapter.TransactionFrom(ctx).QueryRow(ctx, "INSERT INTO parts (name) VALUES ($1) RETURNING id", body.Name).Scan(&imported.ID)
+				return &imported, err
+			},
+		}),
 		livewire.NewMutation("createPart", http.MethodPost, "/parts", &livewire.MutationOptions[livewire.NoParameters, createPartBody, livePart]{
 			Check:  authorization.IsUser(),
 			Status: http.StatusCreated,
@@ -246,6 +254,35 @@ func TestEngineReadsUnderTheTenantAndReRunsOnNotify(t *testing.T) {
 	require.NoError(t, json.Unmarshal(change.Payload, &listChange))
 	require.Len(t, listChange.Upserts, 1)
 	require.Contains(t, string(listChange.Upserts[0]), added)
+}
+
+func TestEngineBatchHistoryNamesEachCall(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	live := newLiveEngine(t, database)
+	key := uuid.NewString()
+	calls := []livewire.BatchCall{
+		{Target: "createPart", Body: json.RawMessage(`{"name":"bolt"}`)},
+		{Target: "importPart", Body: json.RawMessage(`{"name":"nut"}`)},
+	}
+	body, err := json.Marshal(calls)
+	require.NoError(t, err)
+	_, err = live.engine.Batch(asAlice(t), livewire.BatchRequest{Body: body, IdempotencyKey: key, RequestID: key})
+	require.NoError(t, err)
+
+	rows, err := database.pool.Query(t.Context(), `SELECT parts.name, history.mutation, history.request_id, history.actor
+		FROM parts_history history JOIN parts ON parts.id = history.id ORDER BY parts.name`)
+	require.NoError(t, err)
+	type historyActor struct{ Name, Mutation, RequestID, Actor string }
+	history, err := pgx.CollectRows(rows, pgx.RowToStructByPos[historyActor])
+	require.NoError(t, err)
+	require.Equal(t, []historyActor{
+		{Name: "bolt", Mutation: "createPart", RequestID: key, Actor: "password:alice"},
+		{Name: "nut", Mutation: "importPart", RequestID: key, Actor: "password:alice"},
+	}, history, "each call of the batch set its own mutation (D58)")
+	var audited []string
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT array_agg(mutation ORDER BY mutation) FROM livewire_audit WHERE request_id = $1", key).Scan(&audited))
+	require.Equal(t, []string{"createPart", "importPart"}, audited, "one audit row per call")
 }
 
 func TestEngineExportsCSVInItsReadTransaction(t *testing.T) {

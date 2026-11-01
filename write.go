@@ -332,12 +332,15 @@ type batchRun struct {
 	ran       []auditedCall
 }
 
-// run runs the prepared calls in the transaction of ctx, each audited after its handler; the
-// first failure ends it.
-func (b *batchRun) run(ctx context.Context) (int, json.RawMessage, error) {
+// run runs the prepared calls in the transaction of ctx, each described to the transaction
+// before (D58) and audited after its handler; the first failure ends it.
+func (b *batchRun) run(ctx context.Context, transaction Transaction) (int, json.RawMessage, error) {
 	results := make([]BatchResult, 0, len(b.prepared))
 	for index, call := range b.prepared {
 		unit := startUnit(OutcomeCall, b.operation, call.mutation.Name())
+		if err := b.describe(ctx, transaction, call); err != nil {
+			return 0, nil, batchFailure(index, err)
+		}
 		audited := auditedCall{mutation: call.mutation.Name(), parameters: call.parameters, started: unit.started}
 		b.ran = append(b.ran, audited)
 		status, payload, err := callRecovering(ctx, call)
@@ -360,6 +363,22 @@ func (b *batchRun) run(ctx context.Context) (int, json.RawMessage, error) {
 		return 0, nil, fmt.Errorf("livewire: marshal the batch results: %w", err)
 	}
 	return http.StatusOK, payload, nil
+}
+
+// describe hands the call's details to a transaction that takes them (CallDescriber).
+func (b *batchRun) describe(ctx context.Context, transaction Transaction, call *preparedCall) error {
+	describer, ok := transaction.(CallDescriber)
+	if !ok {
+		return nil
+	}
+	details := TransactionDetails{
+		Tenant: TenantFrom(ctx), Identity: auth.IdentityFrom(ctx), Mutation: call.mutation.Name(),
+		Parameters: call.parameters, RequestID: b.plan.requestID,
+	}
+	if err := recovering(func() error { return describer.DescribeCall(ctx, details) }); err != nil {
+		return fmt.Errorf("livewire: describe the call %q to its transaction: %w", call.mutation.Name(), err)
+	}
+	return nil
 }
 
 func callRecovering(ctx context.Context, call *preparedCall) (status int, payload json.RawMessage, err error) {
@@ -516,7 +535,7 @@ type auditedCall struct {
 func (e *Engine) writeAudited(ctx context.Context, plan writePlan, started time.Time, handle func(ctx context.Context) (int, json.RawMessage, error)) (*writeAnswer, error) {
 	call := auditedCall{mutation: plan.transactionMutation, parameters: plan.parameters, started: started}
 	ran := false
-	answer, err := e.write(ctx, plan, func(ctx context.Context) (int, json.RawMessage, error) {
+	answer, err := e.write(ctx, plan, func(ctx context.Context, _ Transaction) (int, json.RawMessage, error) {
 		ran = true
 		status, payload, err := handle(ctx)
 		if err != nil {
@@ -567,10 +586,14 @@ type writeAnswer struct {
 	replayed bool
 }
 
+// writeRun is the work of a write in its transaction; the batch hands each call's details to
+// the transaction (CallDescriber).
+type writeRun func(ctx context.Context, transaction Transaction) (int, json.RawMessage, error)
+
 // write runs one write in an engine transaction (D31): begin with the tenant and actor,
 // reserve the key, run, record the answer, commit. Anything that fails rolls back, which
 // frees the key.
-func (e *Engine) write(ctx context.Context, plan writePlan, run func(ctx context.Context) (int, json.RawMessage, error)) (*writeAnswer, error) {
+func (e *Engine) write(ctx context.Context, plan writePlan, run writeRun) (*writeAnswer, error) {
 	if plan.idempotencyKey != "" {
 		if _, err := uuid.Parse(plan.idempotencyKey); err != nil {
 			return nil, invalidParameter("idempotencyKey", "must be a UUID")
@@ -584,7 +607,7 @@ func (e *Engine) write(ctx context.Context, plan writePlan, run func(ctx context
 		return nil, fmt.Errorf("livewire: begin the transaction of %q: %w", plan.mutation, err)
 	}
 	ctx = WithIdempotencyKey(WithTransaction(ctx, transaction.Handle()), plan.idempotencyKey)
-	answer, err := e.runReserved(ctx, plan, run)
+	answer, err := e.runReserved(ctx, plan, func(ctx context.Context) (int, json.RawMessage, error) { return run(ctx, transaction) })
 	if err != nil || answer.replayed {
 		if rollbackError := transaction.Rollback(ctx); rollbackError != nil {
 			return nil, errors.Join(err, fmt.Errorf("livewire: roll back the transaction of %q: %w", plan.mutation, rollbackError))

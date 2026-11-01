@@ -276,6 +276,9 @@ type fakeTransactor struct {
 	failBegin atomic.Bool
 	// panicBegin makes the next Begin panic.
 	panicBegin atomic.Bool
+	// described are the calls of batches described to their transaction (CallDescriber).
+	described    []livewire.TransactionDetails
+	failDescribe atomic.Bool
 }
 
 func (f *fakeTransactor) Begin(_ context.Context, details livewire.TransactionDetails) (livewire.Transaction, error) {
@@ -313,6 +316,17 @@ type fakeTransaction struct {
 }
 
 func (t *fakeTransaction) Handle() any { return t }
+
+// DescribeCall records the details of a batch's call with the transactor.
+func (t *fakeTransaction) DescribeCall(_ context.Context, details livewire.TransactionDetails) error {
+	if t.transactor.failDescribe.Load() {
+		return errors.New("the actor setting failed")
+	}
+	t.transactor.mutex.Lock()
+	t.transactor.described = append(t.transactor.described, details)
+	t.transactor.mutex.Unlock()
+	return nil
+}
 
 // stage records a write and the change its commit publishes.
 func (t *fakeTransaction) stage(write func(), change livewire.Change) {

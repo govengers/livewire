@@ -141,6 +141,18 @@ func TestBatchIsAllOrNothing(t *testing.T) {
 	require.True(t, exists)
 	require.Len(t, bed.outcomes.of(livewire.OutcomeAfterCommit), 2, "one per committed call")
 	require.Empty(t, bed.transactor.writes()[1].Mutation, "a batch's outer transaction names no mutation")
+	bed.transactor.mutex.Lock()
+	described := bed.transactor.described
+	bed.transactor.mutex.Unlock()
+	require.Len(t, described, 4, "every call that ran was described to its transaction (D58)")
+	require.Equal(t, "createGadget", described[3].Mutation)
+	require.Equal(t, "ada", described[3].Identity.Subject)
+	require.Equal(t, bed.transactor.writes()[1].RequestID, described[3].RequestID)
+
+	bed.transactor.failDescribe.Store(true)
+	refusedDescribe := socket.response(socket.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: mustJSON(succeeding)}))
+	require.Equal(t, http.StatusInternalServerError, refusedDescribe.Status, "a failing description fails the batch")
+	bed.transactor.failDescribe.Store(false)
 
 	invalid := []livewire.BatchCall{{Target: "createGadget", Body: mustJSON(map[string]string{"group": "x"})}}
 	badCall := socket.response(socket.sendFrame(livewire.RequestFrame{Operation: livewire.OperationBatch, Body: mustJSON(invalid)}))

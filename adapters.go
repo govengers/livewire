@@ -110,6 +110,16 @@ type TransactionDetails struct {
 	ReadOnly   bool
 }
 
+// CallDescriber is the optional interface of a Transaction that runs several calls (D58): the
+// engine calls DescribeCall before each call of a batch (D33) with that call's details, so
+// the triggers attribute each call's writes to its own mutation and parameters (D34); the
+// postgresadapter sets livewire.actor again (SET LOCAL). Without it a batch's history rows
+// carry the outer transaction's details, whose Mutation is empty. A failing DescribeCall
+// fails the batch.
+type CallDescriber interface {
+	DescribeCall(ctx context.Context, transactionDetails TransactionDetails) error
+}
+
 // Transactor begins an engine transaction (D31, D42). The implementation sets the tenant and,
 // for a write, the actor of transactionDetails (SET LOCAL) before it returns, so triggers and
 // Row Level Security policies see them.
