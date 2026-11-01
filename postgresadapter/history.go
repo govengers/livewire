@@ -35,13 +35,7 @@ var historyColumns = []query.DerivedColumn{
 //		return postgresadapter.HistoryPage(ctx, r.pool, "parts", listQuery, decodePartRow)
 //	},
 func HistoryPage[Item any](ctx context.Context, database DBTX, table string, listQuery *query.ListQuery, decode func(row []byte) (*Item, error)) (*livewire.Page[livewire.Version[Item]], error) {
-	// The newest life per id as a window: PostgreSQL pushes the scope's id = key into it (the
-	// PARTITION BY column), so a read costs the item's versions once, not once per version.
-	withLives := "(SELECT *, max(life) OVER (PARTITION BY id) AS current_life FROM " + identifier(table+historySuffix) + ") AS history"
-	specification := &query.ResourceSQL{From: withLives, IDColumn: "version", Derived: historyColumns}
-	currentLife := *listQuery
-	currentLife.Where = query.And(listQuery.Where, func(builder *query.Builder) { builder.WriteString("life = current_life") })
-	listQuery = &currentLife
+	specification, listQuery := currentLifeQuery(table, listQuery)
 	page := &livewire.Page[livewire.Version[Item]]{Items: []livewire.Version[Item]{}}
 	err := inSnapshot(ctx, database, func(database DBTX) error {
 		var err error
@@ -55,6 +49,17 @@ func HistoryPage[Item any](ctx context.Context, database DBTX, table string, lis
 		return nil, err
 	}
 	return page, nil
+}
+
+// currentLifeQuery is what HistoryPage reads: the history table with the newest life per id
+// as a window, and listQuery narrowed to it. PostgreSQL pushes the scope's id = key into the
+// window (the PARTITION BY column), so a read costs the item's versions once, not once per
+// version.
+func currentLifeQuery(table string, listQuery *query.ListQuery) (*query.ResourceSQL, *query.ListQuery) {
+	withLives := "(SELECT *, max(life) OVER (PARTITION BY id) AS current_life FROM " + identifier(table+historySuffix) + ") AS history"
+	currentLife := *listQuery
+	currentLife.Where = query.And(listQuery.Where, func(builder *query.Builder) { builder.WriteString("life = current_life") })
+	return &query.ResourceSQL{From: withLives, IDColumn: "version", Derived: historyColumns}, &currentLife
 }
 
 func scanVersions[Item any](ctx context.Context, database DBTX, specification *query.ResourceSQL, listQuery *query.ListQuery, decode func(row []byte) (*Item, error)) ([]livewire.Version[Item], error) {

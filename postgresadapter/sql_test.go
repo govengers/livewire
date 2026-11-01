@@ -641,16 +641,70 @@ func TestHistoryLifeStartsWheneverARowArrivesUnderAnID(t *testing.T) {
 	require.Equal(t, []string{"update:alices-secret"}, names(historyPage(t, database, "parts", target, "")), "the new id's history starts at the change")
 }
 
-func TestHistoryPageReadsALongHistoryInLinearTime(t *testing.T) {
+func TestHistoryPageScopesTheIDBelowTheWindow(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
 	id := uuid.NewString()
 	_, err := database.pool.Exec(t.Context(), `INSERT INTO parts_history (id, version, operation, data, valid_from, life)
-		SELECT $1, version, 'update', '{"name":"bolt"}', now(), 1 FROM generate_series(1, 5000) AS version`, id)
+		SELECT $1, version, 'update', '{"name":"bolt"}', now(), 1 FROM generate_series(1, 500) AS version`, id)
 	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
-	defer cancel()
-	page, err := readHistoryPage(ctx, database, "parts", id, "")
-	require.NoError(t, err, "5000 versions read well within the deadline; a scope re-run per version takes seconds")
-	require.Equal(t, 5000, page.Total)
+	_, err = database.pool.Exec(t.Context(), "ANALYZE parts_history")
+	require.NoError(t, err)
+	scope := func(builder *query.Builder) { builder.WriteString("id = ").Argument(id) }
+	listQuery, err := query.Compile(livewire.HistoryFields(), nil, []query.SortTerm{{Field: "id"}}, query.Page{Limit: 10}, scope)
+	require.NoError(t, err)
+	specification, scoped := postgresadapter.CurrentLifeQuery("parts", listQuery)
+	pageSQL, pageArguments := scoped.PageSQL(specification)
+	countSQL, countArguments := scoped.CountSQL(specification)
+	for _, statement := range []struct {
+		text      string
+		arguments []any
+	}{{pageSQL, pageArguments}, {countSQL, countArguments}} {
+		var plan []map[string]any
+		require.NoError(t, database.pool.QueryRow(t.Context(), "EXPLAIN (FORMAT JSON) "+statement.text, statement.arguments...).Scan(&plan))
+		root := plan[0]["Plan"].(map[string]any)
+		require.False(t, planHas(root, func(node map[string]any) bool { return node["Parent Relationship"] == "SubPlan" }),
+			"no subquery runs per version: %s", statement.text)
+		window := planFind(root, func(node map[string]any) bool { return node["Node Type"] == "WindowAgg" })
+		require.NotNil(t, window, "the current life is a window: %s", statement.text)
+		require.True(t, planHas(window, func(node map[string]any) bool {
+			condition := fmt.Sprint(node["Index Cond"]) + fmt.Sprint(node["Filter"])
+			return node["Relation Name"] == "parts_history" && strings.Contains(condition, "id = ")
+		}), "the item's id restricts the scan below the window, so a read costs its versions once: %v", window)
+	}
+}
+
+// planFind returns the first node of an EXPLAIN (FORMAT JSON) plan that matches, depth first.
+func planFind(node map[string]any, matches func(map[string]any) bool) map[string]any {
+	if matches(node) {
+		return node
+	}
+	children, _ := node["Plans"].([]any)
+	for _, child := range children {
+		if found := planFind(child.(map[string]any), matches); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func planHas(node map[string]any, matches func(map[string]any) bool) bool {
+	return planFind(node, matches) != nil
+}
+
+func TestHistoryLifeStartsOnAnIDChangeAfterADeleteInOneTransaction(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	deleted, changing := uuid.NewString(), uuid.NewString()
+	_, err := database.pool.Exec(t.Context(), "INSERT INTO parts (id, name) VALUES ($1, 'alices-secret'), ($2, 'mallorys')", deleted, changing)
+	require.NoError(t, err)
+	transaction, err := database.pool.Begin(t.Context())
+	require.NoError(t, err)
+	_, err = transaction.Exec(t.Context(), "DELETE FROM parts WHERE id = $1", deleted)
+	require.NoError(t, err)
+	_, err = transaction.Exec(t.Context(), "UPDATE parts SET id = $1 WHERE id = $2", deleted, changing)
+	require.NoError(t, err)
+	require.NoError(t, transaction.Commit(t.Context()))
+	require.Equal(t, []string{"update:mallorys"}, names(historyPage(t, database, "parts", deleted, "")),
+		"an id change onto an id deleted in the same transaction is no partition move")
 }
