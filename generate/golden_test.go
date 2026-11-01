@@ -2,6 +2,7 @@ package generate_test
 
 import (
 	"flag"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -51,4 +52,33 @@ func TestGoldenFiles(t *testing.T) {
 		}
 		require.Equal(t, string(readFile(t, golden)), string(generated), "%s differs from its golden file; run go test ./generate -run TestGoldenFiles -update and review the diff", name)
 	}
+}
+
+// TestRenderAnswersWhatWriteWrites renders the fixture in memory: every file Write writes, at
+// its path, byte for byte, and nothing on disk.
+func TestRenderAnswersWhatWriteWrites(t *testing.T) {
+	directory := generateFixture(t)
+	rendered := t.TempDir()
+	files, err := generate.Render(newRegistry(t), fixtureOptions(rendered))
+	require.NoError(t, err)
+	entries, err := os.ReadDir(rendered)
+	require.NoError(t, err)
+	require.Empty(t, entries, "Render writes nothing")
+	written := 0
+	require.NoError(t, filepath.WalkDir(directory, func(_ string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			written++
+		}
+		return err
+	}))
+	require.Len(t, files, written)
+	for _, file := range files {
+		relative, err := filepath.Rel(rendered, file.Path)
+		require.NoError(t, err)
+		require.Equal(t, string(readFile(t, filepath.Join(directory, relative))), string(file.Content), relative)
+	}
+	_, err = generate.Render(nil, fixtureOptions(rendered))
+	require.Error(t, err)
+	_, err = generate.Render(newRegistry(t), &generate.Options{})
+	require.Error(t, err)
 }
