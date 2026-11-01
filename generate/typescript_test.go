@@ -47,7 +47,8 @@ func installRuntime(t *testing.T, bun string) string {
 
 // TestGeneratedTypeScriptTypeChecks compiles the fixture's generated client with a usage file
 // under strict, exactOptionalPropertyTypes, noUncheckedIndexedAccess, noImplicitOverride and
-// noPropertyAccessFromIndexSignature; the usage file's @ts-expect-error lines must be errors.
+// noPropertyAccessFromIndexSignature, with the edge registry and the wire-type parity file; the
+// @ts-expect-error lines of the usage and the parity file must be errors.
 func TestGeneratedTypeScriptTypeChecks(t *testing.T) {
 	bun := requireTypeScript(t)
 	runtime := installRuntime(t, bun)
@@ -55,6 +56,10 @@ func TestGeneratedTypeScriptTypeChecks(t *testing.T) {
 	options := fixtureOptions(directory)
 	options.TypeScriptDirectory = filepath.Join(directory, "src", "api")
 	require.NoError(t, generate.Write(newRegistry(t), options))
+	require.NoError(t, generate.Write(newEdgeRegistry(t), edgeOptions(filepath.Join(directory, "src", "edge"))))
+	parity, err := generate.LibraryParityTypeScript("./api/runtime")
+	require.NoError(t, err)
+	writeFile(t, filepath.Join(directory, "src", "parity.ts"), []byte(parity))
 	for name, target := range map[string]string{"usage.ts": "src/usage.ts", "tsconfig.json": "tsconfig.json"} {
 		writeFile(t, filepath.Join(directory, target), readFile(t, filepath.Join("testdata", "typescript", name)))
 	}

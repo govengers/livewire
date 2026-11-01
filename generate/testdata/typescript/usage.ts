@@ -26,7 +26,7 @@ import {
   deleteFilter,
 } from './api/api'
 import type { PartsFilter, HistoryFilter } from './api/filters'
-import { ApiError, Client, LiveConnection, NetworkError, batchCall, uuidv7 } from './api/runtime'
+import { ApiError, Client, LiveConnection, NetworkError, batchCall, prepareCall, uuidv7 } from './api/runtime'
 import type { ErrorCode, FixturePart, Kind, ListResponse, PresenceItem, Stat, Version } from './api/types'
 import { livePlugin, useLive, useLiveList, useLivePresence, useLiveStatus } from './api/vue'
 
@@ -131,8 +131,12 @@ export function socket(): void {
   void connection.call(calls.deletePart, { id: uuidv7() }, undefined)
   void connection.query(reads.notes, {})
   void connection.batch([batchCall(calls.rebuild, {}, undefined)])
-  void connection.join(live['parts.presence'], { key: 'k' }, { cursor: 3 })
-  void connection.leave(live['parts.presence'], { key: 'k' })
+  const registration = connection.join(live['parts.presence'], { key: 'k' }, { cursor: 3 }, { onError: (error) => console.log(error.message) })
+  registration.update({ cursor: 4 })
+  void registration.ready.then(() => registration.leave())
+  const prepared = prepareCall(calls.createPart, { name: 'a', kind: 'bolt' })
+  void connection.call(calls.createPart, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey, signal: new AbortController().signal })
+  connection.checkIdentity()
   // @ts-expect-error notes is not live
   connection.subscribe(live.notes, {}, { next: () => {}, error: () => {} })
   // @ts-expect-error a mutation's body

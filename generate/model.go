@@ -89,11 +89,21 @@ type exportModel struct {
 }
 
 // resourceModel is the filter vocabulary of one filterable read: a resource's fields, or
-// HistoryFields for every history read. Name is the prefix of its generated types.
+// HistoryFields for every history read (history set). Name is the prefix of its generated
+// types.
 type resourceModel struct {
-	name   string
-	target string
-	fields query.Fields
+	name    string
+	target  string
+	fields  query.Fields
+	history bool
+}
+
+// condition is one member of a resource's condition union: a filterable field, the operators
+// that take the same operand, and that operand (D12).
+type condition struct {
+	field     string
+	operators []query.Operator
+	operand   *shape
 }
 
 func (r *resourceModel) searchable() bool {
@@ -121,9 +131,61 @@ func (r *resourceModel) distinctFields() []string {
 	return names
 }
 
+// conditions are the members of the condition union, per filterable field one per operand
+// its operators take (query.OperatorsOf, in its order): one value, a list of values, a flag.
+func (r *resourceModel) conditions() []condition {
+	var conditions []condition
+	for _, field := range r.fields {
+		if !field.Filter {
+			continue
+		}
+		var scalar, list, flag []query.Operator
+		for _, operator := range query.OperatorsOf(field.Type) {
+			switch operator {
+			case query.OperatorIn, query.OperatorNotIn, query.OperatorHasAny, query.OperatorHasAll:
+				list = append(list, operator)
+			case query.OperatorIsNull, query.OperatorIsEmpty:
+				flag = append(flag, operator)
+			default:
+				scalar = append(scalar, operator)
+			}
+		}
+		operand := filterOperand(field)
+		operands := []*shape{operand, {kind: shapeArray, element: operand, minimumItems: 1, maximumItems: query.MaximumListValues}, {kind: shapeBoolean}}
+		for group, operators := range [][]query.Operator{scalar, list, flag} {
+			if len(operators) > 0 {
+				conditions = append(conditions, condition{field: field.Name, operators: operators, operand: operands[group]})
+			}
+		}
+	}
+	return conditions
+}
+
 func (r *resourceModel) conditionType() string { return r.name + "Condition" }
 func (r *resourceModel) filterType() string    { return r.name + "Filter" }
 func (r *resourceModel) nodeType() string      { return r.name + "FilterNode" }
+
+// filterOperand is the value a condition on the field compares with (D12): a time may be
+// relative, a string is bounded, an array field compares its elements. It is the one model
+// both emitters render; a parameter's value (fieldValueShape) is a different thing.
+func filterOperand(field query.Field) *shape {
+	switch field.Type {
+	case query.TypeInteger:
+		return &shape{kind: shapeInteger, format: "int64"}
+	case query.TypeFloat:
+		return &shape{kind: shapeNumber, format: "double"}
+	case query.TypeBoolean:
+		return &shape{kind: shapeBoolean}
+	case query.TypeTime:
+		return &shape{kind: shapeTimeValue}
+	case query.TypeUUID:
+		return &shape{kind: shapeString, format: "uuid"}
+	case query.TypeEnum:
+		return &shape{kind: shapeEnum, values: field.Enum}
+	case query.TypeString, query.TypeText, query.TypeStringArray, query.TypeJSON:
+	}
+	return &shape{kind: shapeString, maximumLength: query.MaximumStringBytes}
+}
 
 var (
 	noBodyType    = reflect.TypeFor[livewire.NoBody]()
@@ -133,21 +195,23 @@ var (
 const historyPrefix = "History"
 
 func newModel(registry *livewire.Registry, options Options) (*model, error) {
-	types, err := newTypeSet(options.Enums)
-	if err != nil {
-		return nil, err
-	}
+	types := newTypeSet(options.Enums)
 	built := &model{basePath: registry.BasePath(), types: types}
 	declarations := registry.Declarations()
 	// The guarded fields first: a type is described once, on first sight.
 	for _, declaration := range declarations {
 		guardDeclaration(types, declaration)
 	}
+	if err := types.describeLibrary(); err != nil {
+		return nil, err
+	}
+	filters := map[string]*resourceModel{}
 	for _, declaration := range declarations {
 		if resource, ok := declaration.(*livewire.Resource); ok {
-			built.resources = append(built.resources, &resourceModel{name: pascalCase(resource.Name()), target: resource.Name(), fields: resource.Fields()})
+			filters[resource.Name()] = &resourceModel{name: pascalCase(resource.Name()), target: resource.Name(), fields: resource.Fields()}
+			built.resources = append(built.resources, filters[resource.Name()])
 			if resource.HistoryPath() != "" && built.history == nil {
-				built.history = &resourceModel{name: historyPrefix, fields: livewire.HistoryFields()}
+				built.history = &resourceModel{name: historyPrefix, fields: livewire.HistoryFields(), history: true}
 			}
 		}
 	}
@@ -158,27 +222,15 @@ func newModel(registry *livewire.Registry, options Options) (*model, error) {
 			}
 		}
 	}
-	for position, declaration := range declarations {
-		if err := built.add(declaration, built.resourceAt(declarations, position), options.Presence); err != nil {
+	for _, declaration := range declarations {
+		if err := built.add(declaration, filters[declaration.Name()], options.Presence); err != nil {
 			return nil, fmt.Errorf("generate: %s: %w", declaration.Name(), err)
 		}
 	}
-	types.assignNames()
+	if err := types.assignNames(); err != nil {
+		return nil, err
+	}
 	return built, nil
-}
-
-// resourceAt is the resource model of the declaration at position, nil for another kind.
-func (m *model) resourceAt(declarations []livewire.Declaration, position int) *resourceModel {
-	if _, ok := declarations[position].(*livewire.Resource); !ok {
-		return nil
-	}
-	index := 0
-	for _, declaration := range declarations[:position] {
-		if _, ok := declaration.(*livewire.Resource); ok {
-			index++
-		}
-	}
-	return m.resources[index]
 }
 
 func guardDeclaration(types *typeSet, declaration livewire.Declaration) {
@@ -206,14 +258,14 @@ func fieldNames(fields query.Fields) []string {
 	return names
 }
 
-func (m *model) add(declaration livewire.Declaration, resource *resourceModel, presence bool) error {
+func (m *model) add(declaration livewire.Declaration, filters *resourceModel, presence bool) error {
 	switch typed := declaration.(type) {
 	case *livewire.Resource:
-		return m.addResource(typed, resource, presence)
+		return m.addResource(typed, filters, presence)
 	case *livewire.List:
-		return m.addTyped(typed, typed.ItemType(), true, false)
+		return m.addList(typed)
 	case *livewire.Object:
-		return m.addTyped(typed, typed.ItemType(), false, presence)
+		return m.addObject(typed, presence)
 	case *livewire.Mutation:
 		return m.addMutation(typed)
 	case *livewire.Upload:
@@ -224,7 +276,7 @@ func (m *model) add(declaration livewire.Declaration, resource *resourceModel, p
 }
 
 func (m *model) addResource(resource *livewire.Resource, filters *resourceModel, presence bool) error {
-	item, err := m.types.shapeOf(resource.ItemType(), nil)
+	item, err := m.types.shapeOf(resource.ItemType(), use{})
 	if err != nil {
 		return err
 	}
@@ -242,7 +294,7 @@ func (m *model) addResource(resource *livewire.Resource, filters *resourceModel,
 		})
 	}
 	if resource.DistinctPath() != "" {
-		distinct, err := m.types.shapeOf(reflect.TypeFor[livewire.DistinctValue](), nil)
+		distinct, err := m.types.shapeOf(reflect.TypeFor[livewire.DistinctValue](), use{})
 		if err != nil {
 			return err
 		}
@@ -284,91 +336,96 @@ func itemKeyParameter(resource *livewire.Resource) *parameterModel {
 	return &parameterModel{name: key.Parameter, in: livewire.InPath, shape: fieldValueShape(field), required: true}
 }
 
-// fieldValueShape is the JSON shape of one value of a declared field.
+// fieldValueShape is the JSON shape of one value of a declared field as a parameter carries
+// it: an absolute time, a uuid, an enum value.
 func fieldValueShape(field query.Field) *shape {
 	switch field.Type {
 	case query.TypeInteger:
 		return &shape{kind: shapeInteger, format: "int64"}
-	case query.TypeFloat:
-		return &shape{kind: shapeNumber, format: "double"}
-	case query.TypeBoolean:
-		return &shape{kind: shapeBoolean}
 	case query.TypeTime:
 		return &shape{kind: shapeString, format: "date-time"}
 	case query.TypeUUID:
 		return &shape{kind: shapeString, format: "uuid"}
 	case query.TypeEnum:
 		return &shape{kind: shapeEnum, values: field.Enum}
-	case query.TypeStringArray:
-		return &shape{kind: shapeArray, element: &shape{kind: shapeString}}
-	case query.TypeJSON:
-		return &shape{kind: shapeUnknown}
-	case query.TypeString, query.TypeText:
+	case query.TypeString, query.TypeText, query.TypeFloat, query.TypeBoolean, query.TypeStringArray, query.TypeJSON:
 	}
-	return &shape{kind: shapeString}
+	return &shape{kind: shapeString} // an item key is uuid, string, text, enum, int or time (ItemKey)
 }
 
-// typedRead is a list or an object: its typed parameters and its item type.
-type typedRead interface {
-	livewire.Declaration
-	PresencePath() string
+// typedRead is the parameters and the item shape of a typed-parameters list or object.
+func (m *model) typedRead(declaration livewire.Declaration, itemType reflect.Type) ([]parameterModel, *shape, error) {
+	item, err := m.types.shapeOf(itemType, use{})
+	return m.parametersOf(declaration.Parameters()), item, err
 }
 
-func (m *model) addTyped(declaration livewire.Declaration, itemType reflect.Type, list, presence bool) error {
-	parameters, err := m.parametersOf(declaration.Parameters())
+func (m *model) addList(list *livewire.List) error {
+	parameters, item, err := m.typedRead(list, list.ItemType())
 	if err != nil {
 		return err
 	}
-	item, err := m.types.shapeOf(itemType, nil)
-	if err != nil {
-		return err
-	}
-	data := item
-	if list {
-		data = &shape{kind: shapeListResponse, element: item}
-	}
-	name := declaration.Name()
 	m.reads = append(m.reads, &readModel{
-		declaration: name, kind: livewire.ReadMain, path: declaration.Path(), queryType: pascalCase(name) + "Parameters",
-		parameters: parameters, data: data, list: list, live: len(declaration.Tables()) > 0,
+		declaration: list.Name(), kind: livewire.ReadMain, path: list.Path(), queryType: pascalCase(list.Name()) + "Parameters",
+		parameters: parameters, data: &shape{kind: shapeListResponse, element: item}, list: true, live: len(list.Tables()) > 0,
 	})
-	if object, ok := declaration.(typedRead); ok && presence {
-		return m.addPresence(name, object.PresencePath(), parameters)
-	}
 	return nil
 }
 
+func (m *model) addObject(object *livewire.Object, presence bool) error {
+	parameters, item, err := m.typedRead(object, object.ItemType())
+	if err != nil {
+		return err
+	}
+	m.reads = append(m.reads, &readModel{
+		declaration: object.Name(), kind: livewire.ReadMain, path: object.Path(), queryType: pascalCase(object.Name()) + "Parameters",
+		parameters: parameters, data: item, live: len(object.Tables()) > 0,
+	})
+	if !presence {
+		return nil
+	}
+	return m.addPresence(object.Name(), object.PresencePath(), parameters)
+}
+
 // addPresence adds the presence read of a record (D37): the declaration's own parameters and
-// the key. It is always live: the presence table re-runs it.
+// the key. It is always live: the presence table re-runs it. An object's own query parameter
+// `key` is the key, required here; a `key` of another kind could not be told from it and is
+// refused.
 func (m *model) addPresence(name, path string, parameters []parameterModel) error {
-	presence, err := m.types.shapeOf(reflect.TypeFor[livewire.PresenceItem](), nil)
+	presence, err := m.types.shapeOf(reflect.TypeFor[livewire.PresenceItem](), use{})
 	if err != nil {
 		return err
 	}
 	key := parameterModel{name: livewire.ParameterPresenceKey, in: livewire.InQuery, shape: &shape{kind: shapeString}, required: true}
+	merged := slices.Clone(parameters)
+	position := slices.IndexFunc(merged, func(parameter parameterModel) bool { return parameter.name == livewire.ParameterPresenceKey })
+	switch {
+	case position < 0:
+		merged = append(merged, key)
+	case merged[position].in == livewire.InQuery && (merged[position].shape.kind == shapeString || merged[position].shape.kind == shapeEnum):
+		merged[position].required = true
+	default:
+		return fmt.Errorf("the parameter %q is the presence key (D37), so it must be a string query parameter", livewire.ParameterPresenceKey)
+	}
 	m.reads = append(m.reads, &readModel{
 		declaration: name, kind: livewire.ReadPresence, path: path, queryType: pascalCase(name) + "PresenceParameters",
-		parameters: append(slices.Clone(parameters), key), data: &shape{kind: shapeListResponse, element: presence}, list: true, live: true,
+		parameters: merged, data: &shape{kind: shapeListResponse, element: presence}, list: true, live: true,
 	})
 	return nil
 }
 
 func (m *model) addMutation(mutation *livewire.Mutation) error {
-	parameters, err := m.parametersOf(mutation.Parameters())
-	if err != nil {
-		return err
-	}
 	added := &mutationModel{
 		name: mutation.Name(), method: mutation.Method(), path: mutation.Path(), parametersType: pascalCase(mutation.Name()) + "Parameters",
-		parameters: parameters, status: mutation.Status(), effect: mutation.Effect(), clientID: mutation.ClientID(),
+		parameters: m.parametersOf(mutation.Parameters()), status: mutation.Status(), effect: mutation.Effect(), clientID: mutation.ClientID(),
 	}
+	var err error
 	if mutation.RequestType() != noBodyType {
-		if added.body, err = m.types.shapeOf(mutation.RequestType(), nil); err != nil {
+		if added.body, err = m.types.shapeOf(mutation.RequestType(), use{}); err != nil {
 			return err
 		}
 	}
 	if mutation.ResponseType() != noContentType {
-		if added.response, err = m.types.shapeOf(mutation.ResponseType(), nil); err != nil {
+		if added.response, err = m.types.shapeOf(mutation.ResponseType(), use{}); err != nil {
 			return err
 		}
 	}
@@ -377,17 +434,13 @@ func (m *model) addMutation(mutation *livewire.Mutation) error {
 }
 
 func (m *model) addUpload(upload *livewire.Upload) error {
-	parameters, err := m.parametersOf(upload.Parameters())
-	if err != nil {
-		return err
-	}
-	response, err := m.types.shapeOf(upload.ResponseType(), nil)
+	response, err := m.types.shapeOf(upload.ResponseType(), use{})
 	if err != nil {
 		return err
 	}
 	m.uploads = append(m.uploads, &uploadModel{
 		name: upload.Name(), path: upload.Path(), parametersType: pascalCase(upload.Name()) + "Parameters",
-		parameters: parameters, response: response, status: upload.Status(), contentTypes: upload.ContentTypes(), maximumBytes: upload.MaximumBytes(),
+		parameters: m.parametersOf(upload.Parameters()), response: response, status: upload.Status(), contentTypes: upload.ContentTypes(), maximumBytes: upload.MaximumBytes(),
 	})
 	return nil
 }
@@ -395,7 +448,7 @@ func (m *model) addUpload(upload *livewire.Upload) error {
 // parametersOf types the parameters of a parameters struct: a list is an array of its
 // scalars, a pointer is the value it points to; enum values come from the tag or from the
 // Enums option for a named string type.
-func (m *model) parametersOf(parameters []livewire.Parameter) ([]parameterModel, error) {
+func (m *model) parametersOf(parameters []livewire.Parameter) []parameterModel {
 	result := make([]parameterModel, 0, len(parameters))
 	for _, parameter := range parameters {
 		scalarType := parameter.Type
@@ -411,7 +464,7 @@ func (m *model) parametersOf(parameters []livewire.Parameter) ([]parameterModel,
 		}
 		result = append(result, parameterModel{name: parameter.Name, in: parameter.In, shape: scalar, required: parameter.Required()})
 	}
-	return result, nil
+	return result
 }
 
 func (m *model) scalarShape(scalarType reflect.Type, enum []string) *shape {

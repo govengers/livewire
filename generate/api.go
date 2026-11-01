@@ -63,6 +63,12 @@ export function batch(client: runtime.Client, batchCalls: readonly runtime.Batch
 }
 `
 
+// member is one member of a parameters interface.
+type member struct {
+	text     string
+	required bool
+}
+
 // parametersInterface writes the interface of a parameters set, or an alias of
 // runtime.NoParameters without any, and reports whether a caller must pass it.
 func parametersInterface(builder *strings.Builder, name string, parameters []parameterModel, reserved reservedModel) (required bool) {
@@ -72,44 +78,45 @@ func parametersInterface(builder *strings.Builder, name string, parameters []par
 		return false
 	}
 	fmt.Fprintf(builder, "\nexport interface %s {\n", name)
-	for _, member := range members {
-		builder.WriteString("  " + member + "\n")
-		required = required || !strings.Contains(member, "?:")
+	for _, entry := range members {
+		builder.WriteString("  " + entry.text + "\n")
+		required = required || entry.required
 	}
 	builder.WriteString("}\n")
 	return required
 }
 
-func parameterMembers(parameters []parameterModel, reserved reservedModel) []string {
-	var members []string
-	for _, parameter := range parameters {
+func parameterMembers(parameters []parameterModel, reserved reservedModel) []member {
+	var members []member
+	add := func(name, expression string, required bool) {
 		optional := "?"
-		if parameter.required {
+		if required {
 			optional = ""
 		}
-		expression := apiNames.expression(parameter.shape)
-		if parameter.shape.kind == shapeArray {
-			expression = "readonly " + expression
-		}
-		members = append(members, propertyName(parameter.name)+optional+": "+expression)
+		members = append(members, member{text: propertyName(name) + optional + ": " + expression, required: required})
+	}
+	for _, parameter := range parameters {
+		add(parameter.name, apiNames.operandExpression(parameter.shape), parameter.required)
 	}
 	if reserved.filters != nil {
-		members = append(members, livewire.ParameterFilter+"?: filters."+reserved.filters.filterType(), livewire.ParameterFilterID+"?: string")
+		add(livewire.ParameterFilter, "filters."+reserved.filters.filterType(), false)
+		add(livewire.ParameterFilterID, "string", false)
 	}
 	if reserved.field {
-		members = append(members, livewire.ParameterField+": filters."+reserved.filters.name+"DistinctField")
+		add(livewire.ParameterField, "filters."+reserved.filters.name+"DistinctField", true)
 	}
 	if reserved.sort {
-		members = append(members, livewire.ParameterSort+"?: readonly filters."+reserved.filters.name+"SortTerm[]")
+		add(livewire.ParameterSort, "readonly filters."+reserved.filters.name+"SortTerm[]", false)
 	}
 	if reserved.page {
-		members = append(members, livewire.ParameterLimit+"?: number", livewire.ParameterOffset+"?: number")
+		add(livewire.ParameterLimit, "number", false)
+		add(livewire.ParameterOffset, "number", false)
 	}
 	if reserved.after {
-		members = append(members, livewire.ParameterAfter+"?: string")
+		add(livewire.ParameterAfter, "string", false)
 	}
 	if reserved.format {
-		members = append(members, livewire.ParameterFormat+"?: "+quote(livewire.ExportCSV))
+		add(livewire.ParameterFormat, quote(livewire.ExportCSV), false)
 	}
 	return members
 }

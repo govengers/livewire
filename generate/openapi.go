@@ -30,8 +30,6 @@ const (
 	exportRowsTrailer = "Livewire-Export-Rows"
 )
 
-var filterItemType = reflect.TypeFor[livewire.FilterItem]()
-
 // openAPI collects the components while the paths are written.
 type openAPI struct {
 	model    *model
@@ -67,7 +65,7 @@ func renderOpenAPI(api *model, options OpenAPIOptions) ([]byte, error) {
 		"schemas": document.schemas,
 		"responses": object{"Error": object{
 			"description": "The one error body, its code from the closed set (design section 3).",
-			"content":     object{"application/json": object{"schema": reference("ErrorBody")}},
+			"content":     object{"application/json": object{"schema": document.library(reflect.TypeFor[livewire.ErrorBody]())}},
 		}},
 	}
 	root := object{"openapi": "3.0.3", "info": info(options), "paths": paths, "components": components}
@@ -127,6 +125,12 @@ func reference(name string) object {
 	return object{"$ref": schemaPrefix + name}
 }
 
+// library refers to the schema of a library type under the name it got: its fixed one, or a
+// DTO's when a declaration guards one of its fields (describeLibrary).
+func (o *openAPI) library(goType reflect.Type) object {
+	return reference(o.model.types.named[goType].name)
+}
+
 // decorated adds keys to a schema; a $ref takes no siblings in OpenAPI 3.0, so it is wrapped
 // in allOf first.
 func decorated(schema object, keys object) object {
@@ -167,12 +171,55 @@ func (o *openAPI) schema(value *shape) object {
 		schema = object{"type": "string", "enum": value.values}
 	case shapeListResponse, shapeVersion:
 		schema = o.wrapper(value)
+	case shapeTimeValue:
+		schema = object{"oneOf": []object{{"type": "string", "format": "date-time"}, reference(relativeTimeName)}}
 	}
 	setText(schema, "format", value.format)
+	for key, bound := range map[string]int{"maxLength": value.maximumLength, "minItems": value.minimumItems, "maxItems": value.maximumItems} {
+		if bound > 0 {
+			schema[key] = bound
+		}
+	}
 	if value.nullable {
-		return decorated(schema, object{"nullable": true})
+		return nullable(schema, schemaType(value))
 	}
 	return schema
+}
+
+// nullable admits null besides the schema (D26): `nullable: true` beside its type, and around
+// a $ref, which takes no siblings, an allOf that carries the referenced schema's type, since
+// OpenAPI 3.0.3 reads nullable without a type as no null at all.
+func nullable(schema object, typeName string) object {
+	keys := object{"nullable": true}
+	if _, isReference := schema["$ref"]; isReference && typeName != "" {
+		keys["type"] = typeName
+		if typeName == "array" {
+			keys["items"] = object{} // an array type needs items; the referenced schema constrains them
+		}
+	}
+	return decorated(schema, keys)
+}
+
+// schemaType is the OpenAPI type of a shape, "" for a value of any type.
+func schemaType(value *shape) string {
+	switch value.kind {
+	case shapeString, shapeEnum:
+		return "string"
+	case shapeNumber:
+		return "number"
+	case shapeInteger:
+		return "integer"
+	case shapeBoolean:
+		return "boolean"
+	case shapeArray:
+		return "array"
+	case shapeMap, shapeObject, shapeListResponse, shapeVersion:
+		return "object"
+	case shapeReference:
+		return schemaType(value.reference.definition)
+	case shapeUnknown, shapeTimeValue:
+	}
+	return ""
 }
 
 func (o *openAPI) objectSchema(properties []property) object {
@@ -201,10 +248,10 @@ func (o *openAPI) wrapper(value *shape) object {
 	var definition object
 	if value.kind == shapeVersion {
 		definition = object{"type": "object", "required": []string{"id", "operation", "validFrom", "validTo", "actor", "realActor", "mutation", "requestId", "data"}, "properties": object{
-			"id": object{"type": "integer", "format": "int64"}, "operation": reference("ChangeOperation"),
+			"id": object{"type": "integer", "format": "int64"}, "operation": o.library(reflect.TypeFor[livewire.ChangeOperation]()),
 			"validFrom": object{"type": "string", "format": "date-time"}, "validTo": object{"type": "string", "format": "date-time", "nullable": true},
 			"actor": object{"type": "string"}, "realActor": object{"type": "string"}, "mutation": object{"type": "string"},
-			"requestId": object{"type": "string"}, "data": decorated(element, object{"nullable": true}),
+			"requestId": object{"type": "string"}, "data": nullable(element, schemaType(value.element)),
 		}}
 	} else {
 		definition = object{"type": "object", "required": []string{"limit", "offset", "total", "items"}, "properties": object{
@@ -246,28 +293,18 @@ func wrapperName(value *shape) string {
 }
 
 // filterSchemas adds the filter document schemas of a resource (D12): the document, its
-// node and its conditions, one per field and operator group, from query.OperatorsOf.
+// node and its conditions, one per field and operand (resourceModel.conditions).
 func (o *openAPI) filterSchemas(resource *resourceModel) {
 	var conditions []object
-	for _, field := range resource.fields {
-		if !field.Filter {
-			continue
-		}
-		scalar := o.filterValueSchema(field)
-		values := []object{scalar, {"type": "array", "items": scalar, "minItems": 1, "maxItems": query.MaximumListValues}, {"type": "boolean"}}
-		for group, operators := range conditionGroups(field) {
-			if len(operators) == 0 {
-				continue
-			}
-			conditions = append(conditions, object{
-				"type": "object", "required": []string{"field", "op", "value"}, "additionalProperties": false,
-				"properties": object{
-					"field": object{"type": "string", "enum": []string{field.Name}},
-					"op":    object{"type": "string", "enum": stringsOf(operators)},
-					"value": values[group],
-				},
-			})
-		}
+	for _, member := range resource.conditions() {
+		conditions = append(conditions, object{
+			"type": "object", "required": []string{"field", "op", "value"}, "additionalProperties": false,
+			"properties": object{
+				"field": object{"type": "string", "enum": []string{member.field}},
+				"op":    object{"type": "string", "enum": stringsOf(member.operators)},
+				"value": o.schema(member.operand),
+			},
+		})
 	}
 	condition := object{"not": object{}} // no filterable field: no condition validates
 	if len(conditions) > 0 {
@@ -288,25 +325,6 @@ func (o *openAPI) filterSchemas(resource *resourceModel) {
 		"type": "object", "properties": properties, "additionalProperties": false,
 		"description": "A filter document (D12) of " + resource.name + ": at most " + strconv.Itoa(query.MaximumDepth) + " levels and " + strconv.Itoa(query.MaximumNodes) + " nodes.",
 	}
-}
-
-func (o *openAPI) filterValueSchema(field query.Field) object {
-	switch field.Type {
-	case query.TypeTime:
-		return object{"oneOf": []object{{"type": "string", "format": "date-time"}, reference(relativeTimeName)}}
-	case query.TypeInteger:
-		return object{"type": "integer", "format": "int64"}
-	case query.TypeFloat:
-		return object{"type": "number", "format": "double"}
-	case query.TypeBoolean:
-		return object{"type": "boolean"}
-	case query.TypeUUID:
-		return object{"type": "string", "format": "uuid"}
-	case query.TypeEnum:
-		return object{"type": "string", "enum": field.Enum}
-	case query.TypeString, query.TypeText, query.TypeStringArray, query.TypeJSON:
-	}
-	return object{"type": "string", "maxLength": query.MaximumStringBytes}
 }
 
 // pathItems maps a full path to its operations by lower-case method.
@@ -371,20 +389,24 @@ func jsonContent(schema object) object {
 	return object{"application/json": object{"schema": schema}}
 }
 
+// readOperation describes a read; x-websocket names its socket target and operations, and a
+// presence read's join and leave, which the engine resolves against the declaration itself
+// (D46), under presence.
 func (o *openAPI) readOperation(read *readModel) object {
-	ops := []string{string(livewire.OperationQuery)}
+	operations := []string{string(livewire.OperationQuery)}
 	if read.live {
-		ops = append(ops, string(livewire.OperationSubscribe))
+		operations = append(operations, string(livewire.OperationSubscribe))
 	}
+	websocket := object{"target": read.targetName(), "ops": operations}
 	if read.kind == livewire.ReadPresence {
-		ops = append(ops, string(livewire.OperationJoin), string(livewire.OperationLeave))
+		websocket["presence"] = object{"target": read.declaration, "ops": []string{string(livewire.OperationJoin), string(livewire.OperationLeave)}}
 	}
 	responses := object{"200": object{"description": "The " + describeRead(read) + ".", "content": jsonContent(o.schema(read.data))}}
 	return object{
 		"operationId": read.functionName(), "tags": []string{read.declaration},
 		"parameters":      o.parameters(read.parameters, read.reserved),
 		"responses":       errorResponses(responses, http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusInternalServerError),
-		websocketExtended: object{"target": read.targetName(), "ops": ops},
+		websocketExtended: websocket,
 	}
 }
 
@@ -521,21 +543,21 @@ func (o *openAPI) libraryOperations() map[string]map[string]object {
 	return map[string]map[string]object{
 		livewire.BatchPath: {http.MethodPost: {
 			"operationId": "batch", "tags": []string{livewire.BatchTarget}, "parameters": []object{idempotencyParameter()},
-			"requestBody": object{"required": true, "content": jsonContent(object{"type": "array", "items": reference("BatchCall")})},
-			"responses": errorResponses(object{"200": object{"description": "One result per call, in order (D47).", "content": jsonContent(object{"type": "array", "items": reference("BatchResult")})}},
+			"requestBody": object{"required": true, "content": jsonContent(object{"type": "array", "items": o.library(reflect.TypeFor[livewire.BatchCall]())})},
+			"responses": errorResponses(object{"200": object{"description": "One result per call, in order (D47).", "content": jsonContent(object{"type": "array", "items": o.library(reflect.TypeFor[livewire.BatchResult]())})}},
 				http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusInternalServerError),
 			websocketExtended: object{"target": livewire.BatchTarget, "ops": []string{string(livewire.OperationBatch)}},
 		}},
 		livewire.FiltersPath: {
 			http.MethodPost: {
 				"operationId": "saveFilter", "tags": []string{livewire.FiltersTarget},
-				"requestBody": object{"required": true, "content": jsonContent(reference("FilterRequest"))},
-				"responses":   errorResponses(object{"201": object{"description": "The stored filter.", "content": jsonContent(reference("FilterItem"))}}, refusals...),
+				"requestBody": object{"required": true, "content": jsonContent(o.library(reflect.TypeFor[livewire.FilterRequest]()))},
+				"responses":   errorResponses(object{"201": object{"description": "The stored filter.", "content": jsonContent(o.library(reflect.TypeFor[livewire.FilterItem]()))}}, refusals...),
 			},
 			http.MethodGet: {
 				"operationId": "listFilters", "tags": []string{livewire.FiltersTarget},
 				"parameters": []object{{"name": "resource", "in": "query", "required": false, "schema": resource}},
-				"responses":  errorResponses(object{"200": object{"description": "The caller's named filters.", "content": jsonContent(o.wrapper(&shape{kind: shapeListResponse, element: &shape{kind: shapeReference, reference: o.model.types.named[filterItemType]}}))}}, refusals...),
+				"responses":  errorResponses(object{"200": object{"description": "The caller's named filters.", "content": jsonContent(o.wrapper(&shape{kind: shapeListResponse, element: &shape{kind: shapeReference, reference: o.model.types.named[reflect.TypeFor[livewire.FilterItem]()]}}))}}, refusals...),
 			},
 		},
 		livewire.FiltersPath + "/{id}": {http.MethodDelete: {

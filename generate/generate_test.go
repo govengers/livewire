@@ -3,6 +3,7 @@ package generate_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,7 +21,6 @@ import (
 	"github.com/govengers/livewire/generate"
 	"github.com/govengers/livewire/generate/internal/fixture"
 	"github.com/govengers/livewire/ginadapter"
-	"github.com/govengers/livewire/internal/jsonfield"
 )
 
 func readGenerated(t *testing.T, directory, name string) string {
@@ -90,7 +90,11 @@ func TestOpenAPIDocumentValidates(t *testing.T) {
 	require.Equal(t, "#/components/schemas/PartsFilter", parts.Get.Parameters.GetByInAndName("query", "filter").Content["application/json"].Schema.Ref)
 	require.Equal(t, []any{"query"}, document.Paths.Find("/api/v1/notes").Get.Extensions["x-websocket"].(map[string]any)["ops"], "notes is not live")
 	presence := document.Paths.Find("/api/v1/parts/presence").Get.Extensions["x-websocket"].(map[string]any)
-	require.Equal(t, []any{"query", "subscribe", "join", "leave"}, presence["ops"])
+	require.Equal(t, []any{"query", "subscribe"}, presence["ops"])
+	// join and leave name the declaration, not the read (D46): the engine resolves them so.
+	require.Equal(t, map[string]any{"target": "parts", "ops": []any{"join", "leave"}}, presence["presence"])
+	target, _, _ := strings.Cut(presence["target"].(string), ".")
+	require.Equal(t, target, presence["presence"].(map[string]any)["target"])
 
 	deletion := document.Paths.Find("/api/v1/parts/{id}").Delete
 	require.Nil(t, deletion.Responses.Status(http.StatusNoContent).Value.Content)
@@ -407,48 +411,41 @@ func TestWrapperSchemaCollisionsAreRefused(t *testing.T) {
 	require.ErrorContains(t, err, "Stat2ListResponse of a list or version and a type of the same name collide")
 }
 
-// TestHeadersMatchTheRESTAdapter pins the header names the generated clients send and read to
-// the adapter's, which generate does not import.
+// TestHeadersMatchTheRESTAdapter pins the header names the generated clients send and read,
+// in the runtime and in the OpenAPI document, to the adapter's, which generate does not import.
 func TestHeadersMatchTheRESTAdapter(t *testing.T) {
-	api := readGenerated(t, generateFixture(t), "typescript/runtime.ts")
-	require.Contains(t, api, "const idempotencyHeader = '"+ginadapter.IdempotencyKeyHeader+"'")
-	require.Contains(t, api, "const exportRowsTrailer = '"+ginadapter.ExportRowsTrailer+"'")
+	runtime := readGenerated(t, generateFixture(t), "typescript/runtime.ts")
+	require.Contains(t, runtime, "const idempotencyHeader = '"+ginadapter.IdempotencyKeyHeader+"'")
+	require.Contains(t, runtime, "const exportRowsTrailer = '"+ginadapter.ExportRowsTrailer+"'")
+	require.Equal(t, ginadapter.IdempotencyKeyHeader, generate.IdempotencyHeader)
+	require.Equal(t, ginadapter.ExportRowsTrailer, generate.ExportRowsTrailer)
 }
 
-// TestRuntimeWireTypesMatchTheCore pins the hand-written wire types of runtime.ts to the core's
-// Go types: every JSON field of the Go type is a member of the TypeScript interface, and the
-// closed error codes are the same.
-func TestRuntimeWireTypesMatchTheCore(t *testing.T) {
-	runtime := string(readFile(t, filepath.Join("runtime", "runtime.ts")))
-	for name, goType := range map[string]reflect.Type{
-		"ErrorBody": reflect.TypeFor[livewire.ErrorBody](), "ListResponse<Item>": reflect.TypeFor[livewire.ListResponse[struct{}]](),
-		"ListChange<Item>": reflect.TypeFor[livewire.ListChange](), "Version<Item>": reflect.TypeFor[livewire.Version[struct{}]](),
-		"DistinctValue": reflect.TypeFor[livewire.DistinctValue](), "PresenceItem<State = unknown>": reflect.TypeFor[livewire.PresenceItem](),
-		"FilterItem<Document = unknown>": reflect.TypeFor[livewire.FilterItem](), "FilterRequest<Document = unknown>": reflect.TypeFor[livewire.FilterRequest](),
-		"BatchCall": reflect.TypeFor[livewire.BatchCall](), "BatchResult": reflect.TypeFor[livewire.BatchResult](),
-		"RequestFrame": reflect.TypeFor[livewire.RequestFrame](), "ResponseFrame": reflect.TypeFor[livewire.ResponseFrame](),
-		"PushFrame": reflect.TypeFor[livewire.PushFrame](),
-	} {
-		start := strings.Index(runtime, "interface "+name+" {")
-		require.NotEqual(t, -1, start, name)
-		body := runtime[start : start+strings.Index(runtime[start:], "\n}")]
-		var members []string
-		for _, line := range strings.Split(body, "\n")[1:] {
-			if member, _, ok := strings.Cut(strings.TrimSpace(line), ":"); ok && !strings.HasPrefix(member, "/") && !strings.HasPrefix(member, "*") {
-				members = append(members, strings.TrimSuffix(member, "?"))
+// TestNullableSchemasCarryTheirType walks the document: OpenAPI 3.0.3 reads nullable without a
+// type as no null at all, so every nullable schema, a wrapped $ref included, names its type.
+func TestNullableSchemasCarryTheirType(t *testing.T) {
+	document := readGenerated(t, generateFixture(t), "openapi.yaml")
+	_, body, _ := strings.Cut(document, "\n")
+	var root any
+	require.NoError(t, json.Unmarshal([]byte(body), &root))
+	var walk func(node any, path string) int
+	walk = func(node any, path string) int {
+		found := 0
+		switch typed := node.(type) {
+		case map[string]any:
+			if typed["nullable"] == true {
+				found++
+				require.NotEmpty(t, typed["type"], "the nullable schema at %s has no type", path)
+			}
+			for key, child := range typed {
+				found += walk(child, path+"/"+key)
+			}
+		case []any:
+			for index, child := range typed {
+				found += walk(child, fmt.Sprintf("%s/%d", path, index))
 			}
 		}
-		var fields []string
-		for _, field := range jsonfield.Of(goType) {
-			fields = append(fields, field.Name)
-		}
-		require.ElementsMatch(t, fields, members, name)
+		return found
 	}
-	codes := regexp.MustCompile(`(?s)export type ErrorCode =(.*?)\n\n`).FindStringSubmatch(runtime)
-	require.Len(t, codes, 2)
-	require.Equal(t, "| 'invalid_request' | 'invalid_filter' | 'invalid_sort' | 'invalid_page' | 'invalid_cursor' | 'forbidden_field' | 'unauthenticated' | 'forbidden' | 'not_found' | 'conflict' | 'in_progress' | 'internal'",
-		strings.Join(strings.Fields(codes[1]), " "))
-	encoded, err := json.Marshal([]livewire.Code{livewire.CodeInvalidRequest, livewire.CodeInvalidFilter, livewire.CodeInvalidSort, livewire.CodeInvalidPage, livewire.CodeInvalidCursor, livewire.CodeForbiddenField, livewire.CodeUnauthenticated, livewire.CodeForbidden, livewire.CodeNotFound, livewire.CodeConflict, livewire.CodeInProgress, livewire.CodeInternal})
-	require.NoError(t, err)
-	require.JSONEq(t, `["invalid_request","invalid_filter","invalid_sort","invalid_page","invalid_cursor","forbidden_field","unauthenticated","forbidden","not_found","conflict","in_progress","internal"]`, string(encoded))
+	require.Greater(t, walk(root, ""), 5)
 }

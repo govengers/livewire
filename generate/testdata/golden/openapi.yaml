@@ -336,7 +336,8 @@
                   "$ref": "#/components/schemas/FixturePart"
                 }
               ],
-              "nullable": true
+              "nullable": true,
+              "type": "object"
             },
             "nullable": true,
             "type": "array"
@@ -476,7 +477,9 @@
                 "$ref": "#/components/schemas/Tags"
               }
             ],
-            "nullable": true
+            "items": {},
+            "nullable": true,
+            "type": "array"
           },
           "total": {
             "$ref": "#/components/schemas/Cents"
@@ -567,7 +570,8 @@
                 "$ref": "#/components/schemas/FixturePart"
               }
             ],
-            "nullable": true
+            "nullable": true,
+            "type": "object"
           },
           "id": {
             "format": "int64",
@@ -2986,10 +2990,15 @@
         "x-websocket": {
           "ops": [
             "query",
-            "subscribe",
-            "join",
-            "leave"
+            "subscribe"
           ],
+          "presence": {
+            "ops": [
+              "join",
+              "leave"
+            ],
+            "target": "dashboard"
+          },
           "target": "dashboard.presence"
         }
       }
@@ -3815,10 +3824,15 @@
         "x-websocket": {
           "ops": [
             "query",
-            "subscribe",
-            "join",
-            "leave"
+            "subscribe"
           ],
+          "presence": {
+            "ops": [
+              "join",
+              "leave"
+            ],
+            "target": "parts"
+          },
           "target": "parts.presence"
         }
       }

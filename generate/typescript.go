@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/govengers/livewire"
-	"github.com/govengers/livewire/query"
 )
 
 // The runtime sources the generator copies; they are tested where they live, under bun.
@@ -50,11 +49,22 @@ func renderTypeScript(api *model) ([]file, error) {
 	return files, nil
 }
 
-// typescriptNames renders shapes as TypeScript type expressions; qualify prefixes a named
-// type ("types." in api.ts), generic names the runtime's generic types ("runtime." in api.ts).
+// typescriptNames renders shapes as TypeScript type expressions; types prefixes a named type
+// ("types." in api.ts), runtime the runtime's generic types ("runtime." in api.ts); both are
+// empty inside types.ts and filters.ts.
 type typescriptNames struct {
 	types   string
 	runtime string
+	// libraries prefixes a library type instead of types when set: "runtime." where the
+	// runtime's own declaration is meant.
+	libraries string
+}
+
+func (n typescriptNames) prefix(named *namedType) string {
+	if named.library && n.libraries != "" {
+		return n.libraries
+	}
+	return n.types
 }
 
 func (n typescriptNames) expression(value *shape) string {
@@ -75,18 +85,29 @@ func (n typescriptNames) expression(value *shape) string {
 	case shapeObject:
 		expression = n.objectExpression(value.properties)
 	case shapeReference:
-		expression = n.types + value.reference.name
+		expression = n.prefix(value.reference) + value.reference.name
 	case shapeEnum:
 		expression = literalUnion(value.values)
 	case shapeListResponse:
 		expression = n.runtime + "ListResponse<" + n.expression(value.element) + ">"
 	case shapeVersion:
 		expression = n.runtime + "Version<" + n.expression(value.element) + ">"
+	case shapeTimeValue:
+		expression = "TimeValue"
 	}
 	if value.nullable {
 		return expression + " | null"
 	}
 	return expression
+}
+
+// operandExpression is a parameter's or a condition's value: a list is a readonly array, so a
+// caller may pass either kind.
+func (n typescriptNames) operandExpression(value *shape) string {
+	if value.kind == shapeArray && !value.nullable {
+		return "readonly " + n.elementExpression(value.element) + "[]"
+	}
+	return n.expression(value)
 }
 
 func (n typescriptNames) elementExpression(element *shape) string {
@@ -181,53 +202,6 @@ func goTypeName(named *namedType) string {
 	return named.goType.PkgPath() + "." + named.goType.Name()
 }
 
-// filterValue is the TypeScript type of one value a condition on the field compares with.
-func filterValue(field query.Field) string {
-	switch field.Type {
-	case query.TypeInteger, query.TypeFloat:
-		return "number"
-	case query.TypeBoolean:
-		return "boolean"
-	case query.TypeTime:
-		return "TimeValue"
-	case query.TypeEnum:
-		return literalUnion(field.Enum)
-	case query.TypeString, query.TypeText, query.TypeUUID, query.TypeStringArray, query.TypeJSON:
-	}
-	return "string"
-}
-
-// operatorGroup is how an operator takes its value: one value, a list of values or a flag.
-type operatorGroup int
-
-const (
-	operatorScalar operatorGroup = iota
-	operatorList
-	operatorFlag
-)
-
-func groupOf(operator query.Operator) operatorGroup {
-	switch operator {
-	case query.OperatorIn, query.OperatorNotIn, query.OperatorHasAny, query.OperatorHasAll:
-		return operatorList
-	case query.OperatorIsNull, query.OperatorIsEmpty:
-		return operatorFlag
-	default:
-		return operatorScalar
-	}
-}
-
-// conditionGroups lists a filterable field's operators by how they take their value, in the
-// order query.OperatorsOf names them.
-func conditionGroups(field query.Field) [][]query.Operator {
-	groups := make([][]query.Operator, 3)
-	for _, operator := range query.OperatorsOf(field.Type) {
-		group := groupOf(operator)
-		groups[group] = append(groups[group], operator)
-	}
-	return groups
-}
-
 func renderFilters(api *model) ([]byte, error) {
 	var builder strings.Builder
 	builder.WriteString(typescriptHeader)
@@ -278,7 +252,7 @@ export type TimeValue = string | RelativeTime
 
 func renderResourceFilters(builder *strings.Builder, resource *resourceModel, identifiers *identifiers) error {
 	names := []string{resource.conditionType(), resource.filterType(), resource.name + "SortField", resource.name + "SortTerm"}
-	if resource.name != historyPrefix {
+	if !resource.history {
 		names = append(names, resource.name+"DistinctField")
 	}
 	for _, name := range names {
@@ -286,21 +260,13 @@ func renderResourceFilters(builder *strings.Builder, resource *resourceModel, id
 			return err
 		}
 	}
+	operands := typescriptNames{}
 	var conditions []string
-	for _, field := range resource.fields {
-		if !field.Filter {
-			continue
-		}
-		groups := conditionGroups(field)
-		values := []string{filterValue(field), "readonly " + filterValueElement(field) + "[]", "boolean"}
-		for group, operators := range groups {
-			if len(operators) > 0 {
-				conditions = append(conditions, fmt.Sprintf("{ field: %s; op: %s; value: %s }", quote(field.Name), literalUnion(stringsOf(operators)), values[group]))
-			}
-		}
+	for _, member := range resource.conditions() {
+		conditions = append(conditions, fmt.Sprintf("{ field: %s; op: %s; value: %s }", quote(member.field), literalUnion(stringsOf(member.operators)), operands.operandExpression(member.operand)))
 	}
 	description := "the resource " + resource.target
-	if resource.name == historyPrefix {
+	if resource.history {
 		description = "every history read (HistoryFields)"
 	}
 	fmt.Fprintf(builder, "\n/** The conditions of %s. */\nexport type %s =", description, resource.conditionType())
@@ -320,19 +286,10 @@ func renderResourceFilters(builder *strings.Builder, resource *resourceModel, id
 	fmt.Fprintf(builder, "export type %s = %s<%s>\n", resource.filterType(), document, resource.conditionType())
 	fmt.Fprintf(builder, "export type %sSortField = %s\n", resource.name, literalUnion(resource.sortFields()))
 	fmt.Fprintf(builder, "export type %sSortTerm = SortTerm<%sSortField>\n", resource.name, resource.name)
-	if resource.name != historyPrefix {
+	if !resource.history {
 		fmt.Fprintf(builder, "export type %sDistinctField = %s\n", resource.name, literalUnion(resource.distinctFields()))
 	}
 	return nil
-}
-
-// filterValueElement is a list element's type: an enum union in parentheses.
-func filterValueElement(field query.Field) string {
-	value := filterValue(field)
-	if strings.Contains(value, " | ") {
-		return "(" + value + ")"
-	}
-	return value
 }
 
 // identifiers keeps the names one generated module exports, so two never collide.
