@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,4 +137,30 @@ func TestIdempotencySweepRemovesRecordsOutsideTheWindow(t *testing.T) {
 	require.Error(t, err)
 	_, err = postgresadapter.NewIdempotencyStore(&postgresadapter.IdempotencyStoreOptions{Pool: database.pool, Window: -time.Second})
 	require.Error(t, err)
+}
+
+func TestIdempotencyKeyIsOneKeyInEverySpelling(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store := newIdempotencyStore(t, database)
+	transactor := newTransactor(t, database.pool)
+	alice := livewire.Owner{Key: "password:alice"}
+
+	first, firstTransaction := inTransaction(t, transactor)
+	_, _, err := store.Reserve(first, alice, idempotencyKey, "createPart")
+	require.NoError(t, err)
+	second, secondTransaction := inTransaction(t, transactor)
+	_, _, err = store.Reserve(second, alice, "{"+strings.ToUpper(idempotencyKey)+"}", "createPart")
+	requireCode(t, err, livewire.CodeInProgress) // the key in flight, not a unique violation
+	require.NoError(t, secondTransaction.Rollback(t.Context()))
+	require.NoError(t, store.Record(first, &livewire.IdempotencyRecord{Owner: alice, Key: "urn:uuid:" + idempotencyKey, Mutation: "createPart", Status: http.StatusCreated}))
+	require.NoError(t, firstTransaction.Commit(t.Context()))
+
+	third, _ := inTransaction(t, transactor)
+	replayed, replay, err := store.Reserve(third, alice, "urn:uuid:"+idempotencyKey, "createPart")
+	require.NoError(t, err)
+	require.True(t, replay)
+	require.Equal(t, idempotencyKey, replayed.Key, "the record carries the canonical spelling")
+	_, _, err = store.Reserve(third, alice, "not-a-uuid", "createPart")
+	requireCode(t, err, livewire.CodeInvalidRequest)
 }

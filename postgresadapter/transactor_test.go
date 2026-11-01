@@ -146,3 +146,16 @@ func TestTransactorFailures(t *testing.T) {
 	require.NoError(t, transaction.Rollback(t.Context()))
 	require.Zero(t, database.pool.Stat().AcquiredConns(), "the failed begins returned their connections")
 }
+
+func TestWritesAreReadCommittedWhateverTheDefault(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	repeatable, err := pgxpool.New(t.Context(), database.dsn()+"?default_transaction_isolation=repeatable%20read")
+	require.NoError(t, err)
+	t.Cleanup(repeatable.Close)
+	write, err := newTransactor(t, repeatable).Begin(t.Context(), livewire.TransactionDetails{Mutation: "createPart"})
+	require.NoError(t, err)
+	require.Equal(t, "read committed", settings(t, write.Handle().(postgresadapter.DBTX)).Isolation,
+		"a write sees the record a concurrent call committed (D16)")
+	require.NoError(t, write.Rollback(t.Context()))
+}

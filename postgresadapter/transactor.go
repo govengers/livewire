@@ -46,7 +46,8 @@ type TransactorOptions struct {
 }
 
 // Transactor begins the engine's transactions on a pool (D31, D42, D45): a read is
-// REPEATABLE READ READ ONLY, a write READ COMMITTED READ WRITE. Both set
+// REPEATABLE READ READ ONLY, a write READ COMMITTED READ WRITE, whatever the server's or
+// role's default_transaction_isolation is. Both set
 // livewire.tenant (the tenant, "" with a single tenant) and a write sets livewire.actor, a
 // JSON object `{"actor", "realActor", "mutation", "requestId"}` (owner keys
 // "provider:subject", absent members omitted) with SET LOCAL semantics, so triggers and Row
@@ -75,7 +76,7 @@ type actorSetting struct {
 // Begin begins a transaction for transactionDetails and sets its settings; it implements
 // livewire.Transactor.
 func (t *Transactor) Begin(ctx context.Context, transactionDetails livewire.TransactionDetails) (livewire.Transaction, error) {
-	options := pgx.TxOptions{AccessMode: pgx.ReadWrite}
+	options := pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadWrite}
 	actor := ""
 	if transactionDetails.ReadOnly {
 		options = pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}

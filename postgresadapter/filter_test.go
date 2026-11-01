@@ -1,6 +1,7 @@
 package postgresadapter_test
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -65,18 +66,30 @@ func TestFilterSaveBoundsTheFiltersOfAnOwner(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
 	store := newFilterStore(t, database, postgresadapter.FilterStoreOptions{MaximumUnnamedPerOwner: 2, MaximumNamedPerOwner: 1})
+	saved := map[string]string{}
 	for _, hash := range []string{"a", "b"} {
-		_, err := store.Save(t.Context(), unnamed(hash))
+		stored, err := store.Save(t.Context(), unnamed(hash))
 		require.NoError(t, err)
+		saved[hash] = stored.ID
 	}
-	_, err := store.Save(t.Context(), unnamed("c"))
-	requireCode(t, err, livewire.CodeInvalidRequest)
-	_, err = store.Save(t.Context(), unnamed("a"))
-	require.NoError(t, err, "an existing filter is still found at the maximum")
-	bob := unnamed("c")
+	_, err := database.pool.Exec(t.Context(), "UPDATE livewire_filters SET last_used_at = now() - interval '1 day' WHERE document_hash = 'a'")
+	require.NoError(t, err)
+	again, err := store.Save(t.Context(), unnamed("b"))
+	require.NoError(t, err)
+	require.Equal(t, saved["b"], again.ID, "an existing filter is found at the maximum")
+	_, err = store.Save(t.Context(), unnamed("c"))
+	require.NoError(t, err, "a new unnamed filter at the maximum is never refused (D54)")
+	_, err = store.Get(t.Context(), alice, saved["a"])
+	requireCode(t, err, livewire.CodeNotFound) // the least recently used one made room
+	_, err = store.Get(t.Context(), alice, saved["b"])
+	require.NoError(t, err)
+	bob := unnamed("d")
 	bob.Owner = livewire.Owner{Key: "password:bob", Tenant: "north"}
 	_, err = store.Save(t.Context(), bob)
-	require.NoError(t, err, "the maximum is per owner")
+	require.NoError(t, err)
+	var kept int
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT count(*) FROM livewire_filters WHERE owner = $1 AND name IS NULL", alice.Key).Scan(&kept))
+	require.Equal(t, 2, kept, "the maximum is per owner")
 
 	named := unnamed("a")
 	named.Name = "Mine"
@@ -85,6 +98,42 @@ func TestFilterSaveBoundsTheFiltersOfAnOwner(t *testing.T) {
 	named.Name = "Another"
 	_, err = store.Save(t.Context(), named)
 	requireCode(t, err, livewire.CodeInvalidRequest)
+}
+
+func TestFilterMaximumsHoldUnderConcurrentSaves(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store := newFilterStore(t, database, postgresadapter.FilterStoreOptions{MaximumUnnamedPerOwner: 1, MaximumNamedPerOwner: 1})
+	var saves sync.WaitGroup
+	for index := range 8 {
+		saves.Go(func() {
+			_, _ = store.Save(t.Context(), unnamed("concurrent-"+strconv.Itoa(index))) // counted below
+			named := unnamed("named-" + strconv.Itoa(index))
+			named.Name = "Mine " + strconv.Itoa(index)
+			_, _ = store.Save(t.Context(), named) // all but one are refused
+		})
+	}
+	saves.Wait()
+	var unnamedRows, namedRows int
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT count(*) FILTER (WHERE name IS NULL), count(*) FILTER (WHERE name IS NOT NULL) FROM livewire_filters").
+		Scan(&unnamedRows, &namedRows))
+	require.Equal(t, []int{1, 1}, []int{unnamedRows, namedRows})
+}
+
+func TestFilterIDsAreReadInEverySpellingOfTheUUID(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store := newFilterStore(t, database, postgresadapter.FilterStoreOptions{})
+	stored, err := store.Save(t.Context(), unnamed("a"))
+	require.NoError(t, err)
+	for _, spelling := range []string{"{" + stored.ID + "}", strings.ToUpper(stored.ID), "urn:uuid:" + stored.ID} {
+		got, err := store.Get(t.Context(), alice, spelling)
+		require.NoError(t, err, spelling)
+		require.Equal(t, stored.ID, got.ID)
+	}
+	require.NoError(t, store.Delete(t.Context(), alice, "urn:uuid:"+stored.ID))
+	_, err = store.Get(t.Context(), alice, stored.ID)
+	requireCode(t, err, livewire.CodeNotFound)
 }
 
 func TestFilterNamesAreUniquePerOwnerAndResource(t *testing.T) {
