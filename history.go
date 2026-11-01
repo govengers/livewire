@@ -31,12 +31,12 @@ type Version[Item any] struct {
 
 // HistoryFields are the fields a history read filters and sorts by (D34), named as Version
 // marshals them and written over the columns of `<table>_history`: the loader's FROM is the
-// history table alone. The default sort is by version, oldest first. The operation is insert
-// or update: the history is read through the item, so a deleted item has none (D56).
+// history table alone. The default sort is by version, oldest first. A live item's history
+// may hold delete versions: a partition move writes a delete and an insert (D56).
 func HistoryFields() query.Fields {
 	return query.Fields{
 		{Name: "id", Type: query.TypeInteger, SQL: "version", Filter: true, Sort: true},
-		{Name: "operation", Type: query.TypeEnum, SQL: "operation", Enum: []string{string(ChangeInsert), string(ChangeUpdate)}, Filter: true},
+		{Name: "operation", Type: query.TypeEnum, SQL: "operation", Enum: []string{string(ChangeInsert), string(ChangeUpdate), string(ChangeDelete)}, Filter: true},
 		{Name: "validFrom", Type: query.TypeTime, SQL: "valid_from", Filter: true, Sort: true},
 		{Name: "validTo", Type: query.TypeTime, SQL: "valid_to", Nullable: true, Filter: true, Sort: true},
 		{Name: "actor", Type: query.TypeString, SQL: "actor", Nullable: true, Filter: true},

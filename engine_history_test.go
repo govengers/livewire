@@ -229,7 +229,7 @@ func TestDeletedItemHasNoHistory(t *testing.T) {
 		return err
 	}
 	deletes := `{"where":{"field":"operation","op":"eq","value":"delete"}}`
-	requireStatus(t, read(livewire.MapSource{"id": documentID, "filter": deletes}), http.StatusBadRequest)
+	require.NoError(t, read(livewire.MapSource{"id": documentID, "filter": deletes}), "a live item's history may hold the delete of a partition move")
 
 	socket := bed.dial("ada")
 	subscribed(t, socket.do(livewire.OperationSubscribe, "documents.history", map[string]string{"id": documentID}, nil))
