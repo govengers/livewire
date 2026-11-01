@@ -17,6 +17,8 @@ type outbox struct {
 	clock clock
 	// wake has one slot: the writer has frames to send or a delivery is due.
 	wake chan struct{}
+	// enqueued, set by the engine's tests only, runs before frames are queued.
+	enqueued func()
 
 	mutex       sync.Mutex
 	closed      bool
@@ -38,6 +40,9 @@ func newOutbox(limit int, wait time.Duration, clock clock) *outbox {
 // client does not read what it asks for, a slow consumer (D10). One frame larger than the
 // limit alone is no sign of a slow client and is sent.
 func (o *outbox) enqueue(frames ...[]byte) bool {
+	if o.enqueued != nil {
+		o.enqueued()
+	}
 	o.mutex.Lock()
 	if o.closed {
 		o.mutex.Unlock()

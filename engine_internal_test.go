@@ -121,6 +121,9 @@ func stubEngine(t *testing.T) (*Engine, *socket) {
 		Load: func(context.Context, *NoParameters) ([]stubItem, error) {
 			return nil, errors.New("the database is down")
 		},
+	}), NewMutation("touch", http.MethodPost, "/touch", &MutationOptions[NoParameters, NoBody, stubItem]{
+		Check:  authorization.IsAuthenticated(),
+		Handle: func(context.Context, *NoParameters, *NoBody) (*stubItem, error) { return &stubItem{ID: "touched"}, nil },
 	}), NewObject("board", "/board", &ObjectOptions[stubItem, NoParameters]{
 		Tables: []string{"boards"},
 		Read:   authorization.IsAuthenticated(),
@@ -267,4 +270,51 @@ func TestErrorPushIsTheLastSequence(t *testing.T) {
 			require.Less(t, sequence, terminal.Sequence, "attempt %d: a push after the error", attempt)
 		}
 	}
+}
+
+// TestEveryOpFreesItsSlotBeforeItsResponseIsQueued holds the outbox at the moment a response
+// is queued and reads the in-flight count there: a slot released after the response would
+// still count, and a client answering at once would be refused.
+func TestEveryOpFreesItsSlotBeforeItsResponseIsQueued(t *testing.T) {
+	_, clientSocket := stubEngine(t)
+	frames := []*RequestFrame{
+		{ID: "query", Operation: OperationQuery, Target: "board"},
+		{ID: "call", Operation: OperationCall, Target: "touch"},
+		{ID: "batch", Operation: OperationBatch, Body: json.RawMessage(`[{"target":"touch"}]`)},
+		{ID: "refused", Operation: OperationQuery, Target: "nothing"},
+		{ID: "subscribe", Operation: OperationSubscribe, Target: "board"},
+	}
+	inFlight := make(chan int, 16)
+	clientSocket.outbox.enqueued = func() {
+		clientSocket.mutex.Lock()
+		defer clientSocket.mutex.Unlock()
+		inFlight <- clientSocket.inFlight
+	}
+	for _, frame := range frames { // one at a time; the subscribe, whose pushes follow, last
+		clientSocket.start(frame)
+		select {
+		case count := <-inFlight:
+			require.Zero(t, count, "%s: the slot is free when the response is queued", frame.ID)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: no response was queued", frame.ID)
+		}
+	}
+}
+
+// TestQueryWaitSumsTheWaitForASlot fills every query slot, so a unit waits until its context
+// ends: the wait it reports is at least that long, whatever the scheduler does.
+func TestQueryWaitSumsTheWaitForASlot(t *testing.T) {
+	engine, _ := stubEngine(t)
+	for range cap(engine.queries) {
+		engine.queries <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(withQueryWait(t.Context()), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, engine.inSlot(ctx, func() error { return nil }), context.DeadlineExceeded)
+	require.GreaterOrEqual(t, queryWaitOf(ctx), 20*time.Millisecond)
+	for range cap(engine.queries) {
+		<-engine.queries
+	}
+	require.NoError(t, engine.inSlot(withQueryWait(t.Context()), func() error { return nil }), "a free slot is taken at once")
+	require.Zero(t, queryWaitOf(t.Context()), "no sum without withQueryWait")
 }
