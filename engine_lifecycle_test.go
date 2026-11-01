@@ -144,8 +144,8 @@ func TestCloseGivesUpCloseFramesAtItsDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.Body.Close())
 	defer func() { _ = connection.Close() }()
-	for index := range 16 {
-		require.NoError(t, connection.WriteJSON(livewire.RequestFrame{ID: strconv.Itoa(index), Operation: livewire.OperationQuery, Target: "gadgets"}))
+	for index := range 16 { // openGadgets guards no field: its answers are large but cheap, no redaction under -race
+		require.NoError(t, connection.WriteJSON(livewire.RequestFrame{ID: strconv.Itoa(index), Operation: livewire.OperationQuery, Target: "openGadgets"}))
 	}
 	require.Eventually(t, func() bool { return len(bed.outcomes.of(livewire.OutcomeRequest)) >= 16 }, frameWait, time.Millisecond)
 
