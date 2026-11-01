@@ -10,6 +10,7 @@ import (
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/generate"
+	"github.com/govengers/livewire/generate/internal/fixture"
 )
 
 type exampleNote struct {
@@ -60,4 +61,44 @@ func ExampleWrite() {
 	// runtime.ts
 	// types.ts
 	// vue.ts
+}
+
+// ExampleWrite_goClient generates the Go client package and the command-line client of a
+// registry: the client imports the DTO package (here the generator's fixture), so ImportPath
+// says where the client lives (D67).
+func ExampleWrite_goClient() {
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: "/api/v1"})
+	if err != nil {
+		panic(err)
+	}
+	err = registry.Add(livewire.NewList("notes", "/notes", &livewire.ListOptions[fixture.Note, livewire.NoParameters]{
+		Tables: []string{"notes"}, Read: authorization.IsUser(),
+		Load: func(context.Context, *livewire.NoParameters) ([]fixture.Note, error) { return nil, nil },
+	}))
+	if err != nil {
+		panic(err)
+	}
+	directory, err := os.MkdirTemp("", "livewire-example")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(directory)
+	err = generate.Write(registry, &generate.Options{
+		GoClient:    generate.GoClientOptions{Directory: filepath.Join(directory, "notesclient"), ImportPath: "github.com/govengers/livewire/generate/internal/notesclient"},
+		CommandLine: generate.CommandLineOptions{Directory: filepath.Join(directory, "notescommand"), Name: "notes"},
+	})
+	if err != nil {
+		panic(err)
+	}
+	written, err := filepath.Glob(filepath.Join(directory, "*", "*.go"))
+	if err != nil {
+		panic(err)
+	}
+	for _, path := range written {
+		fmt.Println(filepath.Base(filepath.Dir(path)) + "/" + filepath.Base(path))
+	}
+	// Output:
+	// notesclient/client.go
+	// notesclient/filters.go
+	// notescommand/command.go
 }

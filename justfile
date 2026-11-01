@@ -3,7 +3,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 gotestsum := "go run gotest.tools/gotestsum@v1.13.0"
 govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 coverage_threshold := "80"
-excluded := "/examples/|/test/"
+excluded := "/examples/|/test/|/generate/internal/fixture/"
 
 default:
     @just --list
@@ -14,7 +14,7 @@ lint:
     go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
 
-# Unit tests with the race detector; fails below the coverage threshold (examples and the e2e suite excluded)
+# Unit tests with the race detector; fails below the coverage threshold (examples, the e2e suite and the generator's fixture with its generated clients excluded)
 test:
     mkdir -p sandbox
     {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.raw.cover ./...

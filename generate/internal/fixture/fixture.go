@@ -61,6 +61,12 @@ type Code struct{ value string }
 // MarshalText writes the code.
 func (c Code) MarshalText() ([]byte, error) { return []byte(strings.ToUpper(c.value)), nil }
 
+// UnmarshalText reads the code, so the Go client decodes what the server wrote.
+func (c *Code) UnmarshalText(text []byte) error {
+	c.value = strings.ToLower(string(text))
+	return nil
+}
+
 // Part is the item of the test resource.
 type Part struct {
 	Audit
@@ -107,6 +113,18 @@ type CreatePart struct {
 	ID   uuid.UUID `json:"id,omitzero"`
 	Name string    `json:"name" validate:"required"`
 	Kind Kind      `json:"kind"`
+}
+
+// CreateLabel is a create body whose client id is a named string.
+type CreateLabel struct {
+	ID   Color  `json:"id"`
+	Name string `json:"name"`
+}
+
+// CreateNote is a create body whose client id is a pointer.
+type CreateNote struct {
+	ID   *uuid.UUID `json:"id,omitempty"`
+	Text string     `json:"text"`
 }
 
 // RenamePart is the body of the rename mutation.
