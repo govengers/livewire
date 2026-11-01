@@ -204,6 +204,9 @@ func (s *typeSet) shapeOf(goType reflect.Type, how use) (*shape, error) {
 		return inner.withNullable(true), nil
 	}
 	if how.enum != nil && goType.Kind() == reflect.String {
+		if _, special := specialShape(goType, how.unaddressable); special {
+			return nil, fmt.Errorf("generate: the type %s marshals itself, so an enum tag cannot describe its JSON", goType)
+		}
 		return &shape{kind: shapeEnum, values: how.enum}, nil
 	}
 	if _, listed := s.enums[goType]; !listed {
@@ -389,19 +392,51 @@ func (s *typeSet) objectShape(structType reflect.Type, how use) (*shape, error) 
 // refuseAddressDependent refuses a named struct reached where it is not addressable (a map
 // value) whose field marshals itself only through a pointer receiver: its one definition says
 // how an addressable value marshals, encoding/json writes the field's underlying value there.
+//
+// The walk follows what stays unaddressable inside a map value: struct fields, named or not,
+// and array elements, at any depth; a pointer, a slice and a map make their contents
+// addressable again (or are refused on their own as map values).
 func refuseAddressDependent(goType reflect.Type) error {
-	if goType.Kind() != reflect.Struct {
+	return addressDependent(goType, goType.String(), map[reflect.Type]bool{})
+}
+
+func addressDependent(goType reflect.Type, path string, visited map[reflect.Type]bool) error {
+	if visited[goType] {
 		return nil
 	}
-	for _, field := range jsonfield.Of(goType) {
-		fieldType := field.StructField.Type
-		for _, method := range []reflect.Type{jsonMarshalerType, textMarshalerType} {
-			if !fieldType.Implements(method) && reflect.PointerTo(fieldType).Implements(method) {
-				return fmt.Errorf("generate: %s is a map value, where its field %s, which marshals itself through a pointer receiver only, is not addressable: give the method a value receiver or the map pointer values", goType, field.StructField.Name)
+	visited[goType] = true
+	switch goType.Kind() {
+	case reflect.Array:
+		return addressValue(goType.Elem(), path+"[]", visited)
+	case reflect.Struct:
+		for _, field := range jsonfield.Of(goType) {
+			if err := addressValue(field.StructField.Type, path+"."+field.StructField.Name, visited); err != nil {
+				return err
 			}
 		}
+	default:
 	}
 	return nil
+}
+
+// addressValue refuses a value inside a map value that marshals itself through a pointer
+// receiver only, and walks on into it.
+func addressValue(valueType reflect.Type, path string, visited map[reflect.Type]bool) error {
+	for _, method := range []reflect.Type{jsonMarshalerType, textMarshalerType} {
+		if !valueType.Implements(method) && reflect.PointerTo(valueType).Implements(method) {
+			return fmt.Errorf("generate: %s is inside a map value, where it is not addressable, and marshals itself through a pointer receiver only: give the method a value receiver or the map pointer values", path)
+		}
+	}
+	if _, special := specialShape(valueType, true); special {
+		return nil
+	}
+	return addressDependent(valueType, path, visited)
+}
+
+// marshalsItselfAnyway reports whether a value of the type, addressable or not, has a marshaler,
+// which takes precedence over listed enum values.
+func marshalsItselfAnyway(goType reflect.Type) bool {
+	return implements(goType, jsonMarshalerType, false) || implements(goType, textMarshalerType, false)
 }
 
 // marshalsItself reports whether a field's value (behind one unnamed pointer level, where the

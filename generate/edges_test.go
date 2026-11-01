@@ -181,6 +181,33 @@ type addressedItem struct {
 	Values map[string]addressed `json:"values"`
 }
 
+// deeper holds the address-dependent field one named struct further down.
+type deeper struct {
+	Inner addressed `json:"inner"`
+}
+
+type deeperItem struct {
+	Values map[string]deeper `json:"values"`
+}
+
+// arrayed holds it inside an array field, whose elements stay unaddressable in a map value.
+type arrayed struct {
+	Texts [2]pointerText `json:"texts"`
+}
+
+type arrayedItem struct {
+	Values map[string]arrayed `json:"values"`
+}
+
+// textKind is a named string type that marshals itself as text.
+type textKind string
+
+func (k textKind) MarshalText() ([]byte, error) { return []byte(strings.ToUpper(string(k))), nil }
+
+type textKindItem struct {
+	Kind textKind `json:"kind" enum:"a,b"`
+}
+
 // scalarRegistry holds only scalar DTOs: api.ts imports nothing from types.ts.
 func scalarRegistry(t *testing.T) *livewire.Registry {
 	t.Helper()
@@ -228,7 +255,10 @@ func TestEdgeRegistryRefusals(t *testing.T) {
 			Read: authorization.IsUser(), Load: func(context.Context, *keyPathParameters) (*historyItem, error) { return &historyItem{}, nil },
 		})}, "must be a string query parameter"},
 		{"a map key with a pointer-receiver MarshalText", []livewire.Declaration{objectOf[pointerKeyItem]("keys")}, "with a value receiver"},
-		{"a named struct as a map value whose field marshals itself through a pointer only", []livewire.Declaration{objectOf[addressedItem]("addressed")}, "is a map value"},
+		{"a named struct as a map value whose field marshals itself through a pointer only", []livewire.Declaration{objectOf[addressedItem]("addressed")}, "addressed.Text is inside a map value"},
+		{"the same one named struct further down", []livewire.Declaration{objectOf[deeperItem]("deeper")}, "deeper.Inner.Text is inside a map value"},
+		{"the same inside an array field", []livewire.Declaration{objectOf[arrayedItem]("arrayed")}, "arrayed.Texts[] is inside a map value"},
+		{"an enum tag on a type that marshals itself", []livewire.Declaration{objectOf[textKindItem]("kinds")}, "marshals itself, so an enum tag"},
 		{"two Go names of one package that differ in case", []livewire.Declaration{objectOf[caseItem]("cases")}, "generate_test.Reviewlower are both named"},
 	}
 	for _, testCase := range testCases {

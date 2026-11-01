@@ -268,6 +268,11 @@ func TestOptionsAreValidated(t *testing.T) {
 			options.Enums = append(options.Enums, options.Enums[0])
 			return options
 		}, "listed twice"},
+		{"an enum of a type that marshals itself", func() *generate.Options {
+			options := valid()
+			options.Enums = []generate.Enum{generate.EnumOf[textKind]("a")}
+			return options
+		}, "marshals itself, so its values"},
 		{"an enum value listed twice", func() *generate.Options {
 			options := valid()
 			options.Enums = []generate.Enum{generate.EnumOf(fixture.KindBolt, fixture.KindBolt)}

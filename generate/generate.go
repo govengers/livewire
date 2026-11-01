@@ -188,6 +188,8 @@ func validateEnum(enum Enum, earlier []Enum) error {
 		return fmt.Errorf("generate: Enums: %v is not a named string type", enum.Type)
 	case len(enum.Values) == 0:
 		return fmt.Errorf("generate: Enums: %v has no values", enum.Type)
+	case marshalsItselfAnyway(enum.Type):
+		return fmt.Errorf("generate: Enums: %v marshals itself, so its values cannot describe its JSON", enum.Type)
 	case slices.ContainsFunc(earlier, func(other Enum) bool { return other.Type == enum.Type }):
 		return fmt.Errorf("generate: Enums: %v is listed twice", enum.Type)
 	}
