@@ -35,10 +35,13 @@ var historyColumns = []query.DerivedColumn{
 //		return postgresadapter.HistoryPage(ctx, r.pool, "parts", listQuery, decodePartRow)
 //	},
 func HistoryPage[Item any](ctx context.Context, database DBTX, table string, listQuery *query.ListQuery, decode func(row []byte) (*Item, error)) (*livewire.Page[livewire.Version[Item]], error) {
-	history := identifier(table + historySuffix)
-	currentLife := "(SELECT * FROM " + history + " candidate WHERE candidate.life = (SELECT max(lives.life) FROM " + history +
-		" lives WHERE lives.id = candidate.id)) AS history"
-	specification := &query.ResourceSQL{From: currentLife, IDColumn: "version", Derived: historyColumns}
+	// The newest life per id as a window: PostgreSQL pushes the scope's id = key into it (the
+	// PARTITION BY column), so a read costs the item's versions once, not once per version.
+	withLives := "(SELECT *, max(life) OVER (PARTITION BY id) AS current_life FROM " + identifier(table+historySuffix) + ") AS history"
+	specification := &query.ResourceSQL{From: withLives, IDColumn: "version", Derived: historyColumns}
+	currentLife := *listQuery
+	currentLife.Where = query.And(listQuery.Where, func(builder *query.Builder) { builder.WriteString("life = current_life") })
+	listQuery = &currentLife
 	page := &livewire.Page[livewire.Version[Item]]{Items: []livewire.Version[Item]{}}
 	err := inSnapshot(ctx, database, func(database DBTX) error {
 		var err error
