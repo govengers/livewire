@@ -1666,6 +1666,7 @@ export interface LivePair {
 export interface LivePairOptions {
   /** Who the application's session acts as now; the pair serves the identity it answers at creation. */
   identity?: () => string
+  /** The client's options; its onEnd runs once when the pair ends, from either side, after the connection ended. */
   client: Omit<ClientOptions, 'identity' | 'filters'>
   connection: Omit<LiveOptions, 'identity' | 'filters'>
 }
@@ -1682,8 +1683,17 @@ export function createLivePair(options: LivePairOptions): LivePair {
   const filters = new FilterMemory()
   const identity = options.identity?.() ?? ''
   let connection: LiveConnection | undefined
-  // Either side's end ends the pair: the client's (another identity before a REST call) ends the connection.
-  const clientOptions: ClientOptions = { ...options.client, filters, onEnd: () => connection?.end() }
+  // Either side's end ends the pair: the client's (another identity before a REST call) ends the
+  // connection first, then the application's onEnd runs, under recovery, once.
+  const onEnd = (): void => {
+    connection?.end()
+    try {
+      options.client.onEnd?.()
+    } catch (error) {
+      rethrowLater(error)
+    }
+  }
+  const clientOptions: ClientOptions = { ...options.client, filters, onEnd }
   if (options.identity !== undefined) clientOptions.identity = options.identity
   const client = new Client(clientOptions)
   const connectionOptions: LiveOptions = { ...options.connection, filters }

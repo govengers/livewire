@@ -1144,3 +1144,24 @@ describe('the end path, last round (D66)', () => {
     expect(calls).toBe(0)
   })
 })
+
+describe('createLivePair keeps the application\'s onEnd', () => {
+  const pairWith = (onEnd: () => void, identity = () => 'password:alice') =>
+    createLivePair({ identity, client: { baseURL: 'https://example.com/api/v1', fetch: fakeFetch(json({})).fetch, onEnd }, connection: { url: 'wss://x', WebSocket: fakeSockets().Socket } })
+
+  test('it runs exactly once, after the connection ended, whichever side ends the pair', async () => {
+    const seen: boolean[] = []
+    const fromConnection = pairWith(() => void seen.push(fromConnection.connection.ended))
+    fromConnection.connection.end()
+    fromConnection.end()
+    expect(seen).toEqual([true])
+
+    let identity = 'password:alice'
+    const order: boolean[] = []
+    const fromClient = pairWith(() => void order.push(fromClient.connection.ended), () => identity)
+    identity = 'password:bob'
+    await fromClient.client.read(read<Record<string, never>, unknown>({ target: 'x', path: '/x', pathParameters: [], list: false }), {}).catch(() => {})
+    fromClient.end()
+    expect(order).toEqual([true])
+  })
+})
