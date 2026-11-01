@@ -67,12 +67,13 @@ func TestTriggerSQLQuotesIdentifiersAndLiterals(t *testing.T) {
 	t.Parallel()
 	require.Equal(t,
 		"CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON \"a\"\"b\" FOR EACH ROW EXECUTE FUNCTION livewire_notify();\n"+
-			"CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON \"a\"\"b\" FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify();\n"+
-			"CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON \"c\" FOR EACH ROW EXECUTE FUNCTION livewire_notify();\n"+
-			"CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON \"c\" FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify();\n",
-		postgresadapter.TriggerSQL(`a"b`, "c"))
+			"DO $livewire$ DECLARE relation regclass; BEGIN FOR relation IN SELECT '\"a\"\"b\"'::regclass UNION SELECT relid FROM pg_partition_tree('\"a\"\"b\"') LOOP\n"+
+			"\tEXECUTE format('CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(%s)', relation, '');\n"+
+			"END LOOP; END $livewire$;\n",
+		postgresadapter.TriggerSQL(`a"b`))
 	partitioned := postgresadapter.PartitionedTriggerSQL("gadgets", "it's")
-	require.Equal(t, 2, strings.Count(partitioned, "livewire_notify('it''s')"), "the row and the truncate trigger carry the column")
+	require.Contains(t, partitioned, "livewire_notify('it''s')")
+	require.Contains(t, partitioned, "relation, quote_literal('it''s'))", "the truncate trigger carries the column too")
 }
 
 func TestTriggerNotifiesATruncateToEverySubscriptionOfTheTable(t *testing.T) {
@@ -81,12 +82,18 @@ func TestTriggerNotifiesATruncateToEverySubscriptionOfTheTable(t *testing.T) {
 	insertPart(t, database, "bolt")
 	_, err := database.pool.Exec(t.Context(), "INSERT INTO gadgets (tenant_id, name) VALUES ('north', 'lamp')")
 	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), "INSERT INTO orders (region, total) VALUES ('eu', 7)")
+	require.NoError(t, err)
 	listening := notifications(t, database)
 	for _, table := range []string{"parts", "gadgets", "orders"} {
 		_, err := database.pool.Exec(t.Context(), "TRUNCATE "+table+" CASCADE")
 		require.NoError(t, err)
 		require.JSONEq(t, `{"table":"`+table+`","op":"delete","id":"","partition":""}`, nextPayload(t, listening, time.Second))
 	}
+	_, err = database.pool.Exec(t.Context(), "TRUNCATE orders_eu")
+	require.NoError(t, err)
+	require.JSONEq(t, `{"table":"orders","op":"delete","id":"","partition":""}`, nextPayload(t, listening, time.Second),
+		"a partition truncated on its own names its table")
 	require.Empty(t, nextPayload(t, listening, quiet), "one notification per truncated table")
 }
 
@@ -212,29 +219,27 @@ func TestHistoryAppendsVersionsWithTheActorOfTheTransaction(t *testing.T) {
 func TestAuditMaintainPartitionsByMonthAndDropsExpiredRows(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
-	store, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: database.pool, Retention: 400 * 24 * time.Hour})
-	require.NoError(t, err)
-	require.NoError(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", RequestID: "now", Status: 201}))
-	_, err = database.pool.Exec(t.Context(), `INSERT INTO livewire_audit (at, mutation, request_id, status, duration_ms)
-		VALUES (now() - interval '3 years', 'createPart', 'ancient', 201, 1)`)
+	_, err := database.pool.Exec(t.Context(), `INSERT INTO livewire_audit (at, mutation, request_id, status, duration_ms) VALUES
+		('2026-03-10T08:00:00Z', 'createPart', 'march', 201, 1), ('2023-03-10T08:00:00Z', 'createPart', 'ancient', 201, 1)`)
 	require.NoError(t, err)
 	_, err = database.pool.Exec(t.Context(), `CREATE TABLE livewire_audit_200001 PARTITION OF livewire_audit FOR VALUES FROM ('2000-01-01Z') TO ('2000-02-01Z')`)
 	require.NoError(t, err)
 
-	require.NoError(t, store.Maintain(t.Context()))
-	require.NoError(t, store.Maintain(t.Context()), "maintenance is idempotent")
-
-	var thisMonth, nextMonth string // by the database's clock, which Maintain went by
-	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYYMM'),
-		to_char(date_trunc('month', now() AT TIME ZONE 'UTC') + interval '1 month', 'YYYYMM')`).Scan(&thisMonth, &nextMonth))
+	for range 2 { // maintenance is idempotent
+		_, err = database.pool.Exec(t.Context(), "SELECT livewire_audit_maintain(interval '400 days', '2026-03-15T12:00:00Z')")
+		require.NoError(t, err)
+	}
 	require.Equal(t, map[string]string{
-		"livewire_audit_" + thisMonth: thisMonth, "livewire_audit_" + nextMonth: nextMonth, "livewire_audit_default": "DEFAULT",
+		"livewire_audit_202603": "202603", "livewire_audit_202604": "202604", "livewire_audit_default": "DEFAULT",
 	}, auditPartitions(t, database.pool))
-
 	var requestID, partition string
 	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT request_id, tableoid::regclass::text FROM livewire_audit").Scan(&requestID, &partition))
-	require.Equal(t, "now", requestID, "the expired row is gone")
-	require.Equal(t, "livewire_audit_"+thisMonth, partition, "the month's row moved out of the default partition")
+	require.Equal(t, "march", requestID, "the expired row is gone")
+	require.Equal(t, "livewire_audit_202603", partition, "the month's row moved out of the default partition")
+
+	store, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: database.pool, Retention: 400 * 24 * time.Hour})
+	require.NoError(t, err)
+	require.NoError(t, store.Maintain(t.Context()), "the store runs it at now()")
 }
 
 // auditPartitions is every partition of livewire_audit with the UTC month its bounds span,
@@ -294,28 +299,37 @@ func TestAuditMaintainCutsUTCMonthsWhateverTheSessionTimeZone(t *testing.T) {
 func TestAuditMaintainHoldsUnderConcurrentWrites(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
-	store, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: database.pool})
-	require.NoError(t, err)
 	ctx, stop := context.WithCancel(t.Context())
 	var writers sync.WaitGroup
 	var written atomic.Int64
+	var mutex sync.Mutex
+	var failures []error
 	for range 4 {
 		writers.Go(func() {
 			for ctx.Err() == nil {
-				if store.Write(ctx, &postgresadapter.AuditEntry{Mutation: "createPart", RequestID: "concurrent", Status: 201}) == nil {
+				_, err := database.pool.Exec(ctx, `INSERT INTO livewire_audit (at, mutation, request_id, status, duration_ms)
+					VALUES ('2026-03-15T12:00:00Z', 'createPart', 'concurrent', 201, 1)`)
+				switch {
+				case err == nil:
 					written.Add(1)
+				case ctx.Err() == nil:
+					mutex.Lock()
+					failures = append(failures, err)
+					mutex.Unlock()
 				}
 			}
 		})
 	}
 	require.Eventually(t, func() bool { return written.Load() > 50 }, 5*time.Second, time.Millisecond, "the writers write into the default partition")
-	maintained := store.Maintain(t.Context())
+	_, maintained := database.pool.Exec(t.Context(), "SELECT livewire_audit_maintain(interval '400 days', '2026-03-15T12:00:00Z')")
+	before := written.Load()
+	require.Eventually(t, func() bool { return written.Load() > before+50 }, 5*time.Second, time.Millisecond, "the writers go on into the new partition")
 	stop()
 	writers.Wait()
 	require.NoError(t, maintained, "the move and the attach hold against concurrent inserts")
+	require.Empty(t, failures, "no writer failed, the ones queued behind the attach included")
 	var stranded int
-	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT count(*) FROM livewire_audit_default
-		WHERE at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`).Scan(&stranded))
+	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT count(*) FROM livewire_audit_default`).Scan(&stranded))
 	require.Zero(t, stranded, "no row of the month stays in the default partition")
 }
 
@@ -364,4 +378,134 @@ func TestAuditStoreOptions(t *testing.T) {
 	database := newDatabase(t)
 	_, err = postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: database.pool, Retention: -time.Second})
 	require.Error(t, err)
+}
+
+func TestAMoveBetweenNativePartitionsIsADeleteAndAnInsert(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	var id string
+	require.NoError(t, database.pool.QueryRow(t.Context(), "INSERT INTO orders (region, total) VALUES ('eu', 7) RETURNING id::text").Scan(&id))
+	listening := notifications(t, database)
+	_, err := database.pool.Exec(t.Context(), "UPDATE orders SET region = 'us' WHERE id = $1", id)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"table":"orders","op":"delete","id":"`+id+`","partition":""}`, nextPayload(t, listening, time.Second))
+	require.JSONEq(t, `{"table":"orders","op":"insert","id":"`+id+`","partition":""}`, nextPayload(t, listening, time.Second))
+	rows, err := database.pool.Query(t.Context(), "SELECT operation || ' ' || (data->>'region') FROM orders_history WHERE id = $1 ORDER BY version", id)
+	require.NoError(t, err)
+	versions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	require.Equal(t, []string{"insert eu", "delete eu", "insert us"}, versions, "as HistorySQL documents it")
+}
+
+func TestHistoryClosesTheOldIDOnAnIDChange(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	id := insertPart(t, database, "bolt")
+	var changed string
+	require.NoError(t, database.pool.QueryRow(t.Context(), "UPDATE parts SET id = uuidv7() WHERE id = $1 RETURNING id::text", id).Scan(&changed))
+	require.Equal(t, []historyRow{{Version: 1, Operation: "insert", Name: "bolt"}}, readHistory(t, database, id), "the old id's version is closed")
+	require.Equal(t, []historyRow{{Version: 1, Operation: "update", Name: "bolt", Open: true}}, readHistory(t, database, changed))
+}
+
+func TestHistoryNeverStampsBeforeThePreviousVersion(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	id := insertPart(t, database, "bolt")
+	_, err := database.pool.Exec(t.Context(), "UPDATE parts_history SET valid_from = now() + interval '1 hour' WHERE id = $1", id) // a clock that stepped back
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), "UPDATE parts SET name = 'nut' WHERE id = $1", id)
+	require.NoError(t, err)
+	var ordered bool
+	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT previous.valid_to = next.valid_from AND next.valid_from >= previous.valid_from
+		FROM parts_history previous JOIN parts_history next ON next.id = previous.id AND next.version = previous.version + 1
+		WHERE previous.id = $1`, id).Scan(&ordered))
+	require.True(t, ordered, "the next version starts no earlier than the previous one, where it ended")
+}
+
+func TestHistorySQLRefusesANameItCannotSuffix(t *testing.T) {
+	t.Parallel()
+	_, err := postgresadapter.HistorySQL(strings.Repeat("t", 55))
+	require.NoError(t, err, "55 bytes and _history are 63")
+	_, err = postgresadapter.HistorySQL(strings.Repeat("t", 56))
+	require.ErrorContains(t, err, "63 bytes")
+	_, err = postgresadapter.HistorySQL(strings.Repeat("t", 63))
+	require.Error(t, err, "a legal table name whose history PostgreSQL would cut back to the table's name")
+}
+
+func TestAuditMaintainDropsNothingCurrentForAFutureAsOf(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	_, err := database.pool.Exec(t.Context(), `CREATE TABLE livewire_audit_209912 PARTITION OF livewire_audit FOR VALUES FROM ('2099-12-01Z') TO ('2100-01-01Z')`)
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), `INSERT INTO livewire_audit (at, mutation, request_id, status, duration_ms) VALUES (now(), 'createPart', 'today', 201, 1)`)
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), "SELECT livewire_audit_maintain(interval '1 day', '2100-06-01T00:00:00Z')")
+	require.NoError(t, err)
+	var kept bool
+	var rows int
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT to_regclass('livewire_audit_209912') IS NOT NULL, (SELECT count(*) FROM livewire_audit)").Scan(&kept, &rows))
+	require.True(t, kept, "the cutoff is least(as_of, now()) - retention")
+	require.Equal(t, 1, rows, "today's row is not older than the cutoff")
+}
+
+func TestAuditMaintainWaitsForAWriterAndAReaderWithoutDeadlock(t *testing.T) {
+	t.Parallel()
+	for name, shape := range map[string]struct{ first, second string }{
+		// The writer holds the table, not yet the default partition, and inserts after Maintain began.
+		"writer": {
+			"LOCK TABLE ONLY livewire_audit IN ROW EXCLUSIVE MODE",
+			"INSERT INTO livewire_audit (at, mutation, request_id, status, duration_ms) VALUES ('2026-03-15T12:00:00Z', 'createPart', 'held', 201, 1)",
+		},
+		// The reader holds the table and reads every partition after Maintain began.
+		"reader": {"SELECT count(*) FROM ONLY livewire_audit", "SELECT count(*) FROM livewire_audit"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			database := newDatabase(t)
+			_, err := database.pool.Exec(t.Context(), `CREATE TABLE livewire_audit_200001 PARTITION OF livewire_audit FOR VALUES FROM ('2000-01-01Z') TO ('2000-02-01Z')`)
+			require.NoError(t, err)
+			holder, err := database.pool.Begin(t.Context())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = holder.Rollback(context.Background()) }) // committed below; ErrTxClosed then
+			_, err = holder.Exec(t.Context(), shape.first)
+			require.NoError(t, err)
+
+			maintained := make(chan error, 1)
+			go func() { // creates this and next month and drops 200001
+				_, err := database.pool.Exec(t.Context(), "SELECT livewire_audit_maintain(interval '400 days', '2026-03-15T12:00:00Z')")
+				maintained <- err
+			}()
+			require.Eventually(t, func() bool {
+				var waiting bool
+				err := database.pool.QueryRow(t.Context(), "SELECT EXISTS (SELECT FROM pg_locks WHERE NOT granted AND relation = 'livewire_audit'::regclass AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))").Scan(&waiting)
+				return err == nil && waiting
+			}, 5*time.Second, time.Millisecond, "Maintain waits for the table")
+			_, err = holder.Exec(t.Context(), shape.second)
+			require.NoError(t, err, "the holder goes on")
+			require.NoError(t, holder.Commit(t.Context()))
+			select {
+			case err := <-maintained:
+				require.NoError(t, err, "Maintain went on after the holder, no deadlock")
+			case <-time.After(10 * time.Second):
+				t.Fatal("Maintain did not end")
+			}
+		})
+	}
+}
+
+func TestAuditWriteStoresTheIdempotencyKeyCanonically(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: database.pool})
+	require.NoError(t, err)
+	const key = "0193a8f0-0000-7000-8000-00000000000b"
+	for _, spelling := range []string{"urn:uuid:" + key, "{" + strings.ToUpper(key) + "}", ""} {
+		require.NoError(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", RequestID: spelling, IdempotencyKey: spelling, Status: 201}), spelling)
+	}
+	rows, err := database.pool.Query(t.Context(), "SELECT coalesce(idempotency_key::text, 'none') FROM livewire_audit ORDER BY request_id")
+	require.NoError(t, err)
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	require.Equal(t, []string{"none", key, key}, keys)
+	require.Error(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", IdempotencyKey: "nope"}))
 }

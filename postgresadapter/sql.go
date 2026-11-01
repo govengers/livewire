@@ -1,6 +1,7 @@
 package postgresadapter
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -19,11 +20,13 @@ const Channel = "livewire"
 // PartitionedTriggerSQL and PresenceSQL. It sends one notification per row change on
 // Channel: `{"table", "op", "id", "partition"}` with the operation in lower case (insert,
 // update, delete), the row's id column as text ("" without one) and the partition column's
-// value ("" without one). An update that moves a row to another partition notifies both. The
-// table is the root of a natively partitioned table (PARTITION BY), never the partition the
-// row lives in. A TRUNCATE notifies one delete without id and partition, which reaches every
-// subscription of the table. An id or partition value longer than 500 bytes is sent as "",
-// so the payload stays below pg_notify's 8000 bytes: such a change reaches every
+// value ("" without one, D25). An update that changes the partition column notifies the new
+// and the old value. The table is the root of a natively partitioned table (PARTITION BY),
+// never the partition the row lives in, and its id must be unique across the partitions; an
+// update that moves a row to another native partition runs as a delete and an insert and
+// notifies those two. A TRUNCATE notifies one delete without id and partition, which reaches
+// every subscription of the table. An id or partition value longer than 500 bytes is sent as
+// "", so the payload stays below pg_notify's 8000 bytes: such a change reaches every
 // subscription of the table, never fewer than it should.
 const TriggerFunctionSQL = `CREATE OR REPLACE FUNCTION livewire_notify() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
@@ -53,8 +56,10 @@ $$;
 // TriggerSQL makes every table notify on each row change and on TRUNCATE (D22); the changes
 // carry no partition, so they reach the subscriptions of every partition. A table name is one
 // identifier in the search path, quoted as it is. On a natively partitioned table the row
-// trigger reaches every partition and the changes name the table itself; a TRUNCATE of one
-// partition on its own notifies nothing, truncate the table.
+// trigger reaches every partition and the changes name the table itself; the TRUNCATE
+// trigger is installed on the table and on the partitions it has now, so a partition
+// attached later notifies its own TRUNCATE only once TriggerSQL runs again, and a DETACH
+// PARTITION notifies nothing.
 func TriggerSQL(tables ...string) string {
 	var statements strings.Builder
 	for _, table := range tables {
@@ -108,10 +113,12 @@ CREATE INDEX livewire_idempotency_created_at ON livewire_idempotency (created_at
 // AuditSQL creates livewire_audit, one row per mutation (D32, AuditStore), partitioned by
 // UTC month on at. Rows of a month without its partition land in livewire_audit_default;
 // livewire_audit_maintain(retention, as_of default now()), which AuditStore.Maintain calls,
-// creates the partitions of the UTC month of as_of and the next one (moving their rows out of
-// the default partition, which it locks against inserts meanwhile, at most for its 5 s
-// lock_timeout), drops the partitions that ended before as_of - retention and deletes the
-// default partition's rows older than that. The session's TimeZone changes nothing.
+// creates the partitions of the UTC month of as_of and the next one, moving their rows out of
+// the default partition, drops the partitions whose month ended before least(as_of, now()) -
+// retention and deletes the default partition's rows older than that. When it creates or
+// drops a partition it holds livewire_audit in ACCESS EXCLUSIVE mode until it ends, so audit
+// writes and reads wait meanwhile; its lock_timeout of 5 s bounds how long it waits for that
+// lock, not how long it holds it. The session's TimeZone changes nothing.
 const AuditSQL = `CREATE TABLE livewire_audit (
 	id uuid NOT NULL DEFAULT uuidv7(),
 	at timestamptz NOT NULL DEFAULT now(),
@@ -129,36 +136,43 @@ const AuditSQL = `CREATE TABLE livewire_audit (
 CREATE TABLE livewire_audit_default PARTITION OF livewire_audit DEFAULT;
 CREATE FUNCTION livewire_audit_maintain(retention interval, as_of timestamptz DEFAULT now()) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
+	cutoff timestamptz := least(as_of, now()) - retention; -- a future as_of drops nothing current
 	month_start timestamp; -- the first of a month in UTC
 	month_end timestamp;
 	partition_name text;
-	child record;
+	missing text[] := '{}';
+	expired text[];
 BEGIN
 	PERFORM pg_advisory_xact_lock(hashtextextended('livewire_audit_maintain', 0));
 	PERFORM set_config('lock_timeout', '5s', true);
 	FOR month_offset IN 0..1 LOOP
-		month_start := date_trunc('month', as_of AT TIME ZONE 'UTC') + make_interval(months => month_offset);
+		partition_name := 'livewire_audit_' || to_char(date_trunc('month', as_of AT TIME ZONE 'UTC') + make_interval(months => month_offset), 'YYYYMM');
+		IF to_regclass(quote_ident(partition_name)) IS NULL THEN
+			missing := missing || partition_name;
+		END IF;
+	END LOOP;
+	SELECT coalesce(array_agg(class.relname), '{}') INTO expired
+		FROM pg_inherits JOIN pg_class class ON class.oid = pg_inherits.inhrelid
+		WHERE pg_inherits.inhparent = 'livewire_audit'::regclass AND class.relname ~ '^livewire_audit_[0-9]{6}$'
+			AND (to_date(right(class.relname, 6), 'YYYYMM')::timestamp + interval '1 month') AT TIME ZONE 'UTC' <= cutoff;
+	IF cardinality(missing) > 0 OR cardinality(expired) > 0 THEN
+		-- One lock, before anything else: a writer then routes its row only once the partitions
+		-- are final, and neither a writer nor a reader holding the table can deadlock with us.
+		LOCK TABLE livewire_audit IN ACCESS EXCLUSIVE MODE;
+	END IF;
+	FOREACH partition_name IN ARRAY missing LOOP
+		month_start := to_date(right(partition_name, 6), 'YYYYMM')::timestamp;
 		month_end := month_start + interval '1 month';
-		partition_name := 'livewire_audit_' || to_char(month_start, 'YYYYMM');
-		CONTINUE WHEN to_regclass(quote_ident(partition_name)) IS NOT NULL;
 		EXECUTE format('CREATE TABLE %I (LIKE livewire_audit INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', partition_name);
-		-- A row of the month inserted into the default partition between the move and the
-		-- attach would fail the attach: inserts wait until the function ends.
-		LOCK TABLE livewire_audit_default IN ACCESS EXCLUSIVE MODE;
 		EXECUTE format('WITH moved AS (DELETE FROM livewire_audit_default WHERE at >= $1 AND at < $2 RETURNING *) INSERT INTO %I SELECT * FROM moved', partition_name)
 			USING month_start AT TIME ZONE 'UTC', month_end AT TIME ZONE 'UTC';
 		EXECUTE format('ALTER TABLE livewire_audit ATTACH PARTITION %I FOR VALUES FROM (%L) TO (%L)',
 			partition_name, month_start AT TIME ZONE 'UTC', month_end AT TIME ZONE 'UTC');
 	END LOOP;
-	FOR child IN
-		SELECT class.relname FROM pg_inherits JOIN pg_class class ON class.oid = pg_inherits.inhrelid
-		WHERE pg_inherits.inhparent = 'livewire_audit'::regclass AND class.relname ~ '^livewire_audit_[0-9]{6}$'
-	LOOP
-		IF (to_date(right(child.relname, 6), 'YYYYMM')::timestamp + interval '1 month') AT TIME ZONE 'UTC' <= as_of - retention THEN
-			EXECUTE format('DROP TABLE %I', child.relname);
-		END IF;
+	FOREACH partition_name IN ARRAY expired LOOP
+		EXECUTE format('DROP TABLE %I', partition_name);
 	END LOOP;
-	DELETE FROM livewire_audit_default WHERE at < as_of - retention;
+	DELETE FROM livewire_audit_default WHERE at < cutoff;
 END
 $$;
 `
@@ -204,6 +218,10 @@ BEGIN
 	IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = to_jsonb(NEW) THEN
 		RETURN NULL;
 	END IF;
+	IF TG_OP = 'UPDATE' AND (to_jsonb(OLD)->>'id') IS DISTINCT FROM (current_row->>'id') THEN
+		EXECUTE format('UPDATE %s SET valid_to = greatest(clock_timestamp(), valid_from) WHERE id = $1 AND valid_to IS NULL', history)
+			USING (to_jsonb(OLD)->>'id')::uuid;
+	END IF;
 	EXECUTE format('SELECT coalesce(max(version), 0) + 1, greatest(clock_timestamp(), max(valid_from), max(valid_to)) FROM %s WHERE id = $1', history)
 		INTO next_version, stamp USING row_id;
 	EXECUTE format('UPDATE %s SET valid_to = $2 WHERE id = $1 AND valid_to IS NULL', history) USING row_id, stamp;
@@ -221,13 +239,21 @@ $$;
 // per id), the operation, valid_from and valid_to (NULL for the current version; a delete is
 // a closed version of the last row), and the actor, real actor, mutation and request id the
 // Transactor set in livewire.actor (D31; NULL outside an engine transaction). An update that
-// changes nothing appends nothing, a TRUNCATE appends nothing either. Table needs a uuid
-// column id; for a natively partitioned table the history is the table's, whichever
-// partition the row lives in. The trigger function livewire_history() is created or replaced
-// with it. Applications only insert into history through the trigger; the trigger itself
-// closes the previous version.
-func HistorySQL(table string) string {
-	return historyFunctionSQL + `CREATE TABLE ` + identifier(table+"_history") + ` (
+// changes nothing appends nothing, a TRUNCATE appends nothing either; an update that changes
+// the id closes the old id's version and starts the new id's history. Table needs a uuid
+// column id. For a natively partitioned table the history is the table's, whichever
+// partition the row lives in; the id must be unique across the partitions, which PostgreSQL
+// cannot enforce there and livewire assumes everywhere (Change.ID, item routes). An update
+// that moves a row to another partition runs as a delete and an insert, so it appends a
+// delete and an insert version, not an update. The trigger function livewire_history() is
+// created or replaced with it. Applications only insert into history through the trigger;
+// the trigger itself closes the previous version. A table name whose `_history` would pass
+// PostgreSQL's 63 bytes is refused.
+func HistorySQL(table string) (string, error) {
+	if len(table)+len(historySuffix) > maximumIdentifierBytes {
+		return "", fmt.Errorf("postgresadapter: HistorySQL(%q): %q is longer than PostgreSQL's %d bytes", table, table+historySuffix, maximumIdentifierBytes)
+	}
+	return historyFunctionSQL + `CREATE TABLE ` + identifier(table+historySuffix) + ` (
 	id uuid NOT NULL,
 	version integer NOT NULL,
 	operation text NOT NULL CHECK (operation IN ('insert', 'update', 'delete')),
@@ -242,14 +268,28 @@ func HistorySQL(table string) string {
 );
 CREATE OR REPLACE TRIGGER livewire_history AFTER INSERT OR UPDATE OR DELETE ON ` + identifier(table) + `
 	FOR EACH ROW EXECUTE FUNCTION livewire_history();
-`
+`, nil
 }
 
-func notifyTriggersSQL(table, arguments string) string {
+const (
+	historySuffix = "_history"
+	// maximumIdentifierBytes is PostgreSQL's NAMEDATALEN - 1: a longer name is cut.
+	maximumIdentifierBytes = 63
+)
+
+// notifyTriggersSQL is the row trigger of table and the TRUNCATE trigger of table and of
+// each of its present partitions (statement triggers are not cloned to partitions);
+// argument is the partition column's literal or "".
+func notifyTriggersSQL(table, argument string) string {
+	truncateArgument := "''"
+	if argument != "" {
+		truncateArgument = "quote_literal(" + argument + ")"
+	}
 	return "CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON " + identifier(table) +
-		" FOR EACH ROW EXECUTE FUNCTION livewire_notify(" + arguments + ");\n" +
-		"CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON " + identifier(table) +
-		" FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(" + arguments + ");\n"
+		" FOR EACH ROW EXECUTE FUNCTION livewire_notify(" + argument + ");\n" +
+		"DO $livewire$ DECLARE relation regclass; BEGIN FOR relation IN SELECT " + literal(identifier(table)) + "::regclass UNION SELECT relid FROM pg_partition_tree(" + literal(identifier(table)) + ") LOOP\n" +
+		"\tEXECUTE format('CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(%s)', relation, " +
+		truncateArgument + ");\nEND LOOP; END $livewire$;\n"
 }
 
 func identifier(name string) string { return pgx.Identifier{name}.Sanitize() }

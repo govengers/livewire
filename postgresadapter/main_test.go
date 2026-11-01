@@ -118,14 +118,22 @@ func migrateTemplate() error {
 		return err
 	}
 	defer func() { _ = connection.Close(ctx) }() // as above
+	partsHistory, err := postgresadapter.HistorySQL("parts")
+	if err != nil {
+		return err
+	}
+	ordersHistory, err := postgresadapter.HistorySQL("orders")
+	if err != nil {
+		return err
+	}
 	for _, statements := range []string{
 		fixtureSQL,
 		postgresadapter.TriggerFunctionSQL,
 		postgresadapter.TriggerSQL("parts"),
 		postgresadapter.PartitionedTriggerSQL("gadgets", "tenant_id"),
-		postgresadapter.HistorySQL("parts"),
+		partsHistory,
 		postgresadapter.TriggerSQL("orders"),
-		postgresadapter.HistorySQL("orders"),
+		ordersHistory,
 		postgresadapter.FiltersSQL,
 		postgresadapter.IdempotencySQL,
 		postgresadapter.AuditSQL,
