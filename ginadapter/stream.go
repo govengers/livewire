@@ -17,15 +17,19 @@ import (
 
 // ExportRowsTrailer is the trailer of a complete export: the rows it wrote. The response
 // declares it with its headers and sets it only when the export finished: a signal on top of
-// the aborted body, for a client that reads trailers.
+// the aborted body for a client that reads trailers, and the only one behind a writer
+// wrapper without Unwrap.
 const ExportRowsTrailer = "Livewire-Export-Rows"
 
 // export streams a resource's export as CSV (D35). The headers go out with the first byte
 // the loader writes, so a refusal before it is answered as an error body; a success ends with
 // the ExportRowsTrailer. A failure after the first byte aborts the response, so the client's
-// read of the body fails, whatever middleware runs: on HTTP/1.1 the connection is closed
-// under it; on HTTP/2 a write deadline in the past resets the stream, and the handler panics
-// with http.ErrAbortHandler for the middleware that lets it through.
+// read of the body fails behind gin's own writer or any wrapper with Unwrap, gin.Recovery
+// included: on HTTP/1.1 the connection is closed under it; on HTTP/2 a write deadline in the
+// past resets the stream. The handler then panics with http.ErrAbortHandler. Behind a
+// wrapper without Unwrap (a gzip middleware that embeds gin.ResponseWriter, say) neither
+// reaches the connection, and a recovery that swallows the panic ends the body cleanly: the
+// missing trailer is then the only sign of a cut export.
 func (h *handlers) export(name string) gin.HandlerFunc {
 	recorded := unit{target: name, kind: "export"}
 	return func(ginContext *gin.Context) {
@@ -71,10 +75,10 @@ func (w *exportWriter) start() {
 	w.ginContext.Writer.WriteHeaderNow()
 }
 
-// abort ends a response whose body is broken: the connection is closed under it (HTTP/1.1),
-// else a write deadline in the past resets the stream (HTTP/2; a recovery middleware that
-// swallows http.ErrAbortHandler, as gin.Recovery does, cannot undo it) and the handler panics
-// with http.ErrAbortHandler.
+// abort ends a response whose body is broken, through the writers that Unwrap to the
+// connection: the connection is closed under it (HTTP/1.1), else a write deadline in the
+// past resets the stream (HTTP/2; a recovery middleware that swallows http.ErrAbortHandler,
+// as gin.Recovery does, cannot undo it). The handler then panics with http.ErrAbortHandler.
 func abort(ginContext *gin.Context) {
 	ginContext.Writer.Flush()
 	if unwrapper, ok := ginContext.Writer.(interface{ Unwrap() http.ResponseWriter }); ok {
@@ -102,10 +106,10 @@ const multipartOverhead = 64 << 10
 func readFile(ginContext *gin.Context, upload *livewire.Upload) (*livewire.File, error) {
 	request := ginContext.Request
 	limit := upload.MaximumBytes()
-	// The parse error is not needed: a malformed Content-Type either yields no media type and
-	// is read as a raw body, whose type the engine refuses as not declared, or a multipart
-	// type without parameters, whose missing boundary fails the first part; both are 400 at
-	// "file".
+	// The parse error is not needed: anything but multipart/form-data, malformed or not, is
+	// read raw with the header as sent, which Upload.Accepts refuses when it does not parse to
+	// a declared type; a malformed multipart type has no parameters, so its missing boundary
+	// fails the first part. Both are 400 at "file".
 	mediaType, parameters, _ := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if mediaType != "multipart/form-data" {
 		if request.ContentLength >= 0 {
