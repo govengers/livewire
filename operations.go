@@ -24,9 +24,9 @@ func (s *socket) handle(frame *RequestFrame) {
 		s.unsubscribe(frame)
 	case OperationQuery, OperationSubscribe, OperationCall, OperationBatch, OperationJoin, OperationLeave:
 		s.start(frame)
-	default:
+	default: // the one entry of an operation the socket does not know: reported as "other", a closed label
 		refusal := invalidParameter("op", "is not an operation of the socket")
-		s.observe(startUnit(OutcomeRequest, frame.Operation, frame.Target), refusal)
+		s.observe(startUnit(OutcomeRequest, Operation(unknownOperation), frame.Target), refusal)
 		s.respondError(frame.ID, refusal)
 	}
 }
