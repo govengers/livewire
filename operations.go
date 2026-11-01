@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/govengers/auth"
@@ -30,8 +31,10 @@ func (s *socket) handle(frame *RequestFrame) {
 	}
 }
 
-// start runs an op on its own goroutine within the in-flight limit. A panic of the op is
-// answered as an internal error; the socket stays open.
+// start runs an op on its own goroutine within the in-flight limit. The op's slot is free
+// before its response is queued, so a client that sends its next request on reading the
+// answer is never refused for the one it answered. A panic of the op is answered as an
+// internal error; the socket stays open.
 func (s *socket) start(frame *RequestFrame) {
 	limit := s.engine.options.InFlightPerSocket
 	s.mutex.Lock()
@@ -46,48 +49,61 @@ func (s *socket) start(frame *RequestFrame) {
 		s.respondError(frame.ID, refusal)
 		return
 	}
+	release := sync.OnceFunc(func() {
+		s.mutex.Lock()
+		s.inFlight--
+		s.mutex.Unlock()
+	})
 	s.spawn(func() {
-		defer func() {
-			s.mutex.Lock()
-			s.inFlight--
-			s.mutex.Unlock()
-		}()
+		defer release()
 		unit := startUnit(OutcomeRequest, frame.Operation, frame.Target)
-		if err := recovering(func() error { s.run(frame); return nil }); err != nil {
+		if err := recovering(func() error { s.run(frame, release); return nil }); err != nil {
 			s.observe(unit, err)
+			release()
 			s.respondError(frame.ID, err)
 		}
 	})
 }
 
-// run re-validates the identity and runs the op under it.
-func (s *socket) run(frame *RequestFrame) {
+// run re-validates the identity, runs the op under it, gives the op's in-flight slot back
+// and answers. A subscribe answers itself, together with its first push, and releases the
+// slot before it queues them.
+func (s *socket) run(frame *RequestFrame, release func()) {
 	unit := startUnit(OutcomeRequest, frame.Operation, frame.Target)
 	identity, err := s.freshIdentity(s.ctx)
 	if err != nil {
 		s.observe(unit, err)
+		release()
 		s.respondError(frame.ID, err)
 		return
 	}
 	ctx := auth.WithIdentity(s.ctx, identity)
+	status, payload := http.StatusOK, json.RawMessage(nil)
 	switch frame.Operation {
 	case OperationSubscribe:
-		s.subscribe(ctx, frame)
+		s.subscribe(ctx, frame, release)
+		return
 	case OperationQuery:
-		s.query(ctx, frame)
+		payload, err = s.query(ctx, frame)
 	case OperationCall:
-		s.call(ctx, frame)
+		status, payload, err = s.call(ctx, frame)
 	case OperationBatch:
-		s.batch(ctx, frame)
+		payload, err = s.batch(ctx, frame)
 	case OperationJoin:
-		s.join(ctx, frame)
+		err = s.join(ctx, frame)
 	case OperationLeave:
-		s.leave(ctx, frame)
+		err = s.leave(ctx, frame)
 	case OperationPing, OperationUnsubscribe:
 	}
+	release()
+	if err != nil {
+		s.respondError(frame.ID, err)
+		return
+	}
+	s.respond(frame.ID, status, payload)
 }
 
-func (s *socket) query(ctx context.Context, frame *RequestFrame) {
+func (s *socket) query(ctx context.Context, frame *RequestFrame) (json.RawMessage, error) {
 	unit := startUnit(OutcomeRequest, OperationQuery, frame.Target)
 	var resolved *resolvedRead
 	var result *readResult
@@ -98,10 +114,9 @@ func (s *socket) query(ctx context.Context, frame *RequestFrame) {
 	})
 	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
 	if err != nil {
-		s.respondError(frame.ID, err)
-		return
+		return nil, err
 	}
-	s.respond(frame.ID, http.StatusOK, result.payload)
+	return result.payload, nil
 }
 
 func (s *socket) unsubscribe(frame *RequestFrame) {
@@ -118,34 +133,23 @@ func (s *socket) unsubscribe(frame *RequestFrame) {
 	s.respond(frame.ID, http.StatusOK, nil)
 }
 
-func (s *socket) call(ctx context.Context, frame *RequestFrame) {
-	var status int
-	var payload json.RawMessage
-	err := s.engine.inSlot(ctx, func() error {
-		var err error
+func (s *socket) call(ctx context.Context, frame *RequestFrame) (status int, payload json.RawMessage, err error) {
+	err = s.engine.inSlot(ctx, func() error {
+		var callError error
 		request := CallRequest{Target: frame.Target, Source: MapSource(frame.Parameters), Body: frame.Body, IdempotencyKey: frame.IdempotencyKey}
-		status, payload, err = s.engine.call(ctx, OperationCall, request)
-		return err
+		status, payload, callError = s.engine.call(ctx, OperationCall, request)
+		return callError
 	})
-	if err != nil {
-		s.respondError(frame.ID, err)
-		return
-	}
-	s.respond(frame.ID, status, payload)
+	return status, payload, err
 }
 
-func (s *socket) batch(ctx context.Context, frame *RequestFrame) {
-	var payload json.RawMessage
-	err := s.engine.inSlot(ctx, func() error {
-		var err error
-		payload, err = s.engine.batch(ctx, OperationBatch, BatchRequest{Body: frame.Body, IdempotencyKey: frame.IdempotencyKey})
-		return err
+func (s *socket) batch(ctx context.Context, frame *RequestFrame) (payload json.RawMessage, err error) {
+	err = s.engine.inSlot(ctx, func() error {
+		var batchError error
+		payload, batchError = s.engine.batch(ctx, OperationBatch, BatchRequest{Body: frame.Body, IdempotencyKey: frame.IdempotencyKey})
+		return batchError
 	})
-	if err != nil {
-		s.respondError(frame.ID, err)
-		return
-	}
-	s.respond(frame.ID, http.StatusOK, payload)
+	return payload, err
 }
 
 // presenceRecord names the record a socket joined: the tenant, the declaration and the key.
@@ -160,7 +164,7 @@ type presenceRecord struct {
 // the tenant) and its own read runs under the caller first, so a record the caller may not
 // read cannot be joined. A socket joins at most PresencesPerSocket records; joining one
 // again updates its state.
-func (s *socket) join(ctx context.Context, frame *RequestFrame) {
+func (s *socket) join(ctx context.Context, frame *RequestFrame) error {
 	unit := startUnit(OutcomeRequest, OperationJoin, frame.Target)
 	var resolved *resolvedRead
 	s.presenceMutex.Lock() // before the slot: a join waiting for another holds none
@@ -177,11 +181,7 @@ func (s *socket) join(ctx context.Context, frame *RequestFrame) {
 		return s.joinRecord(WithTenant(ctx, resolved.tenant), record, frame.Body)
 	})
 	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
-	if err != nil {
-		s.respondError(frame.ID, err)
-		return
-	}
-	s.respond(frame.ID, http.StatusOK, nil)
+	return err
 }
 
 // joinRecord counts and stores the join; the caller holds presenceMutex, so a leave of the
@@ -237,17 +237,13 @@ func (s *socket) forgetPresence(record presenceRecord) {
 // join (the declaration, its parameters, the tenant they resolve, the key), but no check or
 // record read runs, so a caller who lost access to the record still leaves it. A record the
 // socket did not join is 404.
-func (s *socket) leave(ctx context.Context, frame *RequestFrame) {
+func (s *socket) leave(ctx context.Context, frame *RequestFrame) error {
 	unit := startUnit(OutcomeRequest, OperationLeave, frame.Target)
 	s.presenceMutex.Lock() // before the slot, like join
 	defer s.presenceMutex.Unlock()
 	resolved, err := s.leaveJoined(ctx, frame)
 	s.engine.observe(ctx, unit.readOutcome(ctx, resolved, err))
-	if err != nil {
-		s.respondError(frame.ID, err)
-		return
-	}
-	s.respond(frame.ID, http.StatusOK, nil)
+	return err
 }
 
 // leaveJoined answers 404 before anything is decoded or resolved when the socket joined no

@@ -659,12 +659,17 @@ type outcomes struct {
 	received []livewire.Outcome
 	// panics makes the Observer panic after it recorded the outcome.
 	panics atomic.Bool
+	// holdSubscribe, when set, holds every OutcomeSubscribe until it is closed.
+	holdSubscribe atomic.Pointer[chan struct{}]
 }
 
 func (o *outcomes) observe(_ context.Context, outcome livewire.Outcome) {
 	o.mutex.Lock()
 	o.received = append(o.received, outcome)
 	o.mutex.Unlock()
+	if hold := o.holdSubscribe.Load(); hold != nil && outcome.Kind == livewire.OutcomeSubscribe {
+		<-*hold
+	}
 	if o.panics.Load() {
 		panic("the observer panicked")
 	}

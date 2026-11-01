@@ -78,26 +78,29 @@ type view struct {
 var errTenantChanged = &auth.Error{Kind: auth.ErrForbidden, Reason: "the tenant of the subscription changed"}
 
 // subscribe opens a subscription: the response and the first push are queued together, so
-// the wire order is response, first push, then every later change.
-func (s *socket) subscribe(ctx context.Context, frame *RequestFrame) {
+// the wire order is response, first push, then every later change. The op's in-flight slot
+// is released before either is queued.
+func (s *socket) subscribe(ctx context.Context, frame *RequestFrame, release func()) {
 	unit := startUnit(OutcomeSubscribe, OperationSubscribe, frame.Target)
-	opening := &installation{socket: s, frameID: frame.ID, request: readRequestOf(frame)}
+	opening := &installation{socket: s, frameID: frame.ID, request: readRequestOf(frame), release: release}
 	err := s.engine.inSlot(ctx, func() error { return opening.install(ctx) })
 	if opening.subscription != nil {
 		unit.subscription = opening.subscription.id
 	}
 	s.engine.observe(ctx, unit.readOutcome(ctx, opening.resolved, err))
 	if err != nil {
+		release()
 		s.respondError(frame.ID, err)
 	}
 }
 
 // installation carries a subscribe from its frame to the published subscription; resolved
-// and subscription are set as far as it got.
+// and subscription are set as far as it got, release frees the op's in-flight slot.
 type installation struct {
 	socket       *socket
 	frameID      string
 	request      ReadRequest
+	release      func()
 	resolved     *resolvedRead
 	subscription *subscription
 }
@@ -169,6 +172,7 @@ func (i *installation) firstFrames(ctx context.Context) ([][]byte, error) {
 // frames never cross), then starts the re-runs.
 func (i *installation) publish(frames [][]byte) error {
 	liveSubscription := i.subscription
+	i.release()
 	liveSubscription.mutex.Lock()
 	if liveSubscription.ended {
 		liveSubscription.mutex.Unlock()
