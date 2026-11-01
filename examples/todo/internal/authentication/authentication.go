@@ -1,7 +1,9 @@
 // Package authentication wires govengers/auth for the example: password login with sessions
 // for the browser, API keys for the CLI and the Go client (D20), the Guard in front of the API,
-// and the IdentitySource the engine re-validates every socket with (D6). Both ways carry the
-// user's workspace in the identity, which the registry resolves as the tenant (D42).
+// and the IdentitySource the engine re-validates every socket with (D6). Either way the user's
+// workspace, the registry's tenant (D42), is read from the user's current membership on every
+// request and every socket re-validation: a moved member acts in the new workspace at once, a
+// removed one is refused (AUTH-007).
 //
 // Users live in password.MemoryStorage and sessions in session.MemoryBackend to keep the
 // example small: a service stores its users with a password.Storage on its own users table
@@ -25,6 +27,10 @@ import (
 	"github.com/govengers/livewire/examples/todo/internal/service"
 )
 
+// apiKeyProvider is the provider of an API key's identity, which carries its membership
+// already: the key's lookup joins it.
+const apiKeyProvider = "apikey"
+
 // Authentication authenticates the API's requests and sockets.
 type Authentication struct {
 	provider *password.Provider
@@ -44,7 +50,8 @@ type Options struct {
 	Observer       auth.Observer
 }
 
-// New wires the password provider, the session Guard and the API keys.
+// New wires the password provider, the session Guard and the API keys; it fails without the
+// storage, the AccountService or a valid key.
 func New(options *Options) (*Authentication, error) {
 	if options == nil || options.Storage == nil || options.AccountService == nil {
 		return nil, errors.New("authentication: Options.Storage and AccountService are required")
@@ -58,9 +65,7 @@ func New(options *Options) (*Authentication, error) {
 	if err != nil {
 		return nil, err
 	}
-	if authentication.provider, err = password.New(&password.Options{
-		Sessions: store, Storage: options.Storage, OnLogin: authentication.joinWorkspace, Observer: options.Observer,
-	}); err != nil {
+	if authentication.provider, err = password.New(&password.Options{Sessions: store, Storage: options.Storage, Observer: options.Observer}); err != nil {
 		return nil, err
 	}
 	if authentication.guard, err = session.NewGuard(&session.GuardOptions{
@@ -77,23 +82,41 @@ func New(options *Options) (*Authentication, error) {
 // Routes are the password provider's routes: login, logout and the second factor.
 func (a *Authentication) Routes() []auth.Route { return a.provider.Routes() }
 
-// Middleware authenticates an API request by its API key or else by its session, and refuses
-// it with 401 JSON without either.
+// Middleware authenticates an API request by its API key or else by its session and puts the
+// user's current workspace into its identity; it refuses a request without either with 401
+// and one whose user is in no workspace with 403, as JSON.
 func (a *Authentication) Middleware(next http.Handler) http.Handler {
-	return a.keys.Middleware()(a.guard.RequireAPI()(next))
+	member := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		identity, err := a.member(request.Context(), auth.IdentityFrom(request.Context()))
+		if err != nil {
+			auth.WriteError(writer, err)
+			return
+		}
+		next.ServeHTTP(writer, request.WithContext(auth.WithIdentity(request.Context(), identity)))
+	})
+	return a.keys.Middleware()(a.guard.RequireAPI()(member))
 }
 
 // Identify re-validates a socket by its upgrade request (livewire.IdentitySource): the API key
-// it carried, or else its session. A revoked key or an ended session is gone (4401).
+// it carried, or else its session, with the user's current workspace. A revoked key, an ended
+// session and a user in no workspace are gone (4401); a moved member is another identity, whose
+// subscriptions end with the old tenant (D7, D42).
 func (a *Authentication) Identify(ctx context.Context, request *http.Request) (*auth.Identity, error) {
 	if key := presentedKey(request); key != "" {
 		return a.resolveKey(ctx, key)
 	}
-	return a.guard.Identify(ctx, request)
+	identity, err := a.guard.Identify(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return a.member(ctx, identity)
 }
 
-// joinWorkspace is the login hook: the identity carries the user's workspace.
-func (a *Authentication) joinWorkspace(ctx context.Context, identity *auth.Identity) (*auth.Identity, error) {
+// member is the identity with the user's current workspace; an API key's carries it already.
+func (a *Authentication) member(ctx context.Context, identity *auth.Identity) (*auth.Identity, error) {
+	if identity.Provider == apiKeyProvider {
+		return identity, nil
+	}
 	workspace, err := a.accounts.Workspace(ctx, identity.UserID)
 	if errors.Is(err, model.ErrNoMember) {
 		return nil, auth.ErrForbidden
@@ -104,7 +127,7 @@ func (a *Authentication) joinWorkspace(ctx context.Context, identity *auth.Ident
 	return actor.WithWorkspace(identity, workspace), nil
 }
 
-// resolveKey is the identity of an API key: its user in the user's workspace.
+// resolveKey is the identity of an API key: its user in the user's current workspace.
 func (a *Authentication) resolveKey(ctx context.Context, key string) (*auth.Identity, error) {
 	member, err := a.accounts.MemberOfAPIKey(ctx, key)
 	if errors.Is(err, model.ErrNotFound) {
@@ -113,7 +136,7 @@ func (a *Authentication) resolveKey(ctx context.Context, key string) (*auth.Iden
 	if err != nil {
 		return nil, err
 	}
-	identity := &auth.Identity{Provider: "apikey", Subject: member.UserID.String(), UserID: member.UserID, Username: member.Username, Active: true}
+	identity := &auth.Identity{Provider: apiKeyProvider, Subject: member.UserID.String(), UserID: member.UserID, Username: member.Username, Active: true}
 	return actor.WithWorkspace(identity, member.Workspace), nil
 }
 
@@ -132,6 +155,9 @@ func presentedKey(request *http.Request) string {
 // usersNamespace makes the id of a seeded user stable across restarts.
 var usersNamespace = uuid.MustParse("6f1d7b3e-4f3a-4c4e-9a51-1d3f3c2b7a10")
 
+// SeededUserID is the id SeedUser gives the user of that name.
+func SeededUserID(username string) uuid.UUID { return uuid.NewSHA1(usersNamespace, []byte(username)) }
+
 // Seed is a user SeedUser creates: the name, the password and the workspace.
 type Seed struct {
 	Username  string
@@ -139,21 +165,22 @@ type Seed struct {
 	Workspace string
 }
 
-// SeedUser creates a user with a password in a workspace unless the user exists (INT-007).
-func SeedUser(ctx context.Context, storage password.Storage, accounts *service.AccountService, seed Seed) error {
-	id := uuid.NewSHA1(usersNamespace, []byte(seed.Username))
-	if err := accounts.Join(ctx, id, seed.Workspace); err != nil {
-		return err
+// SeedUser creates a user that is missing, and its membership when it has none, so a restart
+// never moves a member back (INT-007). It answers the user's id.
+func SeedUser(ctx context.Context, storage password.Storage, accounts *service.AccountService, seed Seed) (uuid.UUID, error) {
+	id := SeededUserID(seed.Username)
+	if err := accounts.JoinUnlessMember(ctx, id, seed.Workspace); err != nil {
+		return uuid.Nil, err
 	}
 	if _, err := storage.GetUserByID(ctx, id); err == nil {
-		return nil
+		return id, nil
 	}
 	if err := (password.Policy{}).Validate(seed.Password); err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	hash, err := password.Hash(seed.Password, password.DefaultParameters())
 	if err != nil {
-		return err
+		return uuid.Nil, err
 	}
-	return storage.CreateUser(ctx, &password.User{ID: id, Username: &seed.Username, PasswordHash: hash})
+	return id, storage.CreateUser(ctx, &password.User{ID: id, Username: &seed.Username, PasswordHash: hash})
 }

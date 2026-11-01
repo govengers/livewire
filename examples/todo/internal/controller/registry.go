@@ -42,12 +42,20 @@ func NewRegistry(options *RegistryOptions) (*livewire.Registry, error) {
 	if options == nil || options.TodoService == nil || options.AccountService == nil {
 		return nil, errors.New("controller: RegistryOptions.TodoService and AccountService are required")
 	}
-	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: options.Observer})
+	return newRegistry(&todoController{todos: options.TodoService}, &accountController{accounts: options.AccountService}, options.Observer)
+}
+
+// Contract is the API's registry without services, for the generator (cmd/generate): it
+// describes every declaration, and none of its handlers or loaders may run.
+func Contract() (*livewire.Registry, error) {
+	return newRegistry(&todoController{}, &accountController{}, nil)
+}
+
+func newRegistry(todos *todoController, accounts *accountController, observer livewire.Observer) (*livewire.Registry, error) {
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: observer})
 	if err != nil {
 		return nil, err
 	}
-	todos := &todoController{todos: options.TodoService}
-	accounts := &accountController{accounts: options.AccountService}
 	return registry, registry.Add(
 		todos.resource(),
 		livewire.NewList("activity", "/activity", &livewire.ListOptions[api.ActivityItem, api.ActivityParameters]{

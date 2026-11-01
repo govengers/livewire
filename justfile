@@ -19,7 +19,7 @@ lint:
     cd examples/todo && go vet ./... && golangci-lint run ./...
 
 # Unit tests with the race detector; fails below the coverage threshold (examples, the e2e suite and the generator's fixture with its generated clients excluded); then the example's tests
-test: && test-example
+test: && test-example db-check-example
     mkdir -p sandbox
     {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.raw.cover ./...
     grep -v -E '{{excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
@@ -39,6 +39,13 @@ test-typescript:
 test-e2e:
     mkdir -p sandbox
     {{require_typescript}} {{gotestsum}} --format testname --jsonfile sandbox/e2e.json -- -tags e2e -count=1 ./test/e2e/...
+
+# The example's SQL check chain (DAT-016): squawk on the migrations, sqlc generate without a diff, the build, and sqlc vet on a fresh database the app's own migrator migrated
+db-check-example:
+    cd examples/todo && bunx squawk-cli@2.66.0 --pg-version 18 --assume-in-transaction internal/database/migrations/*.sql
+    cd examples/todo && {{sqlc}} generate && git diff --exit-code -- internal/repository/internal/sqlc
+    cd examples/todo && go build ./...
+    cd examples/todo && LIVEWIRE_SQLC_VET=1 go test -count=1 -run TestTheQueriesPassSqlcVet ./cmd/todo/
 
 # Regenerate the example's sqlc queries and its clients (TypeScript, OpenAPI, Go client, CLI)
 generate-example:

@@ -10,7 +10,7 @@ import (
 )
 
 // TestTheFrontendTypeChecks compiles web/src (the generated client and live.ts, which uses it)
-// with tsc under the generator's strict settings, on the TypeScript and Vue of the generator's
+// with tsc under the generator's strict settings and runs live.test.ts under bun, on the TypeScript and Vue of the generator's
 // runtime harness (generate/runtime, installed from its lockfile). Without bun it skips, unless
 // LIVEWIRE_REQUIRE_TYPESCRIPT=1 (set in CI, which has bun) makes it fail.
 func TestTheFrontendTypeChecks(t *testing.T) {
@@ -31,6 +31,7 @@ func TestTheFrontendTypeChecks(t *testing.T) {
 	require.NoError(t, os.CopyFS(directory, os.DirFS(web)))
 	require.NoError(t, os.Symlink(filepath.Join(harness, "node_modules"), filepath.Join(directory, "node_modules")))
 	runBun(t, directory, bun, filepath.Join(harness, "node_modules", "typescript", "bin", "tsc"), "-p", directory)
+	runBun(t, directory, bun, "test") // live.test.ts: the session transitions (D66)
 }
 
 func runBun(t *testing.T, directory, bun string, arguments ...string) {

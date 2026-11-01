@@ -2,6 +2,13 @@
 INSERT INTO memberships (user_id, workspace) VALUES (@user_id, @workspace)
 ON CONFLICT (user_id) DO UPDATE SET workspace = EXCLUDED.workspace;
 
+-- name: InsertMembershipUnlessPresent :exec
+INSERT INTO memberships (user_id, workspace) VALUES (@user_id, @workspace)
+ON CONFLICT (user_id) DO NOTHING;
+
+-- name: DeleteMembership :execrows
+DELETE FROM memberships WHERE user_id = @user_id;
+
 -- name: MembershipWorkspace :one
 SELECT workspace FROM memberships WHERE user_id = @user_id;
 

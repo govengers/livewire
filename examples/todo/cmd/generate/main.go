@@ -14,7 +14,6 @@ import (
 
 	"github.com/govengers/livewire/examples/todo/internal/controller"
 	"github.com/govengers/livewire/examples/todo/internal/generated"
-	"github.com/govengers/livewire/examples/todo/internal/service"
 )
 
 func main() {
@@ -25,8 +24,7 @@ func main() {
 }
 
 func run() error {
-	// The generator reads the declarations only, so the services stay unwired: no handler runs.
-	registry, err := controller.NewRegistry(&controller.RegistryOptions{TodoService: &service.TodoService{}, AccountService: &service.AccountService{}})
+	registry, err := controller.Contract()
 	if err != nil {
 		return err
 	}

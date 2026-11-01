@@ -26,12 +26,12 @@ type AccountService struct {
 	accounts *repository.AccountRepository
 }
 
-// AccountServiceOptions configures an AccountService.
+// AccountServiceOptions are the dependencies of an AccountService.
 type AccountServiceOptions struct {
 	AccountRepository *repository.AccountRepository // required
 }
 
-// NewAccountService returns an AccountService.
+// NewAccountService fails without the AccountRepository.
 func NewAccountService(options *AccountServiceOptions) (*AccountService, error) {
 	if options == nil || options.AccountRepository == nil {
 		return nil, errors.New("service: AccountServiceOptions.AccountRepository is required")
@@ -42,6 +42,17 @@ func NewAccountService(options *AccountServiceOptions) (*AccountService, error) 
 // Join puts a user into a workspace.
 func (s *AccountService) Join(ctx context.Context, userID uuid.UUID, workspace string) error {
 	return s.accounts.Join(ctx, userID, workspace)
+}
+
+// JoinUnlessMember puts a user into a workspace unless it is a member of one already.
+func (s *AccountService) JoinUnlessMember(ctx context.Context, userID uuid.UUID, workspace string) error {
+	return s.accounts.JoinUnlessMember(ctx, userID, workspace)
+}
+
+// Leave removes a user from its workspace; its sessions are refused from the next request on
+// and its API keys are gone.
+func (s *AccountService) Leave(ctx context.Context, userID uuid.UUID) error {
+	return s.accounts.Leave(ctx, userID)
 }
 
 // Workspace is the user's workspace, or model.ErrNoMember.

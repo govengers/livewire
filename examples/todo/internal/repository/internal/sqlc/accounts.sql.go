@@ -31,6 +31,18 @@ func (q *Queries) APIKeyByHash(ctx context.Context, keyHash []byte) (APIKeyByHas
 	return i, err
 }
 
+const deleteMembership = `-- name: DeleteMembership :execrows
+DELETE FROM memberships WHERE user_id = $1
+`
+
+func (q *Queries) DeleteMembership(ctx context.Context, userID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteMembership, userID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const insertAPIKey = `-- name: InsertAPIKey :one
 INSERT INTO api_keys (key_hash, user_id, username) VALUES ($1, $2, $3)
 RETURNING id, created_at
@@ -52,6 +64,21 @@ func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) (Ins
 	var i InsertAPIKeyRow
 	err := row.Scan(&i.ID, &i.CreatedAt)
 	return i, err
+}
+
+const insertMembershipUnlessPresent = `-- name: InsertMembershipUnlessPresent :exec
+INSERT INTO memberships (user_id, workspace) VALUES ($1, $2)
+ON CONFLICT (user_id) DO NOTHING
+`
+
+type InsertMembershipUnlessPresentParams struct {
+	UserID    uuid.UUID
+	Workspace string
+}
+
+func (q *Queries) InsertMembershipUnlessPresent(ctx context.Context, arg InsertMembershipUnlessPresentParams) error {
+	_, err := q.db.Exec(ctx, insertMembershipUnlessPresent, arg.UserID, arg.Workspace)
+	return err
 }
 
 const membershipWorkspace = `-- name: MembershipWorkspace :one

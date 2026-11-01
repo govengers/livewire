@@ -1,5 +1,6 @@
 -- +goose Up
-SET lock_timeout = '5s';
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
 
 -- memberships puts every user in one workspace, the tenant of the API (D42).
 CREATE TABLE memberships (
@@ -11,7 +12,7 @@ CREATE TABLE memberships (
 CREATE TABLE api_keys (
     id         uuid PRIMARY KEY DEFAULT uuidv7(),
     key_hash   bytea NOT NULL UNIQUE,
-    user_id    uuid NOT NULL REFERENCES memberships (user_id),
+    user_id    uuid NOT NULL REFERENCES memberships (user_id) ON DELETE CASCADE, -- a removed member's keys go with it
     username   text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -26,6 +27,8 @@ CREATE TABLE todos (
     created_by uuid NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
+    -- version counts one todo's edits, far below 2^31
+    -- squawk-ignore prefer-bigint-over-int
     version    integer NOT NULL DEFAULT 1 CHECK (version > 0)
 );
 CREATE INDEX todos_workspace_created_at ON todos (workspace, created_at DESC, id);
@@ -52,10 +55,3 @@ CREATE TABLE activity (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX activity_workspace_created_at ON activity (workspace, created_at DESC, id);
-
--- +goose Down
-DROP TABLE activity;
-DROP TABLE attachments;
-DROP TABLE todos;
-DROP TABLE api_keys;
-DROP TABLE memberships;

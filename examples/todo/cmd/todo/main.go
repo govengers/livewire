@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,7 +42,7 @@ import (
 )
 
 const (
-	shutdownTimeout    = 20 * time.Second
+	shutdownBudget     = 20 * time.Second // the API's drain, within a 30 s termination grace period
 	maximumConnections = 20
 )
 
@@ -165,7 +166,7 @@ func openDatabase(ctx context.Context, values *configuration) (*pgxpool.Pool, fu
 // seedDemo creates the demo users unless they exist (AUTH-008, INT-007).
 func seedDemo(ctx context.Context, application *application, demoPassword string) error {
 	for _, user := range []struct{ name, workspace string }{{"alice", "north"}, {"carol", "north"}, {"bob", "south"}} {
-		if err := authentication.SeedUser(ctx, application.users, application.accounts, authentication.Seed{Username: user.name, Password: demoPassword, Workspace: user.workspace}); err != nil {
+		if _, err := authentication.SeedUser(ctx, application.users, application.accounts, authentication.Seed{Username: user.name, Password: demoPassword, Workspace: user.workspace}); err != nil {
 			return fmt.Errorf("seed %s: %w", user.name, err)
 		}
 	}
@@ -173,7 +174,8 @@ func seedDemo(ctx context.Context, application *application, demoPassword string
 }
 
 // serve runs the engine, the job worker, the API and the metrics listener until ctx ends,
-// then drains the API and ends the sockets with 1001 (LAY-003).
+// then drains (LAY-003): the API within shutdownBudget, the worker within its DrainTimeout,
+// side by side, so both fit a 30 s termination grace period.
 func serve(ctx context.Context, application *application, values *configuration) error {
 	apiServer := newServer(values.address, application.router)
 	metricsServer := newServer(values.metricsAddress, promhttp.HandlerFor(application.metrics, promhttp.HandlerOpts{}))
@@ -181,13 +183,49 @@ func serve(ctx context.Context, application *application, values *configuration)
 	group.Go(recovering(func() error { return application.engine.Run(groupContext) }))
 	group.Go(recovering(func() error { return application.worker.Run(groupContext) }))
 	group.Go(recovering(func() error {
-		err := listen(groupContext, apiServer)
-		closing, cancel := context.WithTimeout(context.WithoutCancel(groupContext), shutdownTimeout)
-		defer cancel()
-		return errors.Join(err, application.engine.Close(closing))
+		if err := listen(groupContext, apiServer); err != nil {
+			return err
+		}
+		return drain(context.WithoutCancel(groupContext), shutdownBudget, application.ready, apiServer, application.engine)
 	}))
-	group.Go(recovering(func() error { return listen(groupContext, metricsServer) }))
+	group.Go(recovering(func() error {
+		if err := listen(groupContext, metricsServer); err != nil {
+			return err
+		}
+		return drain(context.WithoutCancel(groupContext), shutdownBudget, nil, metricsServer, nil)
+	}))
 	return group.Wait()
+}
+
+// httpServer is what drain stops: an *http.Server.
+type httpServer interface {
+	Shutdown(ctx context.Context) error
+	Close() error
+}
+
+// socketCloser is what drain ends the sockets with: the engine.
+type socketCloser interface {
+	Close(ctx context.Context) error
+}
+
+// drain stops serving in order, within one budget: readiness fails first, so the load
+// balancer sends no new requests; the server stops accepting and waits for its requests,
+// and closes the connections still open when the budget is spent; then the sockets end with
+// 1001. A nil ready or sockets skips its step.
+func drain(ctx context.Context, budget time.Duration, ready *atomic.Bool, server httpServer, sockets socketCloser) error {
+	if ready != nil {
+		ready.Store(false)
+	}
+	bounded, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	err := server.Shutdown(bounded)
+	if err != nil {
+		err = errors.Join(err, server.Close())
+	}
+	if sockets != nil {
+		err = errors.Join(err, sockets.Close(bounded))
+	}
+	return err
 }
 
 // newServer bounds what one client can hold (LAY-006); the socket is hijacked and keeps no
@@ -199,7 +237,7 @@ func newServer(address string, handler http.Handler) *http.Server {
 	}
 }
 
-// listen serves until ctx ends, then waits for running requests.
+// listen serves until ctx ends, or answers why the server failed.
 func listen(ctx context.Context, server *http.Server) error {
 	failed := make(chan error, 1)
 	go func() { failed <- recovering(server.ListenAndServe)() }()
@@ -207,10 +245,8 @@ func listen(ctx context.Context, server *http.Server) error {
 	case err := <-failed:
 		return err
 	case <-ctx.Done():
+		return nil
 	}
-	shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
-	defer cancel()
-	return server.Shutdown(shutdown)
 }
 
 // recovering turns a panic in work into an error for its errgroup (CON-001).

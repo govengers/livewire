@@ -9,6 +9,7 @@ import (
 	"io"
 
 	"github.com/google/uuid"
+	wideevent "github.com/govengers/wide-event-logger"
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/query"
@@ -24,12 +25,12 @@ type TodoService struct {
 	todos *repository.TodoRepository
 }
 
-// TodoServiceOptions configures a TodoService.
+// TodoServiceOptions are the dependencies of a TodoService.
 type TodoServiceOptions struct {
 	TodoRepository *repository.TodoRepository // required
 }
 
-// NewTodoService returns a TodoService.
+// NewTodoService fails without the TodoRepository.
 func NewTodoService(options *TodoServiceOptions) (*TodoService, error) {
 	if options == nil || options.TodoRepository == nil {
 		return nil, errors.New("service: TodoServiceOptions.TodoRepository is required")
@@ -50,22 +51,22 @@ func (s *TodoService) List(ctx context.Context, listQuery *query.ListQuery) (*li
 	return s.todos.List(ctx, listQuery)
 }
 
-// Get reads the todo the query names.
+// Get answers the todo the query names; the engine scoped the query to the workspace.
 func (s *TodoService) Get(ctx context.Context, listQuery *query.ListQuery) (*model.Todo, error) {
 	return s.todos.Get(ctx, listQuery)
 }
 
-// Distinct counts a field's values.
+// Distinct counts a field's values under the scoped query.
 func (s *TodoService) Distinct(ctx context.Context, field string, listQuery *query.ListQuery) ([]livewire.DistinctValue, error) {
 	return s.todos.Distinct(ctx, field, listQuery)
 }
 
-// History reads a todo's versions.
+// History answers the versions of a todo the engine let the caller read first (D56).
 func (s *TodoService) History(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[model.Todo]], error) {
 	return s.todos.History(ctx, listQuery)
 }
 
-// Export writes the todos as CSV.
+// Export writes the scoped todos as CSV; a formula is quoted (D69).
 func (s *TodoService) Export(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error) {
 	return s.todos.Export(ctx, listQuery, columns, writer)
 }
@@ -103,6 +104,7 @@ func (s *TodoService) Create(ctx context.Context, todo model.NewTodo) (*model.To
 	if todo.Priority == "" {
 		todo.Priority = model.PriorityNormal
 	}
+	wideevent.FromContext(ctx).UUID("todo.id", todo.ID)
 	return s.todos.Create(ctx, member, todo)
 }
 
@@ -113,6 +115,7 @@ func (s *TodoService) Update(ctx context.Context, id uuid.UUID, change model.Tod
 	if err != nil {
 		return nil, err
 	}
+	wideevent.FromContext(ctx).UUID("todo.id", id)
 	current, err := s.todos.Lock(ctx, member.Workspace, id)
 	if err != nil {
 		return nil, err
@@ -132,6 +135,7 @@ func (s *TodoService) Update(ctx context.Context, id uuid.UUID, change model.Tod
 		if err := s.todos.Enqueue(ctx, completed); err != nil {
 			return nil, err
 		}
+		wideevent.FromContext(ctx).Bool("todo.completed", true)
 	}
 	return saved, nil
 }
@@ -142,6 +146,7 @@ func (s *TodoService) Delete(ctx context.Context, id uuid.UUID) error {
 	if err != nil {
 		return err
 	}
+	wideevent.FromContext(ctx).UUID("todo.id", id)
 	return s.todos.Delete(ctx, member.Workspace, id)
 }
 
@@ -151,12 +156,14 @@ func (s *TodoService) Attach(ctx context.Context, attachment model.Attachment, c
 	if err != nil {
 		return nil, err
 	}
+	wideevent.FromContext(ctx).UUID("todo.id", attachment.TodoID).Int("attachment.size", len(content))
 	return s.todos.Attach(ctx, member.Workspace, attachment, content)
 }
 
 // RecordCompletion writes the activity line of a completed todo; the job's id keys it, so a
 // retried job writes it once (JOB-003).
 func (s *TodoService) RecordCompletion(ctx context.Context, jobID uuid.UUID, completed model.TodoCompletedPayload) error {
+	wideevent.FromContext(ctx).UUID("job.id", jobID).UUID("todo.id", completed.TodoID)
 	return s.todos.RecordActivity(ctx, completed.Workspace, model.Activity{
 		ID: jobID, TodoID: completed.TodoID, Message: fmt.Sprintf("%s completed %q", completed.Username, completed.Title),
 	})

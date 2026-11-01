@@ -14,7 +14,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,7 @@ import (
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/govengers/auth/password"
 	wideevent "github.com/govengers/wide-event-logger"
 	"github.com/jackc/pgx/v5"
@@ -30,11 +33,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
+	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/client"
 
 	"github.com/govengers/livewire/examples/todo/client/todoclient"
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
 	"github.com/govengers/livewire/examples/todo/internal/database"
+	"github.com/govengers/livewire/examples/todo/internal/server"
 )
 
 // The tests run the application as main wires it (newApplication) on an embedded PostgreSQL
@@ -72,10 +77,11 @@ func runTests(m *testing.M) int {
 	defer func() { _ = os.RemoveAll(runtimePath) }() // a temporary directory; a leftover is harmless
 	server := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
 		Port(uint32(postgres.port)). //nolint:gosec // G115: a TCP port fits a uint32
+		Version(embeddedpostgres.V18).
 		RuntimePath(runtimePath).
-		// ponytail: the binaries are extracted once per machine (xz under -race takes a minute); a run
-		// killed mid-extraction leaves a broken directory, which deleting it repairs.
-		BinariesPath(filepath.Join(os.TempDir(), "livewire-todo-postgres-binaries")).
+		// ponytail: the binaries are extracted once per machine and version (xz under -race takes a
+		// minute); a run killed mid-extraction leaves a broken directory, which deleting it repairs.
+		BinariesPath(binariesPath()).
 		Logger(io.Discard))
 	if err := server.Start(); err != nil {
 		return failed("start embedded postgres", err)
@@ -92,6 +98,20 @@ func runTests(m *testing.M) int {
 		}
 	}
 	return code
+}
+
+// binariesPath is where the PostgreSQL binaries are extracted: per embedded-postgres module
+// version and PostgreSQL version, so an upgrade of either extracts afresh.
+func binariesPath() string {
+	module := "unknown"
+	if build, ok := debug.ReadBuildInfo(); ok {
+		for _, dependency := range build.Deps {
+			if dependency.Path == "github.com/fergusstrange/embedded-postgres" {
+				module = dependency.Version
+			}
+		}
+	}
+	return filepath.Join(os.TempDir(), "livewire-todo-postgres-"+module+"-"+string(embeddedpostgres.V18))
 }
 
 func failed(what string, err error) int {
@@ -155,19 +175,22 @@ type testApplication struct {
 	*application
 	server *httptest.Server
 	pool   *pgxpool.Pool
+	events *recordedEvents
 }
 
 func newTestApplication(t *testing.T) *testApplication {
 	t.Helper()
 	pool := newPool(t)
 	users := password.NewMemoryStorage()
+	events := &recordedEvents{}
 	application, err := newApplication(&applicationOptions{
-		Pool: pool, Emitter: wideevent.EmitterFunc(func(*wideevent.Event) {}), Metrics: prometheus.NewRegistry(), Users: users,
+		Pool: pool, Emitter: events, Metrics: prometheus.NewRegistry(), Users: users,
 		SessionKey: sessionKey(t), InsecureCookie: true,
 	})
 	require.NoError(t, err)
 	for _, user := range []struct{ name, workspace string }{{"alice", "north"}, {"carol", "north"}, {"bob", "south"}} {
-		require.NoError(t, authentication.SeedUser(t.Context(), users, application.accounts, authentication.Seed{Username: user.name, Password: testPassword, Workspace: user.workspace}))
+		_, err := authentication.SeedUser(t.Context(), users, application.accounts, authentication.Seed{Username: user.name, Password: testPassword, Workspace: user.workspace})
+		require.NoError(t, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	running := make(chan error, 1)
@@ -181,7 +204,7 @@ func newTestApplication(t *testing.T) *testApplication {
 		cancel()
 		require.NoError(t, <-running)
 	})
-	return &testApplication{application: application, server: server, pool: pool}
+	return &testApplication{application: application, server: server, pool: pool, events: events}
 }
 
 // sessionKey is a random session encryption key.
@@ -255,6 +278,74 @@ func (a *testApplication) session(t *testing.T, username string) func(request *h
 	return func(request *http.Request) {
 		for _, cookie := range cookies {
 			request.AddCookie(cookie)
+		}
+	}
+}
+
+// recordedEvents keeps every wide event the application emitted.
+type recordedEvents struct {
+	mutex  sync.Mutex
+	events []map[string]any
+}
+
+func (r *recordedEvents) Emit(we *wideevent.Event) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.events = append(r.events, we.FieldsMap())
+}
+
+// named are the fields of the events of a name.
+func (r *recordedEvents) named(name string) []map[string]any {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	var named []map[string]any
+	for _, fields := range r.events {
+		if fields["name"] == name {
+			named = append(named, fields)
+		}
+	}
+	return named
+}
+
+// rawSocket is a socket of the application for the ops the Go client has none for (join) and
+// for a session cookie, which the Go client does not send.
+type rawSocket struct {
+	connection *websocket.Conn
+	sequence   int
+}
+
+// dial opens the socket with the request's authentication.
+func (a *testApplication) dial(t *testing.T, authenticate func(request *http.Request)) *rawSocket {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, a.server.URL, nil)
+	require.NoError(t, err)
+	authenticate(request)
+	request.Header.Set("Origin", a.server.URL)
+	connection, response, err := websocket.DefaultDialer.DialContext(t.Context(), "ws"+strings.TrimPrefix(a.server.URL, "http")+server.SocketPath, request.Header)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	t.Cleanup(func() { _ = connection.Close() }) // closed already when the server closed it
+	return &rawSocket{connection: connection}
+}
+
+// request sends a frame and answers its response, skipping pushes; it fails the test on a
+// closed socket, unless closed is set, which then receives the close code.
+func (s *rawSocket) request(t *testing.T, frame livewire.RequestFrame) (livewire.ResponseFrame, int) {
+	t.Helper()
+	s.sequence++
+	frame.ID = strconv.Itoa(s.sequence)
+	require.NoError(t, s.connection.SetWriteDeadline(time.Now().Add(5*time.Second)))
+	require.NoError(t, s.connection.WriteJSON(frame))
+	require.NoError(t, s.connection.SetReadDeadline(time.Now().Add(10*time.Second)))
+	for {
+		var response livewire.ResponseFrame
+		if err := s.connection.ReadJSON(&response); err != nil {
+			var closed *websocket.CloseError
+			require.ErrorAs(t, err, &closed)
+			return livewire.ResponseFrame{}, closed.Code
+		}
+		if response.ID == frame.ID {
+			return response, 0
 		}
 	}
 }

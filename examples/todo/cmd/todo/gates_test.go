@@ -14,6 +14,7 @@ import (
 
 	"github.com/govengers/livewire/examples/todo/client/todoclient"
 	"github.com/govengers/livewire/examples/todo/internal/api"
+	"github.com/govengers/livewire/examples/todo/internal/controller"
 	"github.com/govengers/livewire/examples/todo/internal/generated"
 	"github.com/govengers/livewire/examples/todo/internal/server"
 )
@@ -23,7 +24,10 @@ import (
 func TestGeneratedClientsAreCurrent(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)
-	livewiretest.GeneratedIsCurrent(t, application.registry, generated.Options("../.."))
+	livewiretest.GeneratedIsCurrentStrict(t, application.registry, generated.Options("../.."))
+	contract, err := controller.Contract()
+	require.NoError(t, err)
+	livewiretest.GeneratedIsCurrentStrict(t, contract, generated.Options("../..")) // what cmd/generate writes from
 }
 
 // fixtureTodo creates a todo through the API and answers it.
@@ -46,6 +50,32 @@ func reads(todo *api.TodoItem) []livewiretest.Read {
 	}
 }
 
+// seedParity gives every read alice runs something to answer: todos of both priorities, a
+// completed one with its activity line and version history, an attachment, and alice's
+// presence on the fixture todo and the summary; it answers the fixture todo.
+func seedParity(t *testing.T, application *testApplication) *api.TodoItem {
+	t.Helper()
+	alice := application.client(t, "alice")
+	todo := fixtureTodo(t, alice, "parity")
+	_, err := alice.CreateTodo(t.Context(), api.CreateTodoRequest{Title: "urgent", Priority: api.PriorityHigh}, nil)
+	require.NoError(t, err)
+	_, err = alice.UpdateTodo(t.Context(), todoclient.UpdateTodoParameters{ID: todo.ID}, api.UpdateTodoRequest{Done: new(true)}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, jobstest.Drain(t, application.worker))
+	_, err = alice.UploadAttachment(t.Context(), todoclient.UploadAttachmentParameters{ID: todo.ID}, textFile("notes"), nil)
+	require.NoError(t, err)
+	socket := application.dial(t, bearer(application.apiKey(t, "alice")))
+	for target, key := range map[string]string{"todos": todo.ID.String(), "summary": "board"} {
+		joined, _ := socket.request(t, livewire.RequestFrame{
+			Operation: livewire.OperationJoin, Target: target, Parameters: map[string]string{livewire.ParameterPresenceKey: key}, Body: []byte(`{"editing":true}`),
+		})
+		require.True(t, joined.OK, "%+v", joined.Error)
+	}
+	todo, err = alice.GetTodosItem(t.Context(), todoclient.TodosItemParameters{ID: todo.ID})
+	require.NoError(t, err)
+	return todo
+}
+
 func (a *testApplication) gateApplication() livewiretest.Application {
 	return livewiretest.Application{Engine: a.engine, Handler: a.router, SocketPath: server.SocketPath}
 }
@@ -53,7 +83,7 @@ func (a *testApplication) gateApplication() livewiretest.Application {
 func TestRESTAndSocketAnswerTheSameBytes(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)
-	todo := fixtureTodo(t, application.client(t, "alice"), "parity")
+	todo := seedParity(t, application)
 	livewiretest.Parity(t, &livewiretest.ParityOptions{
 		Application:  application.gateApplication(),
 		Authenticate: application.session(t, "alice"), // the browser's way; the gates below use an API key

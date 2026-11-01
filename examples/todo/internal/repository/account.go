@@ -19,12 +19,12 @@ type AccountRepository struct {
 	pool *pgxpool.Pool
 }
 
-// AccountRepositoryOptions configures an AccountRepository.
+// AccountRepositoryOptions are the dependencies of an AccountRepository.
 type AccountRepositoryOptions struct {
 	Pool *pgxpool.Pool // required
 }
 
-// NewAccountRepository returns an AccountRepository.
+// NewAccountRepository fails without the pool.
 func NewAccountRepository(options *AccountRepositoryOptions) (*AccountRepository, error) {
 	if options == nil || options.Pool == nil {
 		return nil, errors.New("repository: AccountRepositoryOptions.Pool is required")
@@ -45,6 +45,29 @@ func (r *AccountRepository) Join(ctx context.Context, userID uuid.UUID, workspac
 		return fmt.Errorf("put user %s into a workspace: %w", userID, err)
 	}
 	return nil
+}
+
+// JoinUnlessMember puts the user into the workspace unless it is a member already.
+func (r *AccountRepository) JoinUnlessMember(ctx context.Context, userID uuid.UUID, workspace string) error {
+	err := sqlc.New(r.database(ctx)).InsertMembershipUnlessPresent(ctx, sqlc.InsertMembershipUnlessPresentParams{UserID: userID, Workspace: workspace})
+	if err != nil {
+		return fmt.Errorf("put user %s into a workspace: %w", userID, err)
+	}
+	return nil
+}
+
+// Leave removes the user's membership and with it the user's API keys, or answers
+// model.ErrNoMember.
+func (r *AccountRepository) Leave(ctx context.Context, userID uuid.UUID) error {
+	removed, err := sqlc.New(r.database(ctx)).DeleteMembership(ctx, userID)
+	switch {
+	case err != nil:
+		return fmt.Errorf("remove user %s from its workspace: %w", userID, err)
+	case removed == 0:
+		return model.ErrNoMember
+	default:
+		return nil
+	}
 }
 
 // Workspace is the user's workspace, or model.ErrNoMember.

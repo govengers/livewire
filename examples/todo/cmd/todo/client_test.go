@@ -131,10 +131,10 @@ func TestTheGoClientSubscriptionSeesAnotherClientsWrite(t *testing.T) {
 
 	created, err := carol.CreateTodo(t.Context(), api.CreateTodoRequest{Title: "from carol"}, nil)
 	require.NoError(t, err)
-	diff := nextPush(t, pushes)
-	require.Equal(t, livewire.PushListChange, diff.Kind)
-	require.Len(t, diff.Data.Items, 1)
-	require.Equal(t, created.ID, diff.Data.Items[0].ID, "the same workspace, another user, over the change feed")
+	change := nextPush(t, pushes)
+	require.Equal(t, livewire.PushListChange, change.Kind)
+	require.Len(t, change.Data.Items, 1)
+	require.Equal(t, created.ID, change.Data.Items[0].ID, "the same workspace, another user, over the change feed")
 	cancel()
 	for range pushes { // the channel closes with the subscription
 	}

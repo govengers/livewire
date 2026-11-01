@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 
 	authginadapter "github.com/govengers/auth/ginadapter"
 	"github.com/govengers/auth/password"
 	"github.com/govengers/jobs"
+	jobsauth "github.com/govengers/jobs/authadapter"
 	jobspostgres "github.com/govengers/jobs/postgresadapter"
 	jobsprometheus "github.com/govengers/jobs/prometheusadapter"
 	"github.com/govengers/jobs/wideeventadapter"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
 	"github.com/govengers/livewire/examples/todo/internal/controller"
+	"github.com/govengers/livewire/examples/todo/internal/database"
 	"github.com/govengers/livewire/examples/todo/internal/model"
 	"github.com/govengers/livewire/examples/todo/internal/repository"
 	"github.com/govengers/livewire/examples/todo/internal/server"
@@ -50,7 +53,11 @@ type application struct {
 	users    password.Storage
 	accounts *service.AccountService
 	jobStore *jobspostgres.Store
+	ready    *atomic.Bool // the readiness, true until the drain starts
 }
+
+// errDraining is the readiness of a server that drains: it takes no new requests.
+var errDraining = errors.New("the server is draining")
 
 // stores are livewire's Postgres adapters (D3).
 type stores struct {
@@ -65,7 +72,7 @@ type stores struct {
 // newApplication wires repositories, stores, services, the registry and the engine, the job
 // worker and the router, in this order (LAY-002).
 func newApplication(options *applicationOptions) (*application, error) {
-	jobStore, err := jobspostgres.New(&jobspostgres.Options{Pool: options.Pool})
+	jobStore, err := jobspostgres.New(&jobspostgres.Options{Pool: options.Pool, Propagators: []jobs.Propagator{jobsauth.Identity()}})
 	if err != nil {
 		return nil, err
 	}
@@ -104,31 +111,44 @@ func newApplication(options *applicationOptions) (*application, error) {
 	if err != nil {
 		return nil, err
 	}
-	router, err := server.NewRouter(&server.Options{Engine: engine, Authentication: identities, Emitter: options.Emitter, Ready: options.Pool.Ping})
+	if err := database.RegisterPoolMetrics(options.Metrics, options.Pool); err != nil {
+		return nil, err
+	}
+	ready := &atomic.Bool{}
+	ready.Store(true)
+	router, err := server.NewRouter(&server.Options{
+		Engine: engine, Authentication: identities, Emitter: options.Emitter, Metrics: options.Metrics,
+		Ready: func(ctx context.Context) error {
+			if !ready.Load() {
+				return errDraining
+			}
+			return options.Pool.Ping(ctx)
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &application{
 		registry: engine.Registry(), engine: engine, worker: worker, router: router,
-		metrics: options.Metrics, users: options.Users, accounts: accountService, jobStore: jobStore,
+		metrics: options.Metrics, users: options.Users, accounts: accountService, jobStore: jobStore, ready: ready,
 	}, nil
 }
 
 func newStores(pool *pgxpool.Pool) (*stores, error) {
 	var created stores
-	var errs [6]error
-	created.transactor, errs[0] = postgresadapter.NewTransactor(&postgresadapter.TransactorOptions{Pool: pool})
-	created.filters, errs[1] = postgresadapter.NewFilterStore(&postgresadapter.FilterStoreOptions{Pool: pool})
-	created.idempotency, errs[2] = postgresadapter.NewIdempotencyStore(&postgresadapter.IdempotencyStoreOptions{Pool: pool})
-	created.audit, errs[3] = postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: pool})
-	created.presences, errs[4] = postgresadapter.NewPresenceStore(&postgresadapter.PresenceStoreOptions{Pool: pool})
-	created.listener, errs[5] = postgresadapter.NewListener(&postgresadapter.ListenerOptions{
+	var failures [6]error
+	created.transactor, failures[0] = postgresadapter.NewTransactor(&postgresadapter.TransactorOptions{Pool: pool})
+	created.filters, failures[1] = postgresadapter.NewFilterStore(&postgresadapter.FilterStoreOptions{Pool: pool})
+	created.idempotency, failures[2] = postgresadapter.NewIdempotencyStore(&postgresadapter.IdempotencyStoreOptions{Pool: pool})
+	created.audit, failures[3] = postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: pool})
+	created.presences, failures[4] = postgresadapter.NewPresenceStore(&postgresadapter.PresenceStoreOptions{Pool: pool})
+	created.listener, failures[5] = postgresadapter.NewListener(&postgresadapter.ListenerOptions{
 		// the change feed's dedicated connection, configured like the pool's
 		Connect: func(ctx context.Context) (*pgx.Conn, error) {
 			return pgx.ConnectConfig(ctx, pool.Config().ConnConfig.Copy())
 		},
 	})
-	return &created, errors.Join(errs[:]...)
+	return &created, errors.Join(failures[:]...)
 }
 
 // newEngine builds the registry with its Observer (Prometheus and wide events) and the
@@ -164,11 +184,13 @@ func newWorker(options *applicationOptions, jobStore *jobspostgres.Store, livewi
 		return nil, err
 	}
 	worker, err := jobs.NewWorker(&jobs.WorkerOptions{
-		Store:      jobStore,
-		Queues:     map[string]jobs.QueueOptions{model.QueueTodos: {Concurrency: 4}, model.QueueMaintenance: {Concurrency: 1}},
-		Middleware: []jobs.Middleware{wideEvents},
-		Observer:   jobMetrics,
-		Schedules:  controller.Schedules(),
+		Store:        jobStore,
+		Propagators:  []jobs.Propagator{jobsauth.Identity()}, // a job a user started runs as that user (JOB-011)
+		DrainTimeout: shutdownBudget,
+		Queues:       map[string]jobs.QueueOptions{model.QueueTodos: {Concurrency: 4}, model.QueueMaintenance: {Concurrency: 1}},
+		Middleware:   []jobs.Middleware{wideEvents},
+		Observer:     jobMetrics,
+		Schedules:    controller.Schedules(),
 	})
 	if err != nil {
 		return nil, err

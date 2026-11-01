@@ -30,7 +30,7 @@ type JobController struct {
 	audit       *postgresadapter.AuditStore
 }
 
-// JobControllerOptions configures a JobController; every field is required.
+// JobControllerOptions are the dependencies of a JobController; every field is required.
 type JobControllerOptions struct {
 	TodoService      *service.TodoService
 	FilterStore      *postgresadapter.FilterStore
@@ -38,7 +38,7 @@ type JobControllerOptions struct {
 	AuditStore       *postgresadapter.AuditStore
 }
 
-// NewJobController returns a JobController.
+// NewJobController fails without one of its dependencies.
 func NewJobController(options *JobControllerOptions) (*JobController, error) {
 	if options == nil || options.TodoService == nil || options.FilterStore == nil || options.IdempotencyStore == nil || options.AuditStore == nil {
 		return nil, errors.New("controller: JobControllerOptions needs the TodoService and the three stores")

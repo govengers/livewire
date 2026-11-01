@@ -65,13 +65,13 @@ type TodoRepository struct {
 	jobStore *jobspostgres.Store
 }
 
-// TodoRepositoryOptions configures a TodoRepository.
+// TodoRepositoryOptions are the dependencies of a TodoRepository.
 type TodoRepositoryOptions struct {
 	Pool     *pgxpool.Pool       // required
 	JobStore *jobspostgres.Store // required; enqueues on the engine's transaction (D41)
 }
 
-// NewTodoRepository returns a TodoRepository.
+// NewTodoRepository fails without the pool or the job store.
 func NewTodoRepository(options *TodoRepositoryOptions) (*TodoRepository, error) {
 	if options == nil || options.Pool == nil || options.JobStore == nil {
 		return nil, errors.New("repository: TodoRepositoryOptions.Pool and JobStore are required")
