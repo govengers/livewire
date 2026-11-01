@@ -118,7 +118,9 @@ CREATE INDEX livewire_idempotency_created_at ON livewire_idempotency (created_at
 // retention and deletes the default partition's rows older than that. When it creates or
 // drops a partition it holds livewire_audit in ACCESS EXCLUSIVE mode until it ends, so audit
 // writes and reads wait meanwhile; its lock_timeout of 5 s bounds how long it waits for that
-// lock, not how long it holds it. The session's TimeZone changes nothing.
+// lock, not how long it holds it. Call it at READ COMMITTED, as AuditStore.Maintain does:
+// under REPEATABLE READ its snapshot predates its lock, so it misses rows committed while it
+// waited. The session's TimeZone changes nothing.
 const AuditSQL = `CREATE TABLE livewire_audit (
 	id uuid NOT NULL DEFAULT uuidv7(),
 	at timestamptz NOT NULL DEFAULT now(),
@@ -279,17 +281,22 @@ const (
 
 // notifyTriggersSQL is the row trigger of table and the TRUNCATE trigger of table and of
 // each of its present partitions (statement triggers are not cloned to partitions);
-// argument is the partition column's literal or "".
+// argument is the partition column's literal or "". The DO block's dollar quote is one
+// neither name contains, so no name ends it early.
 func notifyTriggersSQL(table, argument string) string {
 	truncateArgument := "''"
 	if argument != "" {
 		truncateArgument = "quote_literal(" + argument + ")"
 	}
+	quote := "$livewire$"
+	for strings.Contains(table+argument, quote) {
+		quote = quote[:len(quote)-1] + "_$"
+	}
 	return "CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON " + identifier(table) +
 		" FOR EACH ROW EXECUTE FUNCTION livewire_notify(" + argument + ");\n" +
-		"DO $livewire$ DECLARE relation regclass; BEGIN FOR relation IN SELECT " + literal(identifier(table)) + "::regclass UNION SELECT relid FROM pg_partition_tree(" + literal(identifier(table)) + ") LOOP\n" +
+		"DO " + quote + " DECLARE relation regclass; BEGIN FOR relation IN SELECT " + literal(identifier(table)) + "::regclass UNION SELECT relid FROM pg_partition_tree(" + literal(identifier(table)) + ") LOOP\n" +
 		"\tEXECUTE format('CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(%s)', relation, " +
-		truncateArgument + ");\nEND LOOP; END $livewire$;\n"
+		truncateArgument + ");\nEND LOOP; END " + quote + ";\n"
 }
 
 func identifier(name string) string { return pgx.Identifier{name}.Sanitize() }

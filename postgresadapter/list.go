@@ -286,7 +286,8 @@ func hydrateInOrder[Item any](ctx context.Context, database DBTX, rows []PageRow
 }
 
 // jsonValue is a driver value as the JSON body writes it: a uuid hyphenated, an infinite
-// timestamp and a non-finite float as PostgreSQL spells them (JSON has no NaN or Infinity).
+// timestamp and a non-finite float as PostgreSQL spells them (JSON has no NaN or Infinity),
+// the same spellings a cursor carries (query.Cursor.Encode).
 func jsonValue(value any) any {
 	switch typed := value.(type) {
 	case [16]byte:
@@ -294,26 +295,15 @@ func jsonValue(value any) any {
 	case pgtype.InfinityModifier:
 		return typed.String()
 	case float32:
-		return nonFinite(float64(typed), value)
+		if number := float64(typed); math.IsNaN(number) || math.IsInf(number, 0) {
+			return query.NonFiniteSpelling(number)
+		}
 	case float64:
-		return nonFinite(typed, value)
-	default:
-		return value
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return query.NonFiniteSpelling(typed)
+		}
 	}
-}
-
-// nonFinite is the PostgreSQL spelling of a NaN or infinite number, value otherwise.
-func nonFinite(number float64, value any) any {
-	switch {
-	case math.IsNaN(number):
-		return "NaN"
-	case math.IsInf(number, 1):
-		return "Infinity"
-	case math.IsInf(number, -1):
-		return "-Infinity"
-	default:
-		return value
-	}
+	return value
 }
 
 // exportProjection is the page specification of an export, one derived column per written

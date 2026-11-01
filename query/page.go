@@ -104,7 +104,7 @@ func wireValue(value any) any {
 		return wireValue(float64(typed))
 	case float64:
 		if math.IsNaN(typed) || math.IsInf(typed, 0) {
-			return nonFiniteSpelling(typed)
+			return NonFiniteSpelling(typed)
 		}
 		return typed
 	default:
@@ -112,8 +112,9 @@ func wireValue(value any) any {
 	}
 }
 
-// nonFiniteSpelling is PostgreSQL's input form of a non-finite float8.
-func nonFiniteSpelling(value float64) string {
+// NonFiniteSpelling is PostgreSQL's spelling of a non-finite float8 (NaN, Infinity,
+// -Infinity), the form a cursor carries it in; postgresadapter writes the same in JSON bodies.
+func NonFiniteSpelling(value float64) string {
 	switch {
 	case math.IsNaN(value):
 		return "NaN"

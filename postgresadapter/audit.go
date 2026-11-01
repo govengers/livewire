@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/govengers/auth"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/govengers/livewire"
@@ -97,7 +98,13 @@ func (s *AuditStore) Write(ctx context.Context, entry *AuditEntry) error {
 // application runs it periodically, at least monthly; without it every row stays in the
 // default partition.
 func (s *AuditStore) Maintain(ctx context.Context) error {
-	if _, err := s.options.Pool.Exec(ctx, "SELECT livewire_audit_maintain(make_interval(secs => $1))", s.options.Retention.Seconds()); err != nil {
+	// READ COMMITTED whatever the default: the function's statements must see the rows
+	// committed while it waited for its lock.
+	err := pgx.BeginTxFunc(ctx, s.options.Pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadWrite}, func(transaction pgx.Tx) error {
+		_, err := transaction.Exec(ctx, "SELECT livewire_audit_maintain(make_interval(secs => $1))", s.options.Retention.Seconds())
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("postgresadapter: maintain the audit partitions: %w", err)
 	}
 	return nil
