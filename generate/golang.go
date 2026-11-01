@@ -1,6 +1,8 @@
 package generate
 
 import (
+	"encoding"
+	"encoding/json"
 	"fmt"
 	"go/token"
 	"path/filepath"
@@ -374,6 +376,9 @@ func (g *goClient) read(source *goSource, read *readModel) error {
 	if err != nil {
 		return fmt.Errorf("%w (the read %s)", err, read.targetName())
 	}
+	if err := refuseUndecodable(read.item); err != nil {
+		return fmt.Errorf("%w (the read %s)", err, read.targetName())
+	}
 	data, pointer, err := dataType(source.file, read)
 	if err != nil {
 		return fmt.Errorf("%w (the read %s)", err, read.targetName())
@@ -408,6 +413,9 @@ func (g *goClient) mutation(source *goSource, mutation *mutationModel) error {
 	}
 	resultType, zero, answer, decode, responseType := "error", "", "", "nil", ""
 	if mutation.responseType != nil {
+		if err := refuseUndecodable(mutation.responseType); err != nil {
+			return fmt.Errorf("%w (the mutation %s)", err, mutation.name)
+		}
 		if responseType, err = file.expression(mutation.responseType); err != nil {
 			return fmt.Errorf("%w (the mutation %s)", err, mutation.name)
 		}
@@ -476,7 +484,7 @@ func (g *goClient) batchCall(source *goSource, mutation *mutationModel, present 
 // to one, reached without an embedded pointer.
 func (g *goClient) clientID(source *goSource, mutation *mutationModel, bodyType string) error {
 	name := pascalCase(mutation.name)
-	field, err := clientIDField(mutation.requestType)
+	field, selector, err := clientIDField(mutation.requestType)
 	if err != nil {
 		return fmt.Errorf("%w (the mutation %s)", err, mutation.name)
 	}
@@ -495,7 +503,6 @@ func (g *goClient) clientID(source *goSource, mutation *mutationModel, bodyType 
 		}
 		value = expression + "(" + generator + ".String())"
 	}
-	selector := "body." + field.StructField.Name
 	var fill string
 	switch {
 	case pointer:
@@ -511,8 +518,10 @@ func (g *goClient) clientID(source *goSource, mutation *mutationModel, bodyType 
 	return nil
 }
 
-// clientIDField finds the field of a create's body that carries its JSON "id".
-func clientIDField(requestType reflect.Type) (jsonfield.Field, error) {
+// clientIDField finds the field of a create's body that carries its JSON "id" and the
+// selector that reaches it through every embedded struct on its way, so a Go field name two
+// embedded structs share stays unambiguous.
+func clientIDField(requestType reflect.Type) (jsonfield.Field, string, error) {
 	if requestType.Kind() == reflect.Struct {
 		for _, field := range jsonfield.Of(requestType) {
 			if field.Name != "id" {
@@ -523,12 +532,87 @@ func clientIDField(requestType reflect.Type) (jsonfield.Field, error) {
 				fieldType = fieldType.Elem()
 			}
 			fits := fieldType == uuidType || (fieldType.Kind() == reflect.String && !marshalsItselfAnyway(fieldType))
-			if fits && !reachedThroughPointer(requestType, field.StructField.Index) {
-				return field, nil
+			selector, reachable := fieldSelector(requestType, field.StructField.Index)
+			if fits && reachable && !reachedThroughPointer(requestType, field.StructField.Index) {
+				return field, selector, nil
 			}
 		}
 	}
-	return jsonfield.Field{}, fmt.Errorf("generate: the Go client fills in a client id (D18) only in a struct body whose JSON field id is a uuid.UUID or a string kind (or a pointer to one), not through an embedded pointer; %s has none", requestType)
+	return jsonfield.Field{}, "", fmt.Errorf("generate: the Go client fills in a client id (D18) only in a struct body whose JSON field id is a uuid.UUID or a string kind (or a pointer to one), reached through exported fields and no embedded pointer; %s has none", requestType)
+}
+
+// fieldSelector is the selector "body.Outer.Inner.ID" of a field by its index path, and
+// whether another package can write it: every field on the path is exported.
+func fieldSelector(structType reflect.Type, index []int) (string, bool) {
+	selector, current := "body", structType
+	for _, position := range index {
+		field := current.Field(position)
+		if !field.IsExported() || !token.IsIdentifier(field.Name) {
+			return "", false
+		}
+		selector += "." + field.Name
+		current = field.Type
+	}
+	return selector, true
+}
+
+var (
+	jsonUnmarshalerType = reflect.TypeFor[json.Unmarshaler]()
+	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+)
+
+// refuseUndecodable refuses a type the Go client cannot decode what the server wrote into:
+// one that marshals itself (MarshalJSON, MarshalText) without the matching unmarshaler on its
+// pointer, a map key that is text without UnmarshalText, an interface with methods, at any
+// depth of its JSON fields, elements and values.
+func refuseUndecodable(goType reflect.Type) error {
+	return undecodable(goType, goType.String(), map[reflect.Type]bool{})
+}
+
+func undecodable(goType reflect.Type, path string, visited map[reflect.Type]bool) error {
+	if visited[goType] {
+		return nil
+	}
+	visited[goType] = true
+	if goType.Kind() == reflect.Pointer {
+		return undecodable(goType.Elem(), path, visited) // encoding/json allocates and decodes the value
+	}
+	pointer := reflect.PointerTo(goType)
+	switch {
+	case implements(goType, jsonMarshalerType, false):
+		if !pointer.Implements(jsonUnmarshalerType) {
+			return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalJSON but no UnmarshalJSON", path)
+		}
+		return nil
+	case implements(goType, textMarshalerType, false):
+		if !pointer.Implements(jsonUnmarshalerType) && !pointer.Implements(textUnmarshalerType) {
+			return fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalText but no UnmarshalText", path)
+		}
+		return nil
+	}
+	switch goType.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		return undecodable(goType.Elem(), path+"[]", visited)
+	case reflect.Map:
+		key := goType.Key()
+		textKey := key.Kind() != reflect.String && implements(key, textMarshalerType, false)
+		if textKey && !reflect.PointerTo(key).Implements(textUnmarshalerType) {
+			return fmt.Errorf("generate: the Go client cannot decode the keys of %s: %s has MarshalText but no UnmarshalText", path, key)
+		}
+		return undecodable(goType.Elem(), path+"[]", visited)
+	case reflect.Interface:
+		if goType.NumMethod() > 0 {
+			return fmt.Errorf("generate: the Go client cannot decode %s: an interface with methods", path)
+		}
+	case reflect.Struct:
+		for _, field := range jsonfield.Of(goType) {
+			if err := undecodable(field.StructField.Type, path+"."+field.StructField.Name, visited); err != nil {
+				return err
+			}
+		}
+	default:
+	}
+	return nil
 }
 
 func (g *goClient) upload(source *goSource, upload *uploadModel) error {
@@ -538,6 +622,9 @@ func (g *goClient) upload(source *goSource, upload *uploadModel) error {
 		return err
 	}
 	file := source.file
+	if err := refuseUndecodable(upload.responseType); err != nil {
+		return fmt.Errorf("%w (the upload %s)", err, upload.name)
+	}
 	expression, err := file.expression(upload.responseType)
 	if err != nil {
 		return fmt.Errorf("%w (the upload %s)", err, upload.name)

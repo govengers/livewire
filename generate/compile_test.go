@@ -53,6 +53,12 @@ func TestGeneratedGoCompilesInAnApplicationModule(t *testing.T) {
 		Enums:       []generate.Enum{generate.EnumOf(fixture.KindBolt, fixture.KindNut)},
 		Presence:    true,
 	}))
+	// A create whose JSON id lives in one of two embedded structs that both have a Go field ID:
+	// the fill-in must name the full path, or the client does not build.
+	require.NoError(t, generate.Write(createRegistry[fixture.CreateEmbedded](t), &generate.Options{
+		GoClient: generate.GoClientOptions{Directory: filepath.Join(directory, "embeddedclient"), ImportPath: compiledModule + "/embeddedclient"},
+	}))
+	require.Contains(t, readGenerated(t, directory, "embeddedclient/client.go"), "if body.Primary.ID == uuid.Nil {")
 	module := "module " + compiledModule + "\n\ngo 1.26.0\n\nrequire github.com/govengers/livewire v0.0.0\n\nreplace github.com/govengers/livewire => " + root + "\n"
 	writeFile(t, filepath.Join(directory, "go.mod"), []byte(module))
 	writeFile(t, filepath.Join(directory, "go.sum"), readFile(t, filepath.Join(root, "go.sum")))

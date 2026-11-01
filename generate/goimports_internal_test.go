@@ -44,9 +44,11 @@ func TestGoImportAliasesNeverCollide(t *testing.T) {
 	require.Equal(t, "yaml", file.use("gopkg.in/yaml.v3", ""))
 	require.Equal(t, "dto9lives", file.use("example.com/9-lives", ""))
 	require.Equal(t, "type2", file.use("example.com/type", "type"), "a keyword is no alias")
+	require.Equal(t, "error2", file.use("example.com/error", "error"), "a predeclared identifier is no alias")
 	require.Equal(t, "fixture2", file.use("github.com/govengers/livewire/generate/internal/fixture", "fixture"), "a path keeps its alias")
 	require.Equal(t, "import (\n"+
 		"\tdto9lives \"example.com/9-lives\"\n"+
+		"\terror2 \"example.com/error\"\n"+
 		"\tfixture3 \"example.com/other/fixture\"\n"+
 		"\ttype2 \"example.com/type\"\n"+
 		"\tfixture2 \"github.com/govengers/livewire/generate/internal/fixture\"\n"+

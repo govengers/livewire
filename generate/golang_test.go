@@ -113,6 +113,8 @@ func TestGoClientRefusesWhatItCannotImport(t *testing.T) {
 		{"the generated package itself", objectRegistry[fixture.Note](t), "github.com/govengers/livewire/generate/internal/fixture", "declared in the generated package"},
 		{"a generic argument of a test package", objectRegistry[fixture.Page[TestItem]](t), "", "a main or test package"},
 		{"a client id it cannot fill", createRegistry[fixture.Note](t), "", "fills in a client id"},
+		{"a type that marshals itself as text only", objectRegistry[fixture.TextOnly](t), "", "fixture.TextOnly: it has MarshalText but no UnmarshalText"},
+		{"a field that does", objectRegistry[fixture.HoldsTextOnly](t), "", "fixture.HoldsTextOnly.Inner[]: it has MarshalText but no UnmarshalText"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {

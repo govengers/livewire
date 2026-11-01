@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/format"
 	"go/token"
+	"go/types"
 	"reflect"
 	"slices"
 	"strconv"
@@ -24,12 +25,13 @@ type goFile struct {
 	taken      map[string]bool
 }
 
-// goLocalNames are the identifiers the generated function bodies use; no import takes them.
+// goLocalNames are the identifiers the generated function bodies use; no import takes them,
+// nor a predeclared identifier (error, string, any, ...), which an alias would shadow.
 var goLocalNames = []string{"c", "ctx", "parameters", "wire", "data", "err", "body", "options", "file", "writer", "response", "encoded", "id", "values", "value"}
 
 func newGoFile(importPath string, identifiers []string) *goFile {
 	file := &goFile{importPath: importPath, aliases: map[string]string{}, explicit: map[string]bool{}, taken: map[string]bool{}}
-	for _, name := range slices.Concat(goLocalNames, identifiers) {
+	for _, name := range slices.Concat(goLocalNames, types.Universe.Names(), identifiers) {
 		file.taken[name] = true
 	}
 	return file

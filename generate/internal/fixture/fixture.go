@@ -55,6 +55,39 @@ type Raw struct{}
 // MarshalJSON writes an empty object.
 func (Raw) MarshalJSON() ([]byte, error) { return []byte("{}"), nil }
 
+// UnmarshalJSON reads what MarshalJSON wrote: a type that marshals itself must unmarshal
+// itself, or the Go client refuses it (D67).
+func (*Raw) UnmarshalJSON([]byte) error { return nil }
+
+// TextOnly marshals itself as text but cannot read it back: the Go client refuses it.
+type TextOnly struct{ value string }
+
+// MarshalText writes the value.
+func (t TextOnly) MarshalText() ([]byte, error) { return []byte(t.value), nil }
+
+// HoldsTextOnly reaches TextOnly through a field.
+type HoldsTextOnly struct {
+	Inner []TextOnly `json:"inner"`
+}
+
+// Primary and Secondary both have the Go field ID; only Primary's is the JSON id.
+type (
+	Primary struct {
+		ID uuid.UUID `json:"id"`
+	}
+	Secondary struct {
+		ID uuid.UUID `json:"otherId"`
+	}
+)
+
+// CreateEmbedded is a create body whose JSON id lives in an embedded struct, beside another
+// embedded field ID: the client fills body.Primary.ID.
+type CreateEmbedded struct {
+	Primary
+	Secondary
+	Name string `json:"name"`
+}
+
 // Code marshals itself as text.
 type Code struct{ value string }
 
