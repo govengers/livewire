@@ -221,7 +221,7 @@ func TestListedFiltersAreAuthorizedAgain(t *testing.T) {
 func TestUnknownOperationsReportOther(t *testing.T) {
 	bed := newTestbed(t, nil)
 	socket := bed.dial("ada")
-	for _, operation := range []livewire.Operation{"bogus0", "bogus1", livewire.OperationPing} {
+	for _, operation := range []livewire.Operation{"bogus0", "", livewire.OperationPing} {
 		socket.response(socket.sendFrame(livewire.RequestFrame{Operation: operation}))
 	}
 	var operations []livewire.Operation
@@ -229,4 +229,19 @@ func TestUnknownOperationsReportOther(t *testing.T) {
 		operations = append(operations, outcome.Operation)
 	}
 	require.Equal(t, []livewire.Operation{"other", "other", livewire.OperationPing}, operations)
+}
+
+func TestStoredFiltersKeepTheirCanonicalTarget(t *testing.T) {
+	bed := newTestbed(t, nil)
+	ctx := auth.WithIdentity(t.Context(), person("ada", roleReader))
+	payload, err := bed.engine.SaveFilter(ctx, []byte(`{"resource":"gadgets.","name":"Dotted","filter":{"where":{"field":"name","op":"eq","value":"x"}}}`))
+	require.NoError(t, err)
+	var saved livewire.FilterItem
+	require.NoError(t, json.Unmarshal(payload, &saved))
+	require.Equal(t, "gadgets", saved.Resource, "stored under the name its reads look it up by")
+	_, err = bed.engine.Read(ctx, livewire.ReadRequest{Target: "gadgets", Source: livewire.MapSource{"filterId": saved.ID}})
+	require.NoError(t, err, "the saved filter serves its filterId")
+	listed, err := bed.engine.ListFilters(ctx, "gadgets.")
+	require.NoError(t, err)
+	require.Contains(t, string(listed), saved.ID)
 }

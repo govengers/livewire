@@ -113,6 +113,19 @@ type stubItem struct {
 
 func stubEngine(t *testing.T) (*Engine, *socket) {
 	t.Helper()
+	return stubEngineWith(t, stubIdentities{})
+}
+
+// failingIdentities fails every re-validation without the identity being gone: the source is
+// down.
+type failingIdentities struct{}
+
+func (failingIdentities) Identify(context.Context, *http.Request) (*auth.Identity, error) {
+	return nil, errors.New("the identity source is down")
+}
+
+func stubEngineWith(t *testing.T, identities IdentitySource) (*Engine, *socket) {
+	t.Helper()
 	registry, err := NewRegistry(nil)
 	require.NoError(t, err)
 	require.NoError(t, registry.Add(NewList("failing", "/failing", &ListOptions[stubItem, NoParameters]{
@@ -134,7 +147,7 @@ func stubEngine(t *testing.T) (*Engine, *socket) {
 			return &stubItem{ID: "board"}, nil
 		},
 	})))
-	engine, err := NewEngine(&EngineOptions{Registry: registry, IdentitySource: stubIdentities{}, Transactor: stubTransactor{}, PresenceStore: stubPresences{}, SameHostOnly: true})
+	engine, err := NewEngine(&EngineOptions{Registry: registry, IdentitySource: identities, Transactor: stubTransactor{}, PresenceStore: stubPresences{}, SameHostOnly: true})
 	require.NoError(t, err)
 	identity := &auth.Identity{Provider: "test", Subject: "ada", Active: true}
 	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/live", nil)
@@ -282,15 +295,25 @@ func TestEveryOpFreesItsSlotBeforeItsResponseIsQueued(t *testing.T) {
 		{ID: "call", Operation: OperationCall, Target: "touch"},
 		{ID: "batch", Operation: OperationBatch, Body: json.RawMessage(`[{"target":"touch"}]`)},
 		{ID: "refused", Operation: OperationQuery, Target: "nothing"},
+		{ID: "refused subscribe", Operation: OperationSubscribe, Target: "nothing"},
 		{ID: "subscribe", Operation: OperationSubscribe, Target: "board"},
 	}
+	requireSlotsFreeAtResponse(t, clientSocket, frames) // one at a time; the subscribe, whose pushes follow, last
+	_, failing := stubEngineWith(t, failingIdentities{})
+	requireSlotsFreeAtResponse(t, failing, []*RequestFrame{{ID: "failed re-validation", Operation: OperationQuery, Target: "board"}})
+}
+
+// requireSlotsFreeAtResponse starts the frames one at a time and reads the in-flight count
+// when each one's response is queued.
+func requireSlotsFreeAtResponse(t *testing.T, clientSocket *socket, frames []*RequestFrame) {
+	t.Helper()
 	inFlight := make(chan int, 16)
 	clientSocket.outbox.enqueued = func() {
 		clientSocket.mutex.Lock()
 		defer clientSocket.mutex.Unlock()
 		inFlight <- clientSocket.inFlight
 	}
-	for _, frame := range frames { // one at a time; the subscribe, whose pushes follow, last
+	for _, frame := range frames {
 		clientSocket.start(frame)
 		select {
 		case count := <-inFlight:
