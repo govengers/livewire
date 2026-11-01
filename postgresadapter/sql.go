@@ -19,34 +19,46 @@ const Channel = "livewire"
 // PartitionedTriggerSQL and PresenceSQL. It sends one notification per row change on
 // Channel: `{"table", "op", "id", "partition"}` with the operation in lower case (insert,
 // update, delete), the row's id column as text ("" without one) and the partition column's
-// value ("" without one). An update that moves a row to another partition notifies both.
+// value ("" without one). An update that moves a row to another partition notifies both. The
+// table is the root of a natively partitioned table (PARTITION BY), never the partition the
+// row lives in. A TRUNCATE notifies one delete without id and partition, which reaches every
+// subscription of the table. An id or partition value longer than 500 bytes is sent as "",
+// so the payload stays below pg_notify's 8000 bytes: such a change reaches every
+// subscription of the table, never fewer than it should.
 const TriggerFunctionSQL = `CREATE OR REPLACE FUNCTION livewire_notify() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
 	old_row jsonb := CASE WHEN TG_OP IN ('UPDATE', 'DELETE') THEN to_jsonb(OLD) END;
 	new_row jsonb := CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN to_jsonb(NEW) END;
 	partition_column text := CASE WHEN TG_NARGS > 0 THEN TG_ARGV[0] END;
+	table_name text := (SELECT relname FROM pg_class WHERE oid = coalesce(pg_partition_root(TG_RELID), TG_RELID));
+	operation text := CASE WHEN TG_OP = 'TRUNCATE' THEN 'delete' ELSE lower(TG_OP) END;
+	row_id text := coalesce(coalesce(new_row, old_row)->>'id', '');
+	old_id text := coalesce(old_row->>'id', '');
+	row_partition text := coalesce(coalesce(new_row, old_row)->>partition_column, '');
+	old_partition text := coalesce(old_row->>partition_column, '');
 BEGIN
-	PERFORM pg_notify('` + Channel + `', json_build_object(
-		'table', TG_TABLE_NAME, 'op', lower(TG_OP), 'id', coalesce(coalesce(new_row, old_row)->>'id', ''),
-		'partition', coalesce(coalesce(new_row, old_row)->>partition_column, ''))::text);
-	IF TG_OP = 'UPDATE' AND (old_row->>partition_column) IS DISTINCT FROM (new_row->>partition_column) THEN
-		PERFORM pg_notify('` + Channel + `', json_build_object(
-			'table', TG_TABLE_NAME, 'op', 'update', 'id', coalesce(old_row->>'id', ''),
-			'partition', coalesce(old_row->>partition_column, ''))::text);
+	PERFORM pg_notify('` + Channel + `', json_build_object('table', table_name, 'op', operation,
+		'id', CASE WHEN octet_length(row_id) <= 500 THEN row_id ELSE '' END,
+		'partition', CASE WHEN octet_length(row_partition) <= 500 THEN row_partition ELSE '' END)::text);
+	IF TG_OP = 'UPDATE' AND old_partition <> row_partition THEN
+		PERFORM pg_notify('` + Channel + `', json_build_object('table', table_name, 'op', 'update',
+			'id', CASE WHEN octet_length(old_id) <= 500 THEN old_id ELSE '' END,
+			'partition', CASE WHEN octet_length(old_partition) <= 500 THEN old_partition ELSE '' END)::text);
 	END IF;
 	RETURN NULL;
 END
 $$;
 `
 
-// TriggerSQL makes every table notify on each row change (D22); the changes carry no
-// partition, so they reach the subscriptions of every partition. A table name is one
-// identifier in the search path, quoted as it is.
+// TriggerSQL makes every table notify on each row change and on TRUNCATE (D22); the changes
+// carry no partition, so they reach the subscriptions of every partition. A table name is one
+// identifier in the search path, quoted as it is. On a natively partitioned table the row
+// trigger reaches every partition and the changes name the table itself; a TRUNCATE of one
+// partition on its own notifies nothing, truncate the table.
 func TriggerSQL(tables ...string) string {
 	var statements strings.Builder
 	for _, table := range tables {
-		statements.WriteString("CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON " +
-			identifier(table) + " FOR EACH ROW EXECUTE FUNCTION livewire_notify();\n")
+		statements.WriteString(notifyTriggersSQL(table, ""))
 	}
 	return statements.String()
 }
@@ -55,8 +67,7 @@ func TriggerSQL(tables ...string) string {
 // as their partition (D25), so a change re-runs only the subscriptions of that partition and
 // those without one.
 func PartitionedTriggerSQL(table, column string) string {
-	return "CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON " +
-		identifier(table) + " FOR EACH ROW EXECUTE FUNCTION livewire_notify(" + literal(column) + ");\n"
+	return notifyTriggersSQL(table, literal(column))
 }
 
 // FiltersSQL creates livewire_filters, the stored filters of D13 (FilterStore). An unnamed
@@ -95,11 +106,12 @@ CREATE INDEX livewire_idempotency_created_at ON livewire_idempotency (created_at
 `
 
 // AuditSQL creates livewire_audit, one row per mutation (D32, AuditStore), partitioned by
-// month on at. Rows of a month without its partition land in livewire_audit_default;
-// livewire_audit_maintain(retention), which AuditStore.Maintain calls, creates the partitions
-// of this and the next month (moving their rows out of the default partition), drops the
-// partitions that ended before now() - retention and deletes the default partition's rows
-// older than that.
+// UTC month on at. Rows of a month without its partition land in livewire_audit_default;
+// livewire_audit_maintain(retention, as_of default now()), which AuditStore.Maintain calls,
+// creates the partitions of the UTC month of as_of and the next one (moving their rows out of
+// the default partition, which it locks against inserts meanwhile, at most for its 5 s
+// lock_timeout), drops the partitions that ended before as_of - retention and deletes the
+// default partition's rows older than that. The session's TimeZone changes nothing.
 const AuditSQL = `CREATE TABLE livewire_audit (
 	id uuid NOT NULL DEFAULT uuidv7(),
 	at timestamptz NOT NULL DEFAULT now(),
@@ -115,33 +127,38 @@ const AuditSQL = `CREATE TABLE livewire_audit (
 	PRIMARY KEY (at, id)
 ) PARTITION BY RANGE (at);
 CREATE TABLE livewire_audit_default PARTITION OF livewire_audit DEFAULT;
-CREATE FUNCTION livewire_audit_maintain(retention interval) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION livewire_audit_maintain(retention interval, as_of timestamptz DEFAULT now()) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-	month_start timestamptz;
+	month_start timestamp; -- the first of a month in UTC
+	month_end timestamp;
 	partition_name text;
 	child record;
 BEGIN
 	PERFORM pg_advisory_xact_lock(hashtextextended('livewire_audit_maintain', 0));
 	PERFORM set_config('lock_timeout', '5s', true);
 	FOR month_offset IN 0..1 LOOP
-		month_start := date_trunc('month', now(), 'UTC') + make_interval(months => month_offset);
-		partition_name := 'livewire_audit_' || to_char(month_start AT TIME ZONE 'UTC', 'YYYYMM');
+		month_start := date_trunc('month', as_of AT TIME ZONE 'UTC') + make_interval(months => month_offset);
+		month_end := month_start + interval '1 month';
+		partition_name := 'livewire_audit_' || to_char(month_start, 'YYYYMM');
 		CONTINUE WHEN to_regclass(quote_ident(partition_name)) IS NOT NULL;
 		EXECUTE format('CREATE TABLE %I (LIKE livewire_audit INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', partition_name);
+		-- A row of the month inserted into the default partition between the move and the
+		-- attach would fail the attach: inserts wait until the function ends.
+		LOCK TABLE livewire_audit_default IN ACCESS EXCLUSIVE MODE;
 		EXECUTE format('WITH moved AS (DELETE FROM livewire_audit_default WHERE at >= $1 AND at < $2 RETURNING *) INSERT INTO %I SELECT * FROM moved', partition_name)
-			USING month_start, month_start + interval '1 month';
+			USING month_start AT TIME ZONE 'UTC', month_end AT TIME ZONE 'UTC';
 		EXECUTE format('ALTER TABLE livewire_audit ATTACH PARTITION %I FOR VALUES FROM (%L) TO (%L)',
-			partition_name, month_start, month_start + interval '1 month');
+			partition_name, month_start AT TIME ZONE 'UTC', month_end AT TIME ZONE 'UTC');
 	END LOOP;
 	FOR child IN
 		SELECT class.relname FROM pg_inherits JOIN pg_class class ON class.oid = pg_inherits.inhrelid
 		WHERE pg_inherits.inhparent = 'livewire_audit'::regclass AND class.relname ~ '^livewire_audit_[0-9]{6}$'
 	LOOP
-		IF (to_date(right(child.relname, 6), 'YYYYMM')::timestamp AT TIME ZONE 'UTC') + interval '1 month' <= now() - retention THEN
+		IF (to_date(right(child.relname, 6), 'YYYYMM')::timestamp + interval '1 month') AT TIME ZONE 'UTC' <= as_of - retention THEN
 			EXECUTE format('DROP TABLE %I', child.relname);
 		END IF;
 	END LOOP;
-	DELETE FROM livewire_audit_default WHERE at < now() - retention;
+	DELETE FROM livewire_audit_default WHERE at < as_of - retention;
 END
 $$;
 `
@@ -170,24 +187,30 @@ CREATE TRIGGER livewire_notify_update AFTER UPDATE ON livewire_presence
 `
 
 // historyFunctionSQL is the trigger function of HistorySQL: it closes the open version of
-// the row and appends the next one with the actor of the transaction (D31).
+// the row and appends the next one with the actor of the transaction (D31). Both are stamped
+// with clock_timestamp() once the row is locked, never earlier than the previous version, so
+// a transaction that began before another one's write still writes the later version.
 const historyFunctionSQL = `CREATE OR REPLACE FUNCTION livewire_history() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-	history text := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME || '_history');
+	history text := (SELECT format('%I.%I', namespace.nspname, class.relname || '_history')
+		FROM pg_class class JOIN pg_namespace namespace ON namespace.oid = class.relnamespace
+		WHERE class.oid = coalesce(pg_partition_root(TG_RELID), TG_RELID));
 	current_row jsonb := to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END);
 	actor jsonb := nullif(current_setting('livewire.actor', true), '')::jsonb;
 	row_id uuid := (current_row->>'id')::uuid;
 	next_version integer;
+	stamp timestamptz;
 BEGIN
 	IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = to_jsonb(NEW) THEN
 		RETURN NULL;
 	END IF;
-	EXECUTE format('SELECT coalesce(max(version), 0) + 1 FROM %s WHERE id = $1', history) INTO next_version USING row_id;
-	EXECUTE format('UPDATE %s SET valid_to = now() WHERE id = $1 AND valid_to IS NULL', history) USING row_id;
+	EXECUTE format('SELECT coalesce(max(version), 0) + 1, greatest(clock_timestamp(), max(valid_from), max(valid_to)) FROM %s WHERE id = $1', history)
+		INTO next_version, stamp USING row_id;
+	EXECUTE format('UPDATE %s SET valid_to = $2 WHERE id = $1 AND valid_to IS NULL', history) USING row_id, stamp;
 	EXECUTE format('INSERT INTO %s (id, version, operation, data, valid_from, valid_to, actor, real_actor, mutation, request_id)
-		VALUES ($1, $2, $3, $4, now(), CASE WHEN $3 = ''delete'' THEN now() END, $5, $6, $7, $8)', history)
+		VALUES ($1, $2, $3, $4, $9, CASE WHEN $3 = ''delete'' THEN $9 END, $5, $6, $7, $8)', history)
 		USING row_id, next_version, lower(TG_OP), current_row,
-			actor->>'actor', actor->>'realActor', actor->>'mutation', actor->>'requestId';
+			actor->>'actor', actor->>'realActor', actor->>'mutation', actor->>'requestId', stamp;
 	RETURN NULL;
 END
 $$;
@@ -198,9 +221,11 @@ $$;
 // per id), the operation, valid_from and valid_to (NULL for the current version; a delete is
 // a closed version of the last row), and the actor, real actor, mutation and request id the
 // Transactor set in livewire.actor (D31; NULL outside an engine transaction). An update that
-// changes nothing appends nothing. Table needs a uuid column id. The trigger function
-// livewire_history() is created or replaced with it. Applications only insert into history
-// through the trigger; the trigger itself closes the previous version.
+// changes nothing appends nothing, a TRUNCATE appends nothing either. Table needs a uuid
+// column id; for a natively partitioned table the history is the table's, whichever
+// partition the row lives in. The trigger function livewire_history() is created or replaced
+// with it. Applications only insert into history through the trigger; the trigger itself
+// closes the previous version.
 func HistorySQL(table string) string {
 	return historyFunctionSQL + `CREATE TABLE ` + identifier(table+"_history") + ` (
 	id uuid NOT NULL,
@@ -218,6 +243,13 @@ func HistorySQL(table string) string {
 CREATE OR REPLACE TRIGGER livewire_history AFTER INSERT OR UPDATE OR DELETE ON ` + identifier(table) + `
 	FOR EACH ROW EXECUTE FUNCTION livewire_history();
 `
+}
+
+func notifyTriggersSQL(table, arguments string) string {
+	return "CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON " + identifier(table) +
+		" FOR EACH ROW EXECUTE FUNCTION livewire_notify(" + arguments + ");\n" +
+		"CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON " + identifier(table) +
+		" FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(" + arguments + ");\n"
 }
 
 func identifier(name string) string { return pgx.Identifier{name}.Sanitize() }

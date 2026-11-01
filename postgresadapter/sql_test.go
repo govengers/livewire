@@ -3,6 +3,9 @@ package postgresadapter_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,9 +67,86 @@ func TestTriggerSQLQuotesIdentifiersAndLiterals(t *testing.T) {
 	t.Parallel()
 	require.Equal(t,
 		"CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON \"a\"\"b\" FOR EACH ROW EXECUTE FUNCTION livewire_notify();\n"+
-			"CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON \"c\" FOR EACH ROW EXECUTE FUNCTION livewire_notify();\n",
+			"CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON \"a\"\"b\" FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify();\n"+
+			"CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON \"c\" FOR EACH ROW EXECUTE FUNCTION livewire_notify();\n"+
+			"CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON \"c\" FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify();\n",
 		postgresadapter.TriggerSQL(`a"b`, "c"))
-	require.Contains(t, postgresadapter.PartitionedTriggerSQL("gadgets", "it's"), "livewire_notify('it''s')")
+	partitioned := postgresadapter.PartitionedTriggerSQL("gadgets", "it's")
+	require.Equal(t, 2, strings.Count(partitioned, "livewire_notify('it''s')"), "the row and the truncate trigger carry the column")
+}
+
+func TestTriggerNotifiesATruncateToEverySubscriptionOfTheTable(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	insertPart(t, database, "bolt")
+	_, err := database.pool.Exec(t.Context(), "INSERT INTO gadgets (tenant_id, name) VALUES ('north', 'lamp')")
+	require.NoError(t, err)
+	listening := notifications(t, database)
+	for _, table := range []string{"parts", "gadgets", "orders"} {
+		_, err := database.pool.Exec(t.Context(), "TRUNCATE "+table+" CASCADE")
+		require.NoError(t, err)
+		require.JSONEq(t, `{"table":"`+table+`","op":"delete","id":"","partition":""}`, nextPayload(t, listening, time.Second))
+	}
+	require.Empty(t, nextPayload(t, listening, quiet), "one notification per truncated table")
+}
+
+func TestTriggersOfANativelyPartitionedTableNameTheTable(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	listening := notifications(t, database)
+	var id string
+	require.NoError(t, database.pool.QueryRow(t.Context(), "INSERT INTO orders (region, total) VALUES ('eu', 7) RETURNING id::text").Scan(&id))
+	require.JSONEq(t, `{"table":"orders","op":"insert","id":"`+id+`","partition":""}`, nextPayload(t, listening, time.Second),
+		"the table, not its partition orders_eu")
+	_, err := database.pool.Exec(t.Context(), "UPDATE orders SET total = 8 WHERE id = $1", id)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"table":"orders","op":"update","id":"`+id+`","partition":""}`, nextPayload(t, listening, time.Second))
+
+	var versions []int
+	rows, err := database.pool.Query(t.Context(), "SELECT version FROM orders_history WHERE id = $1 ORDER BY version", id)
+	require.NoError(t, err)
+	versions, err = pgx.CollectRows(rows, pgx.RowTo[int])
+	require.NoError(t, err)
+	require.Equal(t, []int{1, 2}, versions, "the versions of every partition go to the table's history")
+}
+
+func TestTriggerSendsAnOversizedPartitionAsNone(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	listening := notifications(t, database)
+	var id string
+	require.NoError(t, database.pool.QueryRow(t.Context(), "INSERT INTO gadgets (tenant_id, name) VALUES (repeat(chr(1), 8000), 'lamp') RETURNING id::text").Scan(&id),
+		"a value past pg_notify's limit does not fail the write")
+	require.JSONEq(t, `{"table":"gadgets","op":"insert","id":"`+id+`","partition":""}`, nextPayload(t, listening, time.Second))
+	_, err := database.pool.Exec(t.Context(), "UPDATE gadgets SET tenant_id = repeat(chr(1), 500) WHERE id = $1", id)
+	require.NoError(t, err)
+	payload := nextPayload(t, listening, time.Second)
+	require.Contains(t, payload, strings.Repeat(`\u0001`, 500), "500 bytes still travel, escaped to six times their size")
+	require.JSONEq(t, `{"table":"gadgets","op":"update","id":"`+id+`","partition":""}`, nextPayload(t, listening, time.Second))
+}
+
+func TestHistoryStampsOverlappingWritersInOrder(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	id := insertPart(t, database, "bolt")
+	earlier, err := database.pool.Begin(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = earlier.Rollback(context.Background()) }) // committed below; ErrTxClosed then
+	_, err = earlier.Exec(t.Context(), "SELECT 1")                   // the transaction's now() is taken
+	require.NoError(t, err)
+	time.Sleep(20 * time.Millisecond)
+	_, err = database.pool.Exec(t.Context(), "UPDATE parts SET name = 'nut' WHERE id = $1", id)
+	require.NoError(t, err)
+	_, err = earlier.Exec(t.Context(), "UPDATE parts SET name = 'washer' WHERE id = $1", id)
+	require.NoError(t, err)
+	require.NoError(t, earlier.Commit(t.Context()))
+
+	var ordered bool
+	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT bool_and(valid_from > previous_from AND previous_to = valid_from)
+		FROM (SELECT valid_from, lag(valid_from) OVER versions AS previous_from, lag(valid_to) OVER versions AS previous_to
+			FROM parts_history WHERE id = $1 WINDOW versions AS (ORDER BY version)) AS stamped
+		WHERE previous_from IS NOT NULL`, id).Scan(&ordered))
+	require.True(t, ordered, "each version starts after the one before and where it ended")
 }
 
 // historyRow is one version of parts_history as the test reads it.
@@ -144,20 +224,99 @@ func TestAuditMaintainPartitionsByMonthAndDropsExpiredRows(t *testing.T) {
 	require.NoError(t, store.Maintain(t.Context()))
 	require.NoError(t, store.Maintain(t.Context()), "maintenance is idempotent")
 
-	var partitions []string
-	rows, err := database.pool.Query(t.Context(), `SELECT class.relname FROM pg_inherits JOIN pg_class class ON class.oid = pg_inherits.inhrelid
-		WHERE pg_inherits.inhparent = 'livewire_audit'::regclass ORDER BY 1`)
-	require.NoError(t, err)
-	partitions, err = pgx.CollectRows(rows, pgx.RowTo[string])
-	require.NoError(t, err)
-	now := time.Now().UTC()
-	thisMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	require.Equal(t, []string{"livewire_audit_" + thisMonth.Format("200601"), "livewire_audit_" + thisMonth.AddDate(0, 1, 0).Format("200601"), "livewire_audit_default"}, partitions)
+	var thisMonth, nextMonth string // by the database's clock, which Maintain went by
+	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYYMM'),
+		to_char(date_trunc('month', now() AT TIME ZONE 'UTC') + interval '1 month', 'YYYYMM')`).Scan(&thisMonth, &nextMonth))
+	require.Equal(t, map[string]string{
+		"livewire_audit_" + thisMonth: thisMonth, "livewire_audit_" + nextMonth: nextMonth, "livewire_audit_default": "DEFAULT",
+	}, auditPartitions(t, database.pool))
 
 	var requestID, partition string
 	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT request_id, tableoid::regclass::text FROM livewire_audit").Scan(&requestID, &partition))
 	require.Equal(t, "now", requestID, "the expired row is gone")
-	require.Equal(t, "livewire_audit_"+thisMonth.Format("200601"), partition, "the month's row moved out of the default partition")
+	require.Equal(t, "livewire_audit_"+thisMonth, partition, "the month's row moved out of the default partition")
+}
+
+// auditPartitions is every partition of livewire_audit with the UTC month its bounds span,
+// "YYYYMM" when they are the first of a month and of the next, else the bound expression.
+func auditPartitions(t *testing.T, database postgresadapter.DBTX) map[string]string {
+	t.Helper()
+	rows, err := database.Query(t.Context(), `SELECT class.relname, CASE WHEN class.relpartbound IS NULL THEN '' ELSE pg_get_expr(class.relpartbound, class.oid) END,
+			coalesce(to_char(bounds.lower AT TIME ZONE 'UTC', 'YYYYMM'), ''),
+			coalesce(bounds.lower AT TIME ZONE 'UTC' = date_trunc('month', bounds.lower AT TIME ZONE 'UTC')
+				AND bounds.upper AT TIME ZONE 'UTC' = date_trunc('month', bounds.lower AT TIME ZONE 'UTC') + interval '1 month', false)
+		FROM pg_inherits JOIN pg_class class ON class.oid = pg_inherits.inhrelid
+		LEFT JOIN LATERAL (SELECT (regexp_match(pg_get_expr(class.relpartbound, class.oid), 'FROM \(''([^'']+)''\) TO \(''([^'']+)''\)'))[1]::timestamptz AS lower,
+			(regexp_match(pg_get_expr(class.relpartbound, class.oid), 'FROM \(''([^'']+)''\) TO \(''([^'']+)''\)'))[2]::timestamptz AS upper) AS bounds ON true
+		WHERE pg_inherits.inhparent = 'livewire_audit'::regclass`)
+	require.NoError(t, err)
+	partitions := map[string]string{}
+	for rows.Next() {
+		var name, expression, month string
+		var wholeMonth bool
+		require.NoError(t, rows.Scan(&name, &expression, &month, &wholeMonth))
+		switch {
+		case expression == "DEFAULT":
+			partitions[name] = expression
+		case wholeMonth:
+			partitions[name] = month
+		default:
+			partitions[name] = expression
+		}
+	}
+	require.NoError(t, rows.Err())
+	return partitions
+}
+
+func TestAuditMaintainCutsUTCMonthsWhateverTheSessionTimeZone(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	for _, timeZone := range []string{"Europe/Berlin", "America/New_York", "Pacific/Kiritimati"} {
+		t.Run(timeZone, func(t *testing.T) {
+			connection, err := pgx.Connect(t.Context(), database.dsn()+"?timezone="+timeZone)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = connection.Close(context.Background()) }) // the database is dropped next; the close error carries nothing
+			_, err = connection.Exec(t.Context(), "DROP TABLE IF EXISTS livewire_audit_202603, livewire_audit_202604, livewire_audit_202612, livewire_audit_202701")
+			require.NoError(t, err)
+			// Around the March DST switch in Europe and America, and across the year's end.
+			for _, asOf := range []string{"2026-03-31T23:30:00Z", "2026-12-31T23:30:00Z"} {
+				_, err = connection.Exec(t.Context(), "SELECT livewire_audit_maintain(interval '100 years', $1::timestamptz)", asOf)
+				require.NoError(t, err)
+			}
+			require.Equal(t, map[string]string{
+				"livewire_audit_202603": "202603", "livewire_audit_202604": "202604",
+				"livewire_audit_202612": "202612", "livewire_audit_202701": "202701", "livewire_audit_default": "DEFAULT",
+			}, auditPartitions(t, connection))
+		})
+	}
+}
+
+func TestAuditMaintainHoldsUnderConcurrentWrites(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: database.pool})
+	require.NoError(t, err)
+	ctx, stop := context.WithCancel(t.Context())
+	var writers sync.WaitGroup
+	var written atomic.Int64
+	for range 4 {
+		writers.Go(func() {
+			for ctx.Err() == nil {
+				if store.Write(ctx, &postgresadapter.AuditEntry{Mutation: "createPart", RequestID: "concurrent", Status: 201}) == nil {
+					written.Add(1)
+				}
+			}
+		})
+	}
+	require.Eventually(t, func() bool { return written.Load() > 50 }, 5*time.Second, time.Millisecond, "the writers write into the default partition")
+	maintained := store.Maintain(t.Context())
+	stop()
+	writers.Wait()
+	require.NoError(t, maintained, "the move and the attach hold against concurrent inserts")
+	var stranded int
+	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT count(*) FROM livewire_audit_default
+		WHERE at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`).Scan(&stranded))
+	require.Zero(t, stranded, "no row of the month stays in the default partition")
 }
 
 func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {

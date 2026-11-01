@@ -23,7 +23,8 @@ import (
 )
 
 // The fixture schema: parts is a live, versioned table with a native enum, nullable sort
-// columns and a timestamptz that holds infinities; gadgets is partitioned by tenant.
+// columns and a timestamptz that holds infinities; gadgets is partitioned by tenant (D25);
+// orders is a live, versioned, natively partitioned table.
 const fixtureSQL = `
 CREATE TYPE part_status AS ENUM ('draft', 'active', 'retired');
 CREATE TABLE parts (
@@ -34,6 +35,10 @@ CREATE TABLE parts (
 	due_at timestamptz
 );
 CREATE TABLE gadgets (id uuid PRIMARY KEY DEFAULT uuidv7(), tenant_id text NOT NULL, name text NOT NULL);
+CREATE TABLE orders (id uuid NOT NULL DEFAULT uuidv7(), region text NOT NULL, total integer NOT NULL, PRIMARY KEY (id, region))
+	PARTITION BY LIST (region);
+CREATE TABLE orders_eu PARTITION OF orders FOR VALUES IN ('eu');
+CREATE TABLE orders_us PARTITION OF orders FOR VALUES IN ('us');
 `
 
 // postgres is the one embedded server of this test binary (TST-002): every test gets a
@@ -104,7 +109,7 @@ func migrateTemplate() error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = admin.Close(ctx) }()
+	defer func() { _ = admin.Close(ctx) }() // the template is created or the error is returned; the close error adds nothing
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+templateDatabase); err != nil {
 		return err
 	}
@@ -112,13 +117,15 @@ func migrateTemplate() error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = connection.Close(ctx) }()
+	defer func() { _ = connection.Close(ctx) }() // as above
 	for _, statements := range []string{
 		fixtureSQL,
 		postgresadapter.TriggerFunctionSQL,
 		postgresadapter.TriggerSQL("parts"),
 		postgresadapter.PartitionedTriggerSQL("gadgets", "tenant_id"),
 		postgresadapter.HistorySQL("parts"),
+		postgresadapter.TriggerSQL("orders"),
+		postgresadapter.HistorySQL("orders"),
 		postgresadapter.FiltersSQL,
 		postgresadapter.IdempotencySQL,
 		postgresadapter.AuditSQL,
