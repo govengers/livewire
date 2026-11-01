@@ -328,6 +328,22 @@ func (a *testApplication) dial(t *testing.T, authenticate func(request *http.Req
 	return &rawSocket{connection: connection}
 }
 
+// pushWait bounds the wait for a push: far below the socket's 60 s re-validation tick.
+const pushWait = 3 * time.Second
+
+// push answers the next push of a subscription within pushWait, skipping other frames.
+func (s *rawSocket) push(t *testing.T, subscription string) livewire.PushFrame {
+	t.Helper()
+	require.NoError(t, s.connection.SetReadDeadline(time.Now().Add(pushWait)))
+	for {
+		var frame livewire.PushFrame
+		require.NoError(t, s.connection.ReadJSON(&frame), "no push of %s within %s", subscription, pushWait)
+		if frame.Subscription == subscription {
+			return frame
+		}
+	}
+}
+
 // request sends a frame and answers its response, skipping pushes; it fails the test on a
 // closed socket, unless closed is set, which then receives the close code.
 func (s *rawSocket) request(t *testing.T, frame livewire.RequestFrame) (livewire.ResponseFrame, int) {

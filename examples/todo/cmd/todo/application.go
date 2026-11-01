@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sync/atomic"
 
+	"github.com/google/uuid"
+	"github.com/govengers/auth"
 	authginadapter "github.com/govengers/auth/ginadapter"
 	"github.com/govengers/auth/password"
 	"github.com/govengers/jobs"
@@ -132,6 +134,34 @@ func newApplication(options *applicationOptions) (*application, error) {
 		registry: engine.Registry(), engine: engine, worker: worker, router: router,
 		metrics: options.Metrics, users: options.Users, accounts: accountService, jobStore: jobStore, ready: ready,
 	}, nil
+}
+
+// moveMember puts a user into another workspace and re-validates the user's sockets at once
+// (section 6, push-driven revocation): the workspace is part of the identity, so each socket
+// ends the subscriptions of the old tenant now instead of at its next re-validation tick.
+func (a *application) moveMember(ctx context.Context, userID uuid.UUID, workspace string) error {
+	if err := a.accounts.Join(ctx, userID, workspace); err != nil {
+		return err
+	}
+	a.revalidateUser(userID)
+	return nil
+}
+
+// removeMember removes a user from its workspace, with its API keys, and ends its sockets at
+// once with 4401.
+func (a *application) removeMember(ctx context.Context, userID uuid.UUID) error {
+	if err := a.accounts.Leave(ctx, userID); err != nil {
+		return err
+	}
+	a.revalidateUser(userID)
+	return nil
+}
+
+// revalidateUser re-validates every socket of the user, by session and by API key.
+func (a *application) revalidateUser(userID uuid.UUID) {
+	for _, provider := range []string{"password", "apikey"} {
+		a.engine.RevalidateOwner(livewire.OwnerKey(&auth.Identity{Provider: provider, Subject: userID.String()}))
+	}
 }
 
 func newStores(pool *pgxpool.Pool) (*stores, error) {

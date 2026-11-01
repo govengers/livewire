@@ -19,7 +19,7 @@ lint:
     cd examples/todo && go vet ./... && golangci-lint run ./...
 
 # Unit tests with the race detector; fails below the coverage threshold (examples, the e2e suite and the generator's fixture with its generated clients excluded); then the example's tests
-test: && test-example db-check-example
+test: && test-example
     mkdir -p sandbox
     {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.raw.cover ./...
     grep -v -E '{{excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
@@ -35,15 +35,16 @@ test-typescript:
     cd generate/runtime && bun install --frozen-lockfile
     LIVEWIRE_REQUIRE_TYPESCRIPT=1 go test -count=1 -run 'TestGeneratedTypeScriptTypeChecks|TestRuntimeUnitTests' ./generate/
 
-# End-to-end: two engines on one embedded Postgres, the TypeScript runtime driven by bun (build tag e2e); without bun its parts skip, except in CI
-test-e2e:
+# End-to-end: two engines on one embedded Postgres, the TypeScript runtime driven by bun (build tag e2e), then the example's SQL check chain; without bun the TypeScript parts skip, except in CI
+test-e2e: && db-check-example
     mkdir -p sandbox
     {{require_typescript}} {{gotestsum}} --format testname --jsonfile sandbox/e2e.json -- -tags e2e -count=1 ./test/e2e/...
 
-# The example's SQL check chain (DAT-016): squawk on the migrations, sqlc generate without a diff, the build, and sqlc vet on a fresh database the app's own migrator migrated
+# The example's SQL check chain (DAT-016), not hermetic (bunx fetches squawk, go run builds sqlc with cgo): squawk on the migrations, sqlc generate leaving nothing changed or new, the build, and sqlc vet on a fresh database the app's own migrator migrated
 db-check-example:
     cd examples/todo && bunx squawk-cli@2.66.0 --pg-version 18 --assume-in-transaction internal/database/migrations/*.sql
-    cd examples/todo && {{sqlc}} generate && git diff --exit-code -- internal/repository/internal/sqlc
+    cd examples/todo && {{sqlc}} generate
+    cd examples/todo && changed="$(git status --porcelain -- internal/repository/internal/sqlc)" && if [ -n "$changed" ]; then echo "$changed"; echo "sqlc generates other code than the committed: commit it"; exit 1; fi
     cd examples/todo && go build ./...
     cd examples/todo && LIVEWIRE_SQLC_VET=1 go test -count=1 -run TestTheQueriesPassSqlcVet ./cmd/todo/
 

@@ -30,8 +30,10 @@ func TestTheFrontendTypeChecks(t *testing.T) {
 	directory := t.TempDir()
 	require.NoError(t, os.CopyFS(directory, os.DirFS(web)))
 	require.NoError(t, os.Symlink(filepath.Join(harness, "node_modules"), filepath.Join(directory, "node_modules")))
-	runBun(t, directory, bun, filepath.Join(harness, "node_modules", "typescript", "bin", "tsc"), "-p", directory)
-	runBun(t, directory, bun, "test") // live.test.ts: the session transitions (D66)
+	tsc := filepath.Join(harness, "node_modules", "typescript", "bin", "tsc")
+	runBun(t, directory, bun, tsc, "-p", filepath.Join(directory, "tsconfig.json"))      // the browser code, without bun's globals
+	runBun(t, directory, bun, tsc, "-p", filepath.Join(directory, "tsconfig.test.json")) // and the bun test
+	runBun(t, directory, bun, "test")                                                    // live.test.ts: the session transitions (D66)
 }
 
 func runBun(t *testing.T, directory, bun string, arguments ...string) {

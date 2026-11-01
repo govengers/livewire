@@ -48,16 +48,17 @@ const (
 
 // configuration is every value the service reads from the environment (CFG-001).
 type configuration struct {
-	databaseURL          string
-	embeddedPostgresPath string
-	embeddedPostgresPort int
-	address              string
-	metricsAddress       string
-	sessionKey           string
-	insecureCookie       bool
-	allowedOrigins       []string
-	demoPassword         string
-	developmentLogs      bool
+	databaseURL           string
+	embeddedPostgresPath  string
+	embeddedPostgresPort  int
+	address               string
+	metricsAddress        string
+	sessionKey            string
+	insecureCookie        bool
+	allowedOrigins        []string
+	demoPassword          string
+	developmentLogs       bool
+	readinessDelaySeconds int
 }
 
 func main() {
@@ -121,6 +122,7 @@ func loadConfiguration() (*configuration, error) {
 		config.StringArray("ALLOWED_ORIGINS").Default(nil).Into(&values.allowedOrigins), // empty: the socket's own host only (D9)
 		config.String("DEMO_PASSWORD").Sensitive().Into(&values.demoPassword),
 		config.Bool("DEVELOPMENT_LOGS").Default(false).Into(&values.developmentLogs),
+		config.Int("READINESS_DELAY_SECONDS").Default(5).Into(&values.readinessDelaySeconds), // the load balancer's notice; with the 20 s drain within a 30 s grace period
 	})
 	return values, err
 }
@@ -186,13 +188,15 @@ func serve(ctx context.Context, application *application, values *configuration)
 		if err := listen(groupContext, apiServer); err != nil {
 			return err
 		}
-		return drain(context.WithoutCancel(groupContext), shutdownBudget, application.ready, apiServer, application.engine)
+		api := drainer{ready: application.ready, readinessDelay: time.Duration(values.readinessDelaySeconds) * time.Second, budget: shutdownBudget, wait: wait}
+		return api.drain(context.WithoutCancel(groupContext), apiServer, application.engine)
 	}))
 	group.Go(recovering(func() error {
 		if err := listen(groupContext, metricsServer); err != nil {
 			return err
 		}
-		return drain(context.WithoutCancel(groupContext), shutdownBudget, nil, metricsServer, nil)
+		metrics := drainer{budget: shutdownBudget, wait: wait}
+		return metrics.drain(context.WithoutCancel(groupContext), metricsServer, nil)
 	}))
 	return group.Wait()
 }
@@ -208,15 +212,34 @@ type socketCloser interface {
 	Close(ctx context.Context) error
 }
 
-// drain stops serving in order, within one budget: readiness fails first, so the load
-// balancer sends no new requests; the server stops accepting and waits for its requests,
-// and closes the connections still open when the budget is spent; then the sockets end with
-// 1001. A nil ready or sockets skips its step.
-func drain(ctx context.Context, budget time.Duration, ready *atomic.Bool, server httpServer, sockets socketCloser) error {
-	if ready != nil {
-		ready.Store(false)
+// drainer stops serving in order (LAY-003).
+type drainer struct {
+	ready          *atomic.Bool                                   // the readiness it withdraws; nil for none
+	readinessDelay time.Duration                                  // how long the load balancer gets to notice
+	budget         time.Duration                                  // the drain's one budget
+	wait           func(ctx context.Context, delay time.Duration) // waits for delay or ctx
+}
+
+// wait waits for delay unless ctx ends first.
+func wait(ctx context.Context, delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
 	}
-	bounded, cancel := context.WithTimeout(ctx, budget)
+}
+
+// drain withdraws readiness and waits the readiness delay while the load balancer notices and
+// stops sending; then, within one budget, the server stops accepting and waits for its
+// requests, closes the connections still open when the budget is spent, and the sockets end
+// with 1001. A nil sockets skips its step.
+func (d drainer) drain(ctx context.Context, server httpServer, sockets socketCloser) error {
+	if d.ready != nil {
+		d.ready.Store(false)
+		d.wait(ctx, d.readinessDelay)
+	}
+	bounded, cancel := context.WithTimeout(ctx, d.budget)
 	defer cancel()
 	err := server.Shutdown(bounded)
 	if err != nil {

@@ -95,7 +95,7 @@ func TestTheGoClientBatchesFiltersAndReplays(t *testing.T) {
 	require.Len(t, replayed, len(results))
 	for index, result := range results {
 		require.Equal(t, result.Status, replayed[index].Status)
-		require.JSONEq(t, string(result.Payload), string(replayed[index].Payload), "a replay answers the recorded results (D16), in the record's jsonb member order")
+		require.Equal(t, string(result.Payload), string(replayed[index].Payload), "a replay answers the recorded results byte for byte (D16, D72)")
 	}
 
 	filter := todoclient.TodosFilter{Where: new(todoclient.TodosPriorityEqual(todoclient.TodosPriorityLow))}

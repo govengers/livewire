@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
@@ -88,6 +90,30 @@ func TestASessionFollowsItsMembershipOnEveryRequest(t *testing.T) {
 	require.Equal(t, livewire.CloseIdentityGone, closed, "and its socket ends with 4401")
 }
 
+// TestAMoveEndsAnOpenSubscriptionAtOnce pins the push-driven re-validation of a membership
+// change: the subscription of the old workspace ends with its error push without waiting for
+// the socket's next op or re-validation tick.
+func TestAMoveEndsAnOpenSubscriptionAtOnce(t *testing.T) {
+	t.Parallel()
+	application := newTestApplication(t)
+	fixtureTodo(t, application.client(t, "alice"), "north's")
+	socket := application.dial(t, application.session(t, "alice"))
+	subscribed, _ := socket.request(t, livewire.RequestFrame{Operation: livewire.OperationSubscribe, Target: "todos"})
+	require.True(t, subscribed.OK, "%+v", subscribed.Error)
+	require.Equal(t, livewire.PushSnapshot, socket.push(t, subscribed.Subscription).Kind)
+
+	require.NoError(t, application.moveMember(t.Context(), authentication.SeededUserID("alice"), "south"))
+	ended := socket.push(t, subscribed.Subscription)
+	require.Equal(t, livewire.PushError, ended.Kind, "the old workspace's subscription ends at once: %s", ended.Payload)
+
+	require.NoError(t, application.removeMember(t.Context(), authentication.SeededUserID("alice")))
+	require.NoError(t, socket.connection.SetReadDeadline(time.Now().Add(pushWait)))
+	var closed *websocket.CloseError
+	_, _, err := socket.connection.ReadMessage()
+	require.ErrorAs(t, err, &closed, "a removed member's socket closes at once")
+	require.Equal(t, livewire.CloseIdentityGone, closed.Code)
+}
+
 func TestAnAPIKeyFollowsItsMembershipAndDiesWithIt(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)
@@ -165,4 +191,13 @@ func TestEverySocketOutcomeHasAWideEventOfItsOwn(t *testing.T) {
 	require.Equal(t, "success", events[0]["outcome"])
 	require.Equal(t, "todos.item", nested(events[1], "livewire", "target"))
 	require.Equal(t, "failure", events[1]["outcome"])
+
+	todo := fixtureTodo(t, application.client(t, "alice"), "renamed on the socket")
+	called, _ := socket.request(t, livewire.RequestFrame{
+		Operation: livewire.OperationCall, Target: "updateTodo", Parameters: map[string]string{"id": todo.ID.String()}, Body: []byte(`{"title":"renamed"}`),
+	})
+	require.True(t, called.OK, "%+v", called.Error)
+	calls := application.events.named("livewire.call")
+	require.Len(t, calls, 1)
+	require.Equal(t, todo.ID.String(), nested(calls[0], "todo", "id"), "a socket mutation's event names its todo (LOG-003)")
 }

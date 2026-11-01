@@ -50,8 +50,19 @@ export async function resume(): Promise<void> {
  * since neither instance can see the cookie and a request in between would go out as the next
  * user (D66). Whatever the change did, a failed or unreadable answer included, the next pair
  * serves the identity the server's session answers afterwards, never the one the change meant.
+ * Changes run one after the other: a second login or logout waits until the first built its
+ * pair, so no pair is live while a cookie changes, and the last change's pair stays.
  */
-async function changeSession(change: () => Promise<Response>): Promise<void> {
+function changeSession(change: () => Promise<Response>): Promise<void> {
+  const changed = transitions.then(() => changeSessionNow(change))
+  transitions = changed.catch(() => undefined)
+  return changed
+}
+
+/** The session changes in flight, one after the other. */
+let transitions: Promise<void> = Promise.resolve()
+
+async function changeSessionNow(change: () => Promise<Response>): Promise<void> {
   pair.value.end()
   let failure: unknown
   try {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/govengers/livewire/ginadapter"
 	"github.com/govengers/livewire/prometheusadapter"
 
+	"github.com/govengers/livewire/examples/todo/internal/api"
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
 	"github.com/govengers/livewire/examples/todo/internal/controller"
 )
@@ -114,8 +116,13 @@ func writeError(ginContext *gin.Context, err error) {
 	ginContext.AbortWithStatusJSON(status, body)
 }
 
+// methods are the label values of a request's method; any other method is "other" (MET-004).
+var methods = []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions}
+
 // newRequestMetrics records the rate, the errors and the duration of every request by route
-// template, method and status class (MET-003, MET-004).
+// template, method and status class, and the requests in flight (MET-003, MET-004). A request
+// that panics counts as 5xx. The socket route is left out: its request lives as long as the
+// socket, which prometheusadapter measures.
 func newRequestMetrics(registerer prometheus.Registerer) (gin.HandlerFunc, error) {
 	requests := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "todo", Subsystem: "http", Name: "requests_total", Help: "HTTP requests by route, method and status class.",
@@ -124,22 +131,59 @@ func newRequestMetrics(registerer prometheus.Registerer) (gin.HandlerFunc, error
 		Namespace: "todo", Subsystem: "http", Name: "request_duration_seconds", Help: "HTTP request durations by route and method.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"route", "method"})
-	for _, collector := range []prometheus.Collector{requests, durations} {
+	inFlight := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "todo", Subsystem: "http", Name: "requests_in_flight", Help: "HTTP requests being served.",
+	})
+	for _, collector := range []prometheus.Collector{requests, durations, inFlight} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, err
 		}
 	}
 	return func(ginContext *gin.Context) {
-		started := time.Now()
-		ginContext.Next()
 		route := ginContext.FullPath()
+		if route == SocketPath {
+			ginContext.Next()
+			return
+		}
 		if route == "" {
 			route = "unmatched" // a client's path never becomes a label
 		}
 		method := ginContext.Request.Method
-		requests.WithLabelValues(route, method, strconv.Itoa(ginContext.Writer.Status()/100)+"xx").Inc()
-		durations.WithLabelValues(route, method).Observe(time.Since(started).Seconds())
+		if !slices.Contains(methods, method) {
+			method = "other"
+		}
+		started := time.Now()
+		inFlight.Inc()
+		defer func() {
+			inFlight.Dec()
+			status := ginContext.Writer.Status()
+			recovered := recover()
+			if recovered != nil {
+				status = http.StatusInternalServerError
+			}
+			requests.WithLabelValues(route, method, strconv.Itoa(status/100)+"xx").Inc()
+			durations.WithLabelValues(route, method).Observe(time.Since(started).Seconds())
+			if recovered != nil {
+				panic(recovered) // the recovery outside answers it
+			}
+		}()
+		ginContext.Next()
 	}, nil
+}
+
+// recordIdentifiers puts the business identifiers of a socket unit's decoded parameters on its
+// event (LOG-003): the services record them on a REST request's event, a socket unit has none
+// for them to write to. A create's id travels in its body, which an outcome does not carry.
+func recordIdentifiers(we *wideevent.Event, parameters any) {
+	switch typed := parameters.(type) {
+	case *api.TodoParameters:
+		we.UUID("todo.id", typed.ID)
+	case *api.ActivityParameters:
+		if typed.TodoID != nil {
+			we.UUID("todo.id", *typed.TodoID)
+		}
+	default:
+	}
 }
 
 // NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome
@@ -164,6 +208,7 @@ func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) 
 		if outcome.Identity != nil {
 			we.UserID(outcome.Identity.UserID)
 		}
+		recordIdentifiers(we, outcome.Parameters)
 		if outcome.Err != nil {
 			we.Failure(outcome.Err)
 		} else {

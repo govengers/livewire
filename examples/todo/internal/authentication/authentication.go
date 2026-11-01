@@ -2,8 +2,10 @@
 // for the browser, API keys for the CLI and the Go client (D20), the Guard in front of the API,
 // and the IdentitySource the engine re-validates every socket with (D6). Either way the user's
 // workspace, the registry's tenant (D42), is read from the user's current membership on every
-// request and every socket re-validation: a moved member acts in the new workspace at once, a
-// removed one is refused (AUTH-007).
+// request and every socket re-validation (AUTH-007): a moved member's next request acts in the
+// new workspace and a removed one's is refused. A socket learns of it when it re-validates, on
+// its next op or its tick (60 s), or at once when the change re-validates the user's sockets
+// (Engine.RevalidateOwner), as the application's moveMember and removeMember do.
 //
 // Users live in password.MemoryStorage and sessions in session.MemoryBackend to keep the
 // example small: a service stores its users with a password.Storage on its own users table
@@ -99,8 +101,8 @@ func (a *Authentication) Middleware(next http.Handler) http.Handler {
 
 // Identify re-validates a socket by its upgrade request (livewire.IdentitySource): the API key
 // it carried, or else its session, with the user's current workspace. A revoked key, an ended
-// session and a user in no workspace are gone (4401); a moved member is another identity, whose
-// subscriptions end with the old tenant (D7, D42).
+// session and a user in no workspace are gone (4401); a moved member is another identity, the
+// workspace being part of it, whose subscriptions of the old tenant end (D7, D42).
 func (a *Authentication) Identify(ctx context.Context, request *http.Request) (*auth.Identity, error) {
 	if key := presentedKey(request); key != "" {
 		return a.resolveKey(ctx, key)

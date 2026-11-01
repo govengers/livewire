@@ -10,17 +10,22 @@ import { login, logout, pair, resume } from './live'
 let session = ''
 let transition: (path: string) => Promise<Response> = () => Promise.resolve(new Response(null, { status: 200 }))
 let sessionReadable = true
+/** When set, the next /auth/me waits for it: a slow answer. */
+let slowSession: Promise<void> | undefined
 
 const realFetch = globalThis.fetch
-globalThis.fetch = (async (input: string | URL | Request) => {
+globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const path = typeof input === 'string' ? input : input instanceof URL ? input.pathname : new URL(input.url).pathname
   if (path === '/auth/me') {
+    const slow = slowSession
+    slowSession = undefined
+    if (slow !== undefined) await slow
     if (!sessionReadable) throw new TypeError('the network is down')
     if (session === '') return new Response('{"code":"unauthenticated"}', { status: 401 })
     const [provider, subject] = session.split(':')
     return Response.json({ provider, subject })
   }
-  return transition(path)
+  return transition(init?.body === undefined ? path : `${path} ${String(init.body)}`)
 }) as typeof fetch
 
 afterEach(() => {
@@ -58,6 +63,33 @@ describe('the pair after a session change', () => {
     transition = () => Promise.resolve(new Response('{"code":"internal"}', { status: 500 }))
     await expect(logout()).rejects.toThrow('500')
     expect(pair.value.identity).toBe('password:alice')
+  })
+
+  test('builds no pair while a later login changes the cookie, and keeps the last one', async () => {
+    let releaseSession = (): void => {}
+    slowSession = new Promise((resolve) => { releaseSession = resolve })
+    let releaseCarol = (): void => {}
+    const carolsLogin = new Promise<void>((resolve) => { releaseCarol = resolve })
+    const liveWhileCookieChanged: string[] = []
+    transition = async (request) => {
+      if (request.includes('carol')) {
+        await carolsLogin
+        if (!pair.value.client.ended) liveWhileCookieChanged.push(pair.value.identity)
+        session = 'password:carol'
+      } else {
+        session = 'password:bob'
+      }
+      return new Response('{}')
+    }
+    const bobs = login('bob', 'secret') // its /auth/me answers slowly
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const carols = login('carol', 'secret') // while bob's pair is not built yet
+    releaseSession()
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    releaseCarol()
+    await Promise.all([bobs, carols])
+    expect(liveWhileCookieChanged).toEqual([])
+    expect(pair.value.identity).toBe('password:carol')
   })
 
   test('serves nobody once nobody knows the session, until resume reads it', async () => {
