@@ -25,7 +25,11 @@ import (
 // a relative time, on the safety tick. FilterStore enables stored filters (D13),
 // IdempotencyStore the replay of mutations (D16), AuditStore the action audit (D32),
 // PresenceStore the join and leave ops and the presence reads (D37); each is optional and its
-// feature is off without it. The engine's outcomes go to the registry's Observer (D49).
+// feature is off without it. The engine's outcomes go to the registry's Observer (D49). The
+// engine runs no store maintenance: the sweeps and the audit partitions (the postgresadapter's
+// FilterStore.Sweep, IdempotencyStore.Sweep and AuditStore.Maintain) are the application's to
+// schedule, a periodic govengers/jobs job for instance, so one replica runs them, not every
+// engine, and a failure lands where the application handles its jobs.
 //
 // The limits (D10) default when zero: SubscriptionsPerSocket 64, InFlightPerSocket 16,
 // PresencesPerSocket 64 (records one socket may join at once), FiltersPerSocket 64 (the
