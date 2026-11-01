@@ -30,7 +30,7 @@ var readKinds = []ReadKind{ReadMain, ReadItem, ReadDistinct, ReadHistory, ReadPr
 // none of them, an unknown declaration or kind, or a subscription's id, is "", so a metric
 // label on it stays a closed set (MET-004).
 func (e *Engine) reportedTarget(target string) string {
-	if target == "" || target == batchMutation || target == filtersTarget {
+	if target == "" || target == BatchTarget || target == FiltersTarget {
 		return target
 	}
 	name, kind := parseTarget(target)

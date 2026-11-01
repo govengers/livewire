@@ -64,12 +64,7 @@ type BatchResult struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
-const (
-	maximumBatchCalls = 100
-	// batchMutation is the target of a batch's outcomes and the prefix of the name its
-	// Idempotency-Key is reserved under (batchReservation).
-	batchMutation = "batch"
-)
+const maximumBatchCalls = 100
 
 // Call runs one mutation for the identity in ctx (section 7), the pipeline the socket's call
 // op runs too: the static Check (D8), the parameters, the tenant (D42), the body (unknown
@@ -229,7 +224,7 @@ func (e *Engine) Batch(ctx context.Context, request BatchRequest) (json.RawMessa
 }
 
 func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRequest) (json.RawMessage, error) {
-	unit := startUnit(OutcomeBatch, operation, batchMutation)
+	unit := startUnit(OutcomeBatch, operation, BatchTarget)
 	prepared, err := e.prepareBatch(ctx, request.Body)
 	if err != nil {
 		e.observe(ctx, unit.outcome(ctx, err))
@@ -264,7 +259,7 @@ func batchReservation(prepared []*preparedCall) string {
 	for _, call := range prepared {
 		targets = append(targets, call.mutation.Name())
 	}
-	return batchMutation + "(" + strings.Join(targets, ",") + ")"
+	return BatchTarget + "(" + strings.Join(targets, ",") + ")"
 }
 
 // redactBatch passes every result of a replayed batch through the guards of its recorded

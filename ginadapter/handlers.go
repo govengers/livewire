@@ -85,7 +85,7 @@ func (h *handlers) call(mutation *livewire.Mutation) gin.HandlerFunc {
 }
 
 func (h *handlers) batch(ginContext *gin.Context) {
-	recorded := unit{target: "batch", kind: "batch"}
+	recorded := unit{target: livewire.BatchTarget, kind: livewire.BatchTarget}
 	body, err := h.readBody(ginContext)
 	if err != nil {
 		answer(ginContext, recorded, 0, nil, err)
@@ -96,10 +96,13 @@ func (h *handlers) batch(ginContext *gin.Context) {
 	answer(ginContext, recorded, http.StatusOK, payload, err)
 }
 
+// upload reads the file on the request, then runs the upload like a mutation, on a context
+// the client's disconnect does not cancel: a handler that stored the file somewhere commits
+// and is audited as what it did.
 func (h *handlers) upload(upload *livewire.Upload) gin.HandlerFunc {
 	recorded := unit{target: upload.Name(), kind: string(livewire.KindUpload)}
 	return func(ginContext *gin.Context) {
-		ctx := ginContext.Request.Context()
+		ctx := context.WithoutCancel(ginContext.Request.Context())
 		request := livewire.UploadRequest{
 			Target: upload.Name(), Source: sourceOf(ginContext),
 			IdempotencyKey: ginContext.GetHeader(IdempotencyKeyHeader), RequestID: requestID(ginContext),
@@ -117,10 +120,8 @@ func (h *handlers) upload(upload *livewire.Upload) gin.HandlerFunc {
 	}
 }
 
-const filtersTarget = "filters"
-
 func (h *handlers) saveFilter(ginContext *gin.Context) {
-	recorded := unit{target: filtersTarget, kind: filtersTarget}
+	recorded := unit{target: livewire.FiltersTarget, kind: livewire.FiltersTarget}
 	body, err := h.readBody(ginContext)
 	if err != nil {
 		answer(ginContext, recorded, 0, nil, err)
@@ -132,12 +133,12 @@ func (h *handlers) saveFilter(ginContext *gin.Context) {
 
 func (h *handlers) listFilters(ginContext *gin.Context) {
 	payload, err := h.engine.ListFilters(ginContext.Request.Context(), ginContext.Query("resource"))
-	answer(ginContext, unit{target: filtersTarget, kind: filtersTarget}, http.StatusOK, payload, err)
+	answer(ginContext, unit{target: livewire.FiltersTarget, kind: livewire.FiltersTarget}, http.StatusOK, payload, err)
 }
 
 func (h *handlers) deleteFilter(ginContext *gin.Context) {
 	err := h.engine.DeleteFilter(ginContext.Request.Context(), ginContext.Param("id"))
-	answer(ginContext, unit{target: filtersTarget, kind: filtersTarget}, http.StatusNoContent, nil, err)
+	answer(ginContext, unit{target: livewire.FiltersTarget, kind: livewire.FiltersTarget}, http.StatusNoContent, nil, err)
 }
 
 // readBody reads a JSON body of at most MaximumBodyBytes.

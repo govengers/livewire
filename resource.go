@@ -69,7 +69,10 @@ func ReadParametersFrom(source ParameterSource) (*ReadParameters, error) {
 
 // ItemKey says how a resource's item read addresses one row: the path parameter of the
 // item route (`{Parameter}` below the resource path) and the declared field it matches,
-// which must be filterable and of type uuid, string, text, enum, int or time.
+// which must be filterable and of type uuid, string, text, enum, int or time. On REST the
+// resource's own routes `distinct`, `export` and `presence` sit beside the item route and
+// win, so an item whose key is one of these words is readable on the socket only; a key of
+// type uuid never is.
 type ItemKey struct {
 	Parameter string
 	Field     string

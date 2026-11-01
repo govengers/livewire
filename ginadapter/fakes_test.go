@@ -68,7 +68,11 @@ func (t *transaction) hooks(onCommit, onRollback func()) {
 	t.onRollback = append(t.onRollback, onRollback)
 }
 
-func (t *transaction) Commit(context.Context) error {
+// Commit fails on a cancelled context, as a database driver does.
+func (t *transaction) Commit(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	for _, hook := range t.onCommit {
@@ -206,3 +210,25 @@ func (p *presences) List(_ context.Context, tenant, target, key string) ([]livew
 func (p *presences) Sweep(context.Context, time.Duration) (int, error) { return 0, nil }
 
 var errDatabaseGone = errors.New("the database went away")
+
+// audits keeps the audit entries; a write on a cancelled context fails, as on a database.
+type audits struct {
+	mutex   sync.Mutex
+	entries []livewire.AuditEntry
+}
+
+func (a *audits) Write(ctx context.Context, entry *livewire.AuditEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	a.entries = append(a.entries, *entry)
+	return nil
+}
+
+func (a *audits) written() []livewire.AuditEntry {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	return append([]livewire.AuditEntry(nil), a.entries...)
+}

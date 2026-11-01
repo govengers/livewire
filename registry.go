@@ -144,7 +144,7 @@ func (s *staging) stage(declaration Declaration) error {
 		return fmt.Errorf("livewire: %s %q: %w", kind, name, shared.err)
 	case shared.registry != nil && shared.registry != s.registry:
 		return fmt.Errorf("livewire: %s %q is registered with another registry", kind, name)
-	case name == batchMutation || name == filtersTarget:
+	case name == BatchTarget || name == FiltersTarget:
 		return fmt.Errorf("livewire: %s %q: the name is reserved: the outcomes of a batch and of the stored filter routes carry it as their target (D33, D59)", kind, name)
 	}
 	if _, exists := s.byName[name]; exists {

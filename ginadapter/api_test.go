@@ -79,6 +79,9 @@ type api struct {
 	mutex   sync.Mutex
 	parts   map[string]part
 	created atomic.Int64
+	// cancelRequest, when set, is called by a handler that gets the name or file "cancel": the
+	// client went away while its write ran.
+	cancelRequest atomic.Pointer[context.CancelFunc]
 }
 
 func (a *api) sorted() []part {
@@ -220,6 +223,7 @@ func (a *api) createPart() *livewire.Mutation {
 		Check: authorization.HasRole(roleWriter), Status: http.StatusCreated,
 		Handle: func(ctx context.Context, _ *livewire.NoParameters, body *createPart) (*part, error) {
 			a.created.Add(1)
+			a.cancelIf(body.Name)
 			item := part{ID: secondID, Name: body.Name}
 			transactionOf(ctx).hooks(func() { a.put(item) }, func() {})
 			return &item, nil
@@ -250,6 +254,12 @@ func (a *api) failPart() *livewire.Mutation {
 	})
 }
 
+func (a *api) cancelIf(text string) {
+	if cancel := a.cancelRequest.Load(); cancel != nil && text == "cancel" {
+		(*cancel)()
+	}
+}
+
 func (a *api) uploadPicture() *livewire.Upload {
 	return livewire.NewUpload("uploadPicture", "/parts/{id}/pictures", &livewire.UploadOptions[partParameters, picture]{
 		Check: authorization.HasRole(roleWriter), ContentTypes: []string{"image/png"}, MaximumBytes: 16,
@@ -257,6 +267,10 @@ func (a *api) uploadPicture() *livewire.Upload {
 			content, err := io.ReadAll(file.Body)
 			if err != nil {
 				return nil, err
+			}
+			a.cancelIf(strings.TrimSuffix(string(content), "-fail"))
+			if strings.HasSuffix(string(content), "-fail") {
+				return nil, errDatabaseGone
 			}
 			return &picture{Part: parameters.ID, Bytes: len(content), ContentType: file.ContentType, Filename: file.Filename}, nil
 		},
@@ -269,6 +283,7 @@ type testServer struct {
 	t      *testing.T
 	api    *api
 	people *identities
+	audits *audits
 	engine *livewire.Engine
 	router *gin.Engine
 	mutex  sync.Mutex
@@ -278,7 +293,7 @@ type testServer struct {
 func newServer(t *testing.T) *testServer {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	server := &testServer{t: t, api: &api{parts: map[string]part{firstID: {ID: firstID, Name: "bolt", Secret: "s1", Version: 1}}}}
+	server := &testServer{t: t, api: &api{parts: map[string]part{firstID: {ID: firstID, Name: "bolt", Secret: "s1", Version: 1}}}, audits: &audits{}}
 	people := &identities{people: map[string]*auth.Identity{
 		"ada":  {Provider: "test", Subject: "ada", Active: true, Roles: []string{roleReader, roleWriter}},
 		"rita": {Provider: "test", Subject: "rita", Active: true, Roles: []string{roleReader}},
@@ -287,7 +302,7 @@ func newServer(t *testing.T) *testServer {
 	engine, err := livewire.NewEngine(&livewire.EngineOptions{
 		Registry: server.api.registry(t), IdentitySource: people, Transactor: &transactor{},
 		FilterStore: &filters{stored: map[string]livewire.StoredFilter{}}, IdempotencyStore: &idempotency{records: map[string]*livewire.IdempotencyRecord{}},
-		PresenceStore: &presences{}, SameHostOnly: true,
+		AuditStore: server.audits, PresenceStore: &presences{}, SameHostOnly: true,
 	})
 	require.NoError(t, err)
 	server.engine, server.people = engine, people
@@ -327,6 +342,11 @@ func (s *testServer) do(method, path, subject string, body io.Reader, header htt
 	if subject != "" {
 		request.Header.Set(subjectHeader, subject)
 	}
+	return s.serve(request)
+}
+
+// serve serves one request and returns the recorder.
+func (s *testServer) serve(request *http.Request) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	s.router.ServeHTTP(recorder, request)
 	return recorder

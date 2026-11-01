@@ -26,8 +26,9 @@ const defaultMaximumBodyBytes = 1 << 20
 // registry's BasePath, with `{name}` placeholders as gin's `:name`:
 //
 //   - a resource: GET Path (list), ItemPath, DistinctPath, HistoryPath, PresencePath and
-//     ExportPath as far as it declares them;
-//   - a list: GET Path; an object: GET Path and PresencePath;
+//     ExportPath as far as it declares them, PresencePath only when the engine serves
+//     presence;
+//   - a list: GET Path; an object: GET Path and, with presence, PresencePath;
 //   - a mutation: its method and Path; an upload: POST Path;
 //   - the library's own: POST BatchPath, POST and GET FiltersPath, DELETE FiltersPath/:id.
 //
@@ -35,8 +36,9 @@ const defaultMaximumBodyBytes = 1 << 20
 // target (D46), every write an Engine.Call, Batch or Upload, so a REST body is byte for byte
 // the socket's payload (D23). A mutation and an upload run their static Check before the
 // body is read (D8): a refused request reads no body and is answered by the engine, which
-// runs the same Check first and reports the outcome. Mutations and batches run on a context
-// the client's disconnect does not cancel, so a write that started finishes as what it is.
+// runs the same Check first and reports the outcome. Mutations, batches and uploads (once
+// the file is read) run on a context the client's disconnect does not cancel, so a write
+// that started finishes, and is audited, as what it is.
 // The Idempotency-Key header is the call's key (D16), the X-Request-ID the wide-event
 // middleware answers with is its request id (D31). Every refusal and failure is answered
 // with livewire.ResponseFor's status and body. Each request's outcome is recorded on the
@@ -95,19 +97,24 @@ func (h *handlers) register(router gin.IRoutes, registry *livewire.Registry) (er
 
 type handleFunc func(method, path string, handler gin.HandlerFunc)
 
+// routedRead is a read kind of a declaration and its route, "" for none.
+type routedRead struct {
+	path string
+	kind livewire.ReadKind
+}
+
 func (h *handlers) registerDeclaration(handle handleFunc, declaration livewire.Declaration) {
 	name := declaration.Name()
 	switch typed := declaration.(type) {
 	case *livewire.Resource:
 		handle(http.MethodGet, typed.Path(), h.read(name, livewire.ReadMain))
-		reads := []struct {
-			path string
-			kind livewire.ReadKind
-		}{
+		reads := []routedRead{
 			{typed.ItemPath(), livewire.ReadItem},
 			{typed.DistinctPath(), livewire.ReadDistinct},
 			{typed.HistoryPath(), livewire.ReadHistory},
-			{typed.PresencePath(), livewire.ReadPresence},
+		}
+		if h.engine.ServesPresence() {
+			reads = append(reads, routedRead{typed.PresencePath(), livewire.ReadPresence})
 		}
 		for _, read := range reads {
 			if read.path != "" {
@@ -121,7 +128,9 @@ func (h *handlers) registerDeclaration(handle handleFunc, declaration livewire.D
 		handle(http.MethodGet, typed.Path(), h.read(name, livewire.ReadMain))
 	case *livewire.Object:
 		handle(http.MethodGet, typed.Path(), h.read(name, livewire.ReadMain))
-		handle(http.MethodGet, typed.PresencePath(), h.read(name, livewire.ReadPresence))
+		if h.engine.ServesPresence() {
+			handle(http.MethodGet, typed.PresencePath(), h.read(name, livewire.ReadPresence))
+		}
 	case *livewire.Mutation:
 		handle(typed.Method(), typed.Path(), h.call(typed))
 	case *livewire.Upload:

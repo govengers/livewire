@@ -396,6 +396,10 @@ func (e *Engine) RevalidateOwner(key string) {
 	}
 }
 
+// ServesPresence reports whether the engine has a PresenceStore, so presence reads and the
+// join and leave ops are on (D37).
+func (e *Engine) ServesPresence() bool { return e.options.PresenceStore != nil }
+
 // Registry is the registry the engine serves.
 func (e *Engine) Registry() *Registry { return e.registry }
 

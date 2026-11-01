@@ -20,8 +20,12 @@ const (
 	FiltersPath = "/filters" // POST stores, GET lists the caller's stored filters; DELETE FiltersPath/{id} removes one (D13)
 )
 
-// filtersTarget is the target of the stored filter routes' outcomes.
-const filtersTarget = "filters"
+// The targets of the outcomes of the library's own routes (D59); both are reserved names.
+// BatchTarget is also the prefix of the name a batch's Idempotency-Key is reserved under.
+const (
+	BatchTarget   = "batch"
+	FiltersTarget = "filters"
+)
 
 // reservedRoutes are the library's own routes as route patterns.
 var reservedRoutes = map[route]bool{
@@ -62,7 +66,7 @@ type FilterItem struct {
 // it is 404, without an identity 401. It reports an OutcomeRequest with the target
 // "filters".
 func (e *Engine) SaveFilter(ctx context.Context, body []byte) (json.RawMessage, error) {
-	unit := startUnit(OutcomeRequest, "", filtersTarget)
+	unit := startUnit(OutcomeRequest, "", FiltersTarget)
 	payload, owner, err := e.saveFilter(ctx, body)
 	e.observeFilters(ctx, unit, owner, err)
 	return payload, err
@@ -156,7 +160,7 @@ func (e *Engine) observeFilters(ctx context.Context, unit unitOfWork, owner Owne
 // that is not a registered filterable resource is 400; without a FilterStore it is 404,
 // without an identity 401.
 func (e *Engine) ListFilters(ctx context.Context, resource string) (json.RawMessage, error) {
-	unit := startUnit(OutcomeRequest, "", filtersTarget)
+	unit := startUnit(OutcomeRequest, "", FiltersTarget)
 	payload, owner, err := e.listFilters(ctx, resource)
 	e.observeFilters(ctx, unit, owner, err)
 	return payload, err
@@ -195,7 +199,7 @@ func (e *Engine) listFilters(ctx context.Context, resource string) (json.RawMess
 // is not there, or another owner's, is no error. Without a FilterStore it is 404, without an
 // identity 401.
 func (e *Engine) DeleteFilter(ctx context.Context, id string) error {
-	unit := startUnit(OutcomeRequest, "", filtersTarget)
+	unit := startUnit(OutcomeRequest, "", FiltersTarget)
 	owner, store, err := e.filterOwner(ctx)
 	if err == nil {
 		err = recovering(func() error { return store.Delete(WithTenant(ctx, owner.Tenant), owner, id) })

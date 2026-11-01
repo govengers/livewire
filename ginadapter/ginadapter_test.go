@@ -2,6 +2,7 @@ package ginadapter_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -114,9 +115,9 @@ func TestRESTBodiesEqualTheSocketPayloads(t *testing.T) {
 	}
 
 	for _, read := range []struct {
-		path   string
-		target string
-		params map[string]string
+		path       string
+		target     string
+		parameters map[string]string
 	}{
 		{"/api/parts?sort=-name", "parts", map[string]string{"sort": "-name"}},
 		{"/api/parts/" + firstID, "parts.item", map[string]string{"id": firstID}},
@@ -124,7 +125,7 @@ func TestRESTBodiesEqualTheSocketPayloads(t *testing.T) {
 		{"/api/stats?group=a", "stats", map[string]string{"group": "a"}},
 	} {
 		rest := server.do(http.MethodGet, read.path, "ada", nil, nil)
-		socket := ask(livewire.RequestFrame{ID: read.target, Operation: livewire.OperationQuery, Target: read.target, Parameters: read.params})
+		socket := ask(livewire.RequestFrame{ID: read.target, Operation: livewire.OperationQuery, Target: read.target, Parameters: read.parameters})
 		require.True(t, socket.OK, "%+v", socket.Error)
 		require.Equal(t, rest.Body.String(), string(socket.Payload), "REST and socket answer the same bytes (D23): %s", read.target)
 	}
@@ -252,7 +253,7 @@ func TestUploadRoute(t *testing.T) {
 		{"a multipart file past the limit", "ada", tooLarge, tooLargeType, http.StatusBadRequest},
 		{"a multipart part of another name", "ada", unnamed, unnamedType, http.StatusBadRequest},
 		{"a multipart part without a type", "ada", untyped, untypedType, http.StatusBadRequest},
-		{"the static check", "rita", strings.NewReader("png"), "image/png", http.StatusForbidden},
+		{"a malformed content type", "ada", strings.NewReader("png"), "image/png;;", http.StatusBadRequest},
 	}
 	for _, refusal := range refusals {
 		t.Run(refusal.name, func(t *testing.T) {
@@ -260,6 +261,60 @@ func TestUploadRoute(t *testing.T) {
 			require.Equal(t, refusal.status, response.Code, response.Body.String())
 		})
 	}
+}
+
+func TestARefusedUploadReadsNoBody(t *testing.T) {
+	server := newServer(t)
+	body := &countingReader{reader: strings.NewReader("png")}
+	refused := server.do(http.MethodPost, "/api/parts/"+firstID+"/pictures", "rita", body, http.Header{"Content-Type": {"image/png"}})
+	require.Equal(t, http.StatusForbidden, refused.Code)
+	require.Zero(t, body.read, "the static check runs before the body is read (D8)")
+}
+
+func TestWritesOutliveTheClientsDisconnect(t *testing.T) {
+	server := newServer(t)
+	within := func(method, path string, body io.Reader, header http.Header) *httptest.ResponseRecorder {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		server.api.cancelRequest.Store(&cancel)
+		defer server.api.cancelRequest.Store(nil)
+		request := httptest.NewRequestWithContext(ctx, method, path, body)
+		for name, values := range header {
+			request.Header[name] = values
+		}
+		request.Header.Set(subjectHeader, "ada")
+		return server.serve(request)
+	}
+	called := within(http.MethodPost, "/api/parts", strings.NewReader(`{"name":"cancel"}`), nil)
+	require.Equal(t, http.StatusCreated, called.Code, "the call commits though its client went away: %s", called.Body.String())
+	batched := within(http.MethodPost, "/api/batch", strings.NewReader(`[{"target":"createPart","body":{"name":"cancel"}}]`), nil)
+	require.Equal(t, http.StatusOK, batched.Code, batched.Body.String())
+	png := http.Header{"Content-Type": {"image/png"}}
+	path := "/api/parts/" + firstID + "/pictures"
+	require.Equal(t, http.StatusOK, within(http.MethodPost, path, strings.NewReader("cancel"), png).Code)
+	failed := within(http.MethodPost, path, strings.NewReader("cancel-fail"), png)
+	require.Equal(t, http.StatusInternalServerError, failed.Code)
+	entries := server.audits.written()
+	require.Len(t, entries, 4, "every write is audited, the failed upload after its rollback")
+	require.Equal(t, http.StatusInternalServerError, entries[3].Status)
+}
+
+func TestPresenceRoutesNeedAPresenceStore(t *testing.T) {
+	server := newServer(t)
+	engine, err := livewire.NewEngine(&livewire.EngineOptions{Registry: server.engine.Registry(), IdentitySource: server.people, Transactor: &transactor{}, SameHostOnly: true})
+	require.NoError(t, err)
+	router := gin.New()
+	require.NoError(t, ginadapter.RegisterRoutes(router, &ginadapter.Options{Engine: engine}))
+	var paths []string
+	for _, route := range router.Routes() {
+		paths = append(paths, route.Path)
+	}
+	require.NotContains(t, paths, "/api/parts/presence")
+	require.NotContains(t, paths, "/api/teams/:team/board/presence")
+	require.Contains(t, paths, "/api/parts/:id/history")
+	require.True(t, server.engine.ServesPresence())
+	require.False(t, engine.ServesPresence())
+	require.NoError(t, engine.Close(t.Context()))
 }
 
 func multipartFile(t *testing.T, field, filename, contentType, content string) (io.Reader, string) {
