@@ -3,6 +3,8 @@ import { FakeClock, fakeFetch, fakeSockets, json, settle } from './fakes'
 import {
   ApiError,
   Client,
+  EndedError,
+  createLivePair,
   FilterMemory,
   LiveConnection,
   NetworkError,
@@ -450,24 +452,6 @@ describe('LiveConnection', () => {
     expect(sockets).toHaveLength(1)
   })
 
-  test('4401 means the identity is gone: no reconnect until reconnect()', async () => {
-    let unauthorized = 0
-    const { connection, clock, sockets, current } = connect({ onUnauthorized: () => void unauthorized++ })
-    connection.subscribe(parts, {}, listener())
-    current().open()
-    current().end(4401)
-    expect([connection.status, unauthorized]).toEqual(['unauthorized', 1])
-    clock.advance(60_000)
-    expect(sockets).toHaveLength(1)
-    await expect(connection.query(notes, {})).rejects.toThrow('unauthorized')
-    connection.subscribe(parts, {}, listener())
-    expect(sockets).toHaveLength(1)
-    connection.reconnect()
-    expect(sockets).toHaveLength(2)
-    current().open()
-    expect(current().sent.filter((frame) => frame.op === 'subscribe')).toHaveLength(2)
-  })
-
   test('1001 reconnects at once with jitter, 1013 backs off and doubles', () => {
     const { connection, clock, sockets, current } = connect({ reconnectDelay: 40, random: () => 0 })
     connection.subscribe(parts, {}, listener())
@@ -498,58 +482,6 @@ describe('LiveConnection', () => {
     clock.advance(5)
     expect(sockets[0]?.closedWith).toBe(1005)
     expect(sockets).toHaveLength(2)
-  })
-
-  test('a changed identity replaces the socket, which the upgrade request authorized (D6)', async () => {
-    let identity = 'password:alice'
-    const { connection, clock, sockets, current } = connect({ identity: () => identity })
-    const received = listener<ListResponse<Part>>()
-    connection.subscribe(parts, {}, received)
-    current().open()
-    current().answer('subscribe', { subscription: 's1' })
-    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'secret of alice' }]) })
-    const owed = connection.query(notes, {})
-    identity = 'password:bob'
-    connection.checkIdentity()
-    expect(sockets).toHaveLength(2)
-    expect(sockets[0]?.closedWith).toBe(1000)
-    await expect(owed).rejects.toThrow('the identity changed')
-    current().open()
-    expect(current().last('subscribe').target).toBe('parts')
-    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([]) })
-    expect(received.states).toHaveLength(1)
-
-    identity = 'password:carol'
-    clock.advance(25_000)
-    expect(sockets).toHaveLength(3)
-    identity = 'password:dave'
-    void connection.ping().catch(() => {})
-    expect(sockets).toHaveLength(4)
-    connection.checkIdentity()
-    expect(sockets).toHaveLength(4)
-  })
-
-  test('after a 4401 another identity connects again', () => {
-    let identity = 'password:alice'
-    const { connection, sockets, current } = connect({ identity: () => identity })
-    connection.subscribe(parts, {}, listener())
-    current().open()
-    current().end(4401)
-    identity = 'password:bob'
-    connection.checkIdentity()
-    expect([sockets.length, connection.status]).toEqual([2, 'connecting'])
-  })
-
-  test('close() ends the socket for good until reconnect()', async () => {
-    const { connection, sockets, current } = connect()
-    connection.subscribe(parts, {}, listener())
-    current().open()
-    connection.close()
-    expect([connection.status, sockets[0]?.closedWith]).toEqual(['closed', 1000])
-    await expect(connection.query(notes, {})).rejects.toBeInstanceOf(NetworkError)
-    connection.reconnect()
-    expect(sockets).toHaveLength(2)
-    new LiveConnection({ url: () => 'wss://x', WebSocket: fakeSockets().Socket }).close()
   })
 
   test('a removal shows at once, pending, and the next push decides (D36)', async () => {
@@ -778,64 +710,9 @@ describe('LiveConnection', () => {
     await settle()
   })
 
-  test('the socket URL and the identity come from the options', () => {
-    const { Socket, current } = fakeSockets()
-    const connection = new LiveConnection({ url: () => 'wss://dynamic/socket', WebSocket: Socket, identity: () => 'password:user' })
-    expect(connection.identity()).toBe('password:user')
-    expect(new LiveConnection({ url: 'x' }).identity()).toBe('')
-    connection.subscribe(parts, {}, listener())
-    expect(current().url).toBe('wss://dynamic/socket')
-    connection.close()
-  })
 })
 
-describe('LiveConnection identity epochs (D66)', () => {
-  test('a switch during reconnect backoff fails the queued write and starts the subscriptions over as the new identity', async () => {
-    let identity = 'password:reader'
-    const { connection, clock, sockets, current, received } = subscribedList([{ id: 'a', name: 'private row of the reader' }], { identity: () => identity })
-    current().end(1006)
-    const write = connection.call(deletePart, { id: 'a' }, undefined)
-    identity = 'password:writer'
-    const before = received.states.length
-    clock.advance(10)
-    expect(sockets).toHaveLength(2)
-    current().open()
-    expect(current().sent.map((frame) => frame.op)).toEqual(['subscribe'])
-    await expect(write).rejects.toThrow('the identity changed')
-    expect(received.states.slice(before).every((state) => state.identity === 'password:writer' && state.data.items.every((item) => item.name !== 'private row of the reader'))).toBe(true)
-    current().answer('subscribe', { subscription: 's9' })
-    current().receive({ sub: 's9', seq: 1, kind: 'snapshot', payload: list([{ id: 'w', name: 'of the writer' }]) })
-    expect([received.last()?.identity, received.last()?.data.items[0]?.name]).toEqual(['password:writer', 'of the writer'])
-  })
-
-  test('a switch through checkIdentity drops the data, so nothing of the old identity is delivered under the new one', async () => {
-    let identity = 'password:alice'
-    const { connection, current, received } = subscribedList([{ id: 'a', name: 'of alice' }], { identity: () => identity })
-    const pending = connection.call(deletePart, { id: 'a' }, undefined)
-    const before = received.states.length
-    identity = 'password:bob'
-    connection.checkIdentity()
-    await expect(pending).rejects.toBeInstanceOf(NetworkError)
-    expect(received.states.slice(before)).toEqual([])
-    current().open()
-    expect(current().sent.some((frame) => frame.op === 'unsubscribe')).toBe(false)
-  })
-
-  test('close() fails a write queued during backoff and stops the reconnect: a new login sends nothing of it', async () => {
-    let identity = 'password:alice'
-    const { connection, clock, sockets, current } = subscribedList([], { identity: () => identity })
-    current().end(1006)
-    const write = connection.call(deletePart, { id: 'a' }, undefined)
-    connection.close()
-    clock.advance(60_000)
-    expect(sockets).toHaveLength(1)
-    identity = 'password:bob'
-    connection.reconnect()
-    current().open()
-    expect(current().sent.map((frame) => frame.op)).toEqual(['subscribe'])
-    await expect(write).rejects.toThrow('the connection was closed')
-  })
-
+describe('LiveConnection, one identity (D66)', () => {
   test('a subscribe without an answer ends at the request deadline', () => {
     const { connection, clock, current } = connect({ requestTimeout: 100 })
     const received = listener<ListResponse<Part>>()
@@ -905,5 +782,189 @@ describe('LiveConnection identity epochs (D66)', () => {
     current().open()
     current().receive({ id: current().last('subscribe').id, ok: false, status: 404, error: notFound })
     expect(current().last('subscribe').params).toEqual({ filter: '{"search":"x"}' })
+  })
+})
+
+/** A listener that also records the end of its connection. */
+function endingListener<Data>() {
+  const collected = listener<Data>()
+  let ends = 0
+  return { ...collected, end: () => void ends++, ends: () => ends }
+}
+
+describe('LiveConnection ends instead of switching identity (D66)', () => {
+  test('a switch during reconnect backoff ends it: the queued write fails, the listener is told, no socket opens for the new identity', async () => {
+    let identity = 'password:reader'
+    const { connection, clock, sockets, current } = connect({ identity: () => identity })
+    const received = endingListener<ListResponse<Part>>()
+    connection.subscribe(parts, {}, received)
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'private row of the reader' }]) })
+    current().end(1006)
+    const write = connection.call(deletePart, { id: 'a' }, undefined)
+    identity = 'password:writer'
+    const before = received.states.length
+    clock.advance(10)
+    expect([sockets.length, connection.status, received.ends()]).toEqual([1, 'ended', 1])
+    await expect(write).rejects.toBeInstanceOf(EndedError)
+    expect(received.states.slice(before)).toEqual([])
+  })
+
+  test('a non-reactive switch through checkIdentity ends it: owed requests fail with EndedError, listeners end, nothing is delivered after', async () => {
+    let identity = 'password:alice'
+    const { connection, current } = connect({ identity: () => identity })
+    const received = endingListener<ListResponse<Part>>()
+    connection.subscribe(parts, {}, received)
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'of alice' }]) })
+    const owed = connection.query(notes, {}).catch((error: unknown) => error)
+    const pending = connection.call(deletePart, { id: 'a' }, undefined).catch((error: unknown) => error)
+    const before = received.states.length
+    identity = 'password:bob'
+    connection.checkIdentity()
+    expect([connection.status, received.ends(), current().closedWith]).toEqual(['ended', 1, 1000])
+    expect(await owed).toBeInstanceOf(EndedError)
+    expect(await pending).toBeInstanceOf(EndedError)
+    expect(received.states.slice(before)).toEqual([])
+    await expect(connection.query(notes, {})).rejects.toBeInstanceOf(EndedError)
+    const late = endingListener<ListResponse<Part>>()
+    connection.subscribe(parts, {}, late)
+    expect(late.errors[0]).toBeInstanceOf(EndedError)
+    const registration = connection.join(presence, { key: 'k' }, {})
+    await expect(registration.ready).rejects.toBeInstanceOf(EndedError)
+  })
+
+  test('an ended connection delivers no optimistic change: neither a reconcile window nor a rollback reaches the listener', async () => {
+    const { connection, clock, current, received } = subscribedList([{ id: 'a', name: 'A' }], { reconcileWindow: 100 })
+    const settled = connection.call(createPart, {}, { name: 'z' })
+    current().answer('call', { payload: { id: 'z', name: 'z' } })
+    await settled
+    const inFlight = connection.call(createPart, {}, { id: 'y', name: 'y' }, { optimistic: { id: 'y', name: 'y' } })
+    const before = received.states.length
+    connection.end()
+    await expect(inFlight).rejects.toBeInstanceOf(EndedError)
+    clock.advance(100)
+    expect(received.states.slice(before)).toEqual([])
+  })
+
+  test('end() fails a write queued during backoff, stops the reconnect and sends nothing ever after', async () => {
+    const { connection, clock, sockets, current } = subscribedList([])
+    current().end(1006)
+    const write = connection.call(deletePart, { id: 'a' }, undefined)
+    connection.end()
+    connection.end()
+    clock.advance(60_000)
+    expect([sockets.length, connection.status, connection.ended]).toEqual([1, 'ended', true])
+    await expect(write).rejects.toBeInstanceOf(EndedError)
+  })
+
+  test('a 4401 ends it after onUnauthorized, with no reconnect', () => {
+    let unauthorized = 0
+    const { connection, clock, sockets, current } = connect({ onUnauthorized: () => void unauthorized++ })
+    const received = endingListener<ListResponse<Part>>()
+    connection.subscribe(parts, {}, received)
+    current().open()
+    current().end(4401)
+    clock.advance(60_000)
+    expect([connection.status, unauthorized, received.ends(), sockets.length]).toEqual(['ended', 1, 1, 1])
+  })
+
+  test('a socket that finishes its handshake after the identity changed sends nothing of what waited for it', async () => {
+    let identity = 'password:alice'
+    const { connection, current } = connect({ identity: () => identity })
+    const queued = connection.call(deletePart, { id: 'a' }, undefined)
+    connection.subscribe(parts, {}, listener())
+    identity = 'password:bob'
+    current().open()
+    expect(current().sent).toEqual([])
+    await expect(queued).rejects.toBeInstanceOf(EndedError)
+  })
+
+  test('a socket D54 retry after the end is not made', async () => {
+    const { connection, current } = connect()
+    connection.subscribe(parts, { filter: { search: 'bolt' } }, listener())
+    current().open()
+    current().answer('subscribe', { subscription: 's1', filterId: 'f1' })
+    const query = connection.query(parts, { filterId: 'f1' })
+    current().receive({ id: current().last('query').id, ok: false, status: 404, error: notFound })
+    connection.end()
+    await expect(query).rejects.toBeInstanceOf(EndedError)
+    expect(current().sent.filter((frame) => frame.op === 'query')).toHaveLength(1)
+  })
+
+  test('a subscribe answered after its deadline is unsubscribed', () => {
+    const { connection, clock, current } = connect({ requestTimeout: 100 })
+    connection.subscribe(parts, {}, listener())
+    current().open()
+    const late = current().last('subscribe')
+    clock.advance(100)
+    current().receive({ id: late.id, ok: true, status: 200, subscription: 's-late' })
+    expect(current().last('unsubscribe').target).toBe('s-late')
+  })
+
+  test('the connection serves the identity it answered at construction', () => {
+    let identity = 'password:user'
+    const { Socket, current } = fakeSockets()
+    const connection = new LiveConnection({ url: () => 'wss://dynamic/socket', WebSocket: Socket, identity: () => identity })
+    identity = 'password:other'
+    expect(connection.identity()).toBe('password:user')
+    expect(new LiveConnection({ url: 'x' }).identity()).toBe('')
+    identity = 'password:user'
+    connection.subscribe(parts, {}, listener())
+    expect(current().url).toBe('wss://dynamic/socket')
+  })
+})
+
+describe('Client ends instead of switching identity (D66)', () => {
+  const base = 'https://example.com/api/v1'
+
+  test('a mutation still awaiting its headers when the client ends is never sent', async () => {
+    let release: (headers: Record<string, string>) => void = () => {}
+    const { fetch, calls } = fakeFetch(json({ id: 'p', name: 'a' }, 201))
+    const client = new Client({ baseURL: base, fetch, identity: 'password:alice', headers: () => new Promise((resolve) => (release = resolve)) })
+    const call = client.call(createPart, {}, { name: 'a' })
+    await settle()
+    client.end()
+    release({ Authorization: 'Bearer of bob' })
+    await expect(call).rejects.toBeInstanceOf(EndedError)
+    expect(calls).toHaveLength(0)
+    expect([client.identity, client.ended]).toEqual(['password:alice', true])
+    await expect(client.read(notes, {})).rejects.toBeInstanceOf(EndedError)
+  })
+
+  test('a D54 retry after the end is not made', async () => {
+    const memory = new FilterMemory()
+    const stored = json({ id: 'f1', resource: 'parts', filter: { search: 'x' }, createdAt: '', lastUsedAt: '' }, 201)
+    let client: Client | undefined
+    const calls: string[] = []
+    const fetcher = async (input: string | URL | Request): Promise<Response> => {
+      calls.push(String(input))
+      if (calls.length === 1) return stored
+      client?.end() // the identity ends while the read is on its way
+      return json(notFound, 404)
+    }
+    client = new Client({ baseURL: base, fetch: fetcher as typeof fetch, filters: memory })
+    await client.saveFilter({ resource: 'parts', filter: { search: 'x' } })
+    await expect(client.read(parts, { filterId: 'f1' })).rejects.toBeInstanceOf(EndedError)
+    expect(calls).toHaveLength(2)
+    expect(memory.document('f1')).toBeUndefined()
+  })
+
+  test('a saveFilter answered after the end remembers nothing, and the pair\'s memory ends with either', async () => {
+    let answer: (response: Response) => void = () => {}
+    const fetcher = (() => new Promise<Response>((resolve) => (answer = resolve))) as unknown as typeof fetch
+    const pair = createLivePair({ identity: () => 'password:alice', client: { baseURL: base, fetch: fetcher }, connection: { url: 'wss://x', WebSocket: fakeSockets().Socket } })
+    const saving = pair.client.saveFilter({ resource: 'parts', filter: { search: 'x' } })
+    await settle()
+    pair.connection.end()
+    expect(pair.client.ended).toBe(true)
+    answer(json({ id: 'f1', resource: 'parts', filter: { search: 'x' }, createdAt: '', lastUsedAt: '' }, 201))
+    await saving.catch(() => {})
+    expect(pair.filters.document('f1')).toBeUndefined()
+    const second = createLivePair({ client: { baseURL: base }, connection: { url: 'wss://x' } })
+    second.end()
+    expect([second.identity, second.client.ended, second.connection.ended]).toEqual(['', true, true])
   })
 })

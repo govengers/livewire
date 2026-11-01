@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { createApp, effectScope, nextTick, reactive, ref } from 'vue'
+import { createApp, effectScope, nextTick, reactive, ref, shallowRef } from 'vue'
 import { FakeClock, fakeSockets, settle } from './fakes'
-import { LiveConnection, liveRead, mutation, type ListResponse, type PresenceItem } from './runtime'
-import { livePlugin, liveConnectionKey, useLive, useLiveConnection, useLiveList, useLivePresence, useLiveStatus, type SnapshotStorage } from './vue'
+import { LiveConnection, createLivePair, liveRead, mutation, type ListResponse, type LivePair, type PresenceItem } from './runtime'
+import { livePairKey, livePlugin, useLive, useLiveConnection, useLiveList, useLivePair, useLivePresence, useLiveStatus, type SnapshotStorage } from './vue'
 
 interface Part {
   id: string
@@ -135,24 +135,26 @@ describe('useLive', () => {
     expect([...storage.values.entries()]).toEqual([['livewire:identity', '']])
   })
 
-  test('an identity change in a mounted view drops the old data and subscribes on a new socket (D21, D6)', async () => {
+  test('a new connection (a new pair) drops the old data and pending changes and subscribes on it (D66)', async () => {
     const storage = new MemoryStorage()
-    const { connection, user, sockets, current } = connect('password:alice')
-    const live = effectScope().run(() => useLive(parts, {}, { connection, cache: true, storage }))!
-    current().open()
-    current().answer('subscribe', { subscription: 's1' })
-    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'secret of alice' }]) })
-    void connection.call(deletePart, { id: 'a' }, undefined).catch(() => {})
+    const alice = connect('password:alice')
+    const current = shallowRef(alice.connection)
+    const live = effectScope().run(() => useLive(parts, {}, { connection: current, cache: true, storage }))!
+    alice.current().open()
+    alice.current().answer('subscribe', { subscription: 's1' })
+    alice.current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'secret of alice' }]) })
+    void alice.connection.call(deletePart, { id: 'a' }, undefined).catch(() => {})
     expect(live.pending.value).toEqual(['a'])
-    user.value = 'password:bob'
+    const bob = connect('password:bob')
+    alice.connection.end()
+    current.value = bob.connection
     await nextTick()
     expect([live.data.value, live.pending.value, live.stale.value]).toEqual([undefined, [], true])
     expect([...storage.values.keys()]).toEqual(['livewire:identity'])
-    expect(sockets).toHaveLength(2)
-    current().open()
-    expect(current().sent.map((frame) => frame.op)).toEqual(['subscribe'])
-    current().answer('subscribe', { subscription: 's2' })
-    current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: list([{ id: 'b', name: 'of bob' }]) })
+    bob.current().open()
+    expect(bob.current().sent.map((frame) => frame.op)).toEqual(['subscribe'])
+    bob.current().answer('subscribe', { subscription: 's2' })
+    bob.current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: list([{ id: 'b', name: 'of bob' }]) })
     expect(live.data.value?.items[0]?.name).toBe('of bob')
     expect([...storage.values.keys()].some((key) => key.includes('password:bob'))).toBe(true)
   })
@@ -186,25 +188,38 @@ describe('useLive', () => {
 })
 
 describe('the connection', () => {
-  test('is provided by the plugin, given by options, or missing', () => {
-    const { connection } = connect()
+  test('is the provided pair\'s, the given one, or missing', async () => {
+    const first = createLivePair({ identity: () => 'password:alice', client: { baseURL: 'https://x' }, connection: { url: 'wss://x', WebSocket: fakeSockets().Socket } })
+    const pair = shallowRef<LivePair>(first)
     const app = createApp({})
-    app.use(livePlugin(connection))
-    expect(app.runWithContext(() => useLiveConnection())).toBe(connection)
-    expect(app._context.provides[liveConnectionKey as symbol]).toBe(connection)
-    expect(useLiveConnection(connection)).toBe(connection)
-    expect(() => useLiveConnection()).toThrow('no LiveConnection')
+    app.use(livePlugin(pair))
+    expect(app._context.provides[livePairKey as symbol]).toBe(pair)
+    const followed = app.runWithContext(() => useLiveConnection())
+    expect(followed.value).toBe(first.connection)
+    const second = createLivePair({ identity: () => 'password:bob', client: { baseURL: 'https://x' }, connection: { url: 'wss://x', WebSocket: fakeSockets().Socket } })
+    pair.value = second
+    expect(followed.value).toBe(second.connection)
+    expect(app.runWithContext(() => useLivePair())).toBe(pair)
+    const { connection } = connect()
+    expect(useLiveConnection(connection).value).toBe(connection)
+    expect(() => useLiveConnection()).toThrow('no pair provided')
   })
 
-  test('useLiveStatus follows it', () => {
+  test('useLiveStatus follows it, and a new connection', async () => {
     const { connection, current } = connect()
+    const followed = shallowRef(connection)
     const scope = effectScope()
-    const status = scope.run(() => useLiveStatus(connection))!
+    const status = scope.run(() => useLiveStatus(followed))!
     expect(status.value).toBe('idle')
     connection.subscribe(parts, {}, { next: () => {}, error: () => {} })
     expect(status.value).toBe('connecting')
     current().open()
     expect(status.value).toBe('open')
+    connection.end()
+    expect(status.value).toBe('ended')
+    followed.value = connect().connection
+    await nextTick()
+    expect(status.value).toBe('idle')
     scope.stop()
   })
 })
@@ -252,16 +267,21 @@ describe('useLiveList', () => {
     expect(subscribes(current().sent)).toBe(2)
   })
 
-  test('an identity change starts the list over', async () => {
-    const { connection, user, sockets } = connect()
-    const live = effectScope().run(() => useLiveList(parts, { connection }))!
-    sockets[0]?.open()
-    sockets[0]?.answer('subscribe', { subscription: 's1' })
-    sockets[0]?.receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }]) })
-    user.value = 'password:bob'
+  test('the end of the connection drops the pages, and a new connection starts the list over (D66)', async () => {
+    const alice = connect()
+    const followed = shallowRef(alice.connection)
+    const live = effectScope().run(() => useLiveList(parts, { connection: followed }))!
+    alice.current().open()
+    alice.current().answer('subscribe', { subscription: 's1' })
+    alice.current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }]) })
+    expect(live.items.value).toHaveLength(1)
+    alice.connection.end()
+    expect([live.items.value, live.total.value]).toEqual([[], undefined])
+    const bob = connect('password:bob')
+    followed.value = bob.connection
     await nextTick()
-    expect(live.items.value).toEqual([])
-    expect(sockets).toHaveLength(2)
+    bob.current().open()
+    expect(bob.current().last('subscribe').target).toBe('parts')
   })
 
   /** A cursor list with two loaded tiles: t1 holds a, b (next after-b), t2 c, d (next after-d). */
@@ -422,26 +442,30 @@ describe('useLivePresence', () => {
   })
 })
 
-describe('identity epochs in the views (D66)', () => {
-  test('a non-reactive switch through checkIdentity stores the new data under the new identity, never shown to the old one', () => {
+describe('one identity per pair in the views (D66)', () => {
+  test('a non-reactive switch through checkIdentity ends the view\'s data at once; the new pair\'s data is never shown to the old identity (D66)', async () => {
     const storage = new MemoryStorage()
-    let identity = 'password:alice'
+    let identity = 'password:admin'
+    const pairOf = () => createLivePair({ identity: () => identity, client: { baseURL: 'https://x' }, connection: { url: 'wss://x', WebSocket: fakes.Socket, clock: new FakeClock() } })
     const fakes = fakeSockets()
-    const connection = new LiveConnection({ url: 'wss://x', WebSocket: fakes.Socket, identity: () => identity, clock: new FakeClock() })
-    const view = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection, cache: true, storage }))!
+    const pair = shallowRef<LivePair>(pairOf())
+    const view = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: () => pair.value.connection, cache: true, storage }))!
     fakes.current().open()
     fakes.current().answer('subscribe', { subscription: 's1' })
-    fakes.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'of alice' } })
-    identity = 'password:bob'
-    connection.checkIdentity()
-    fakes.current().open()
-    expect(fakes.current().sent.some((frame) => frame.op === 'unsubscribe')).toBe(false)
-    fakes.current().answer('subscribe', { subscription: 's2' })
-    fakes.current().receive({ sub: 's2', seq: 1, kind: 'replace', payload: { title: 'secret of bob' } })
-    expect(view.data.value?.title).toBe('secret of bob')
+    fakes.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'guarded column of the admin' } })
+    identity = 'password:reader'
+    pair.value.connection.checkIdentity()
+    expect([view.data.value, view.stale.value, pair.value.client.ended]).toEqual([undefined, true, true])
 
-    identity = 'password:alice'
-    const remount = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: connect('password:alice').connection, cache: true, storage }))!
+    pair.value = pairOf()
+    await nextTick()
+    fakes.current().open()
+    fakes.current().answer('subscribe', { subscription: 's2' })
+    fakes.current().receive({ sub: 's2', seq: 1, kind: 'replace', payload: { title: 'secret of the reader' } })
+    expect(view.data.value?.title).toBe('secret of the reader')
+
+    identity = 'password:admin'
+    const remount = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: connect('password:admin').connection, cache: true, storage }))!
     expect(remount.data.value).toBeUndefined()
   })
 
@@ -494,5 +518,30 @@ describe('useLiveList limits and cursors', () => {
     current().receive({ id: refresh.id, ok: true, status: 200, payload: list([{ id: 'n', name: 'N' }, { id: 'a', name: 'A' }], { next: 'after-a' }) })
     await settle()
     expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-x' })
+  })
+
+  test('a snapshot with an unchanged next still outdates a read on its way, and clears a refused one (D64)', async () => {
+    const connected = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection: connected.connection, mode: 'cursor', limit: 2 }))!
+    const { current } = connected
+    current().open()
+    current().answer('subscribe', { subscription: 't1' })
+    current().receive({ sub: 't1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], { next: 'after-b' }) })
+    live.loadMore()
+    current().answer('subscribe', { subscription: 't2' })
+    const subscribes = current().sent.filter((frame) => frame.op === 'subscribe').length
+    current().receive({ sub: 't1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'c', name: 'C' }], removes: ['a'], order: ['c', 'b'] } })
+    const outdated = current().last('query')
+    current().receive({ sub: 't1', seq: 3, kind: 'snapshot', payload: list([{ id: 'c', name: 'C' }, { id: 'b', name: 'B' }], { next: 'after-b' }) })
+    current().receive({ id: outdated.id, ok: true, status: 200, payload: list([{ id: 'c', name: 'C' }, { id: 'y', name: 'Y' }], { next: 'after-y' }) })
+    await settle()
+    expect(current().sent.filter((frame) => frame.op === 'subscribe')).toHaveLength(subscribes)
+
+    current().receive({ sub: 't1', seq: 4, kind: 'diff', payload: { upserts: [{ id: 'd', name: 'D' }], removes: ['c'], order: ['d', 'b'] } })
+    current().receive({ id: current().last('query').id, ok: false, status: 500, error: { code: 'internal', message: 'x' } })
+    await settle()
+    expect(live.error.value).toBeDefined()
+    current().receive({ sub: 't1', seq: 5, kind: 'snapshot', payload: list([{ id: 'd', name: 'D' }, { id: 'b', name: 'B' }], { next: 'after-b' }) })
+    expect(live.error.value).toBeUndefined()
   })
 })

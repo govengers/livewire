@@ -1,7 +1,7 @@
 // Calls the generated client of the fixture registry the way an application does; tsc checks
 // it under the strictest settings, and every @ts-expect-error line must stay an error.
 
-import { effectScope } from 'vue'
+import { effectScope, shallowRef } from 'vue'
 import {
   calls,
   createPart,
@@ -26,13 +26,26 @@ import {
   deleteFilter,
 } from './api/api'
 import type { PartsFilter, HistoryFilter } from './api/filters'
-import { ApiError, Client, LiveConnection, NetworkError, batchCall, prepareCall, uuidv7 } from './api/runtime'
+import { ApiError, EndedError, NetworkError, batchCall, createLivePair, prepareCall, uuidv7, type LivePair } from './api/runtime'
 import type { ErrorCode, FixturePart, Kind, ListResponse, PresenceItem, Stat, Version } from './api/types'
-import { livePlugin, useLive, useLiveList, useLivePresence, useLiveStatus } from './api/vue'
+import { livePlugin, useLive, useLiveConnection, useLiveList, useLivePresence, useLiveStatus } from './api/vue'
 
-const client = new Client({ baseURL: 'https://example.com/api/v1', headers: () => ({ Authorization: 'Bearer key' }) })
-const connection = new LiveConnection({ url: 'wss://example.com/api/v1/socket', identity: () => 'password:user' })
-export const plugin = livePlugin(connection)
+let session = 'password:user'
+const pairOf = (): LivePair => createLivePair({
+  identity: () => session,
+  client: { baseURL: 'https://example.com/api/v1', headers: () => ({ Authorization: 'Bearer key' }) },
+  connection: { url: 'wss://example.com/api/v1/socket' },
+})
+const pair = shallowRef(pairOf())
+export const plugin = livePlugin(pair)
+const { client, connection } = pair.value
+
+/** An account switch: end the old pair, provide the new one; the composables follow it. */
+export function switchAccount(next: string): void {
+  pair.value.end()
+  session = next
+  pair.value = pairOf()
+}
 
 export async function rest(): Promise<void> {
   const page: ListResponse<FixturePart> = await getParts(client)
@@ -137,6 +150,7 @@ export function socket(): void {
   const prepared = prepareCall(calls.createPart, { name: 'a', kind: 'bolt' })
   void connection.call(calls.createPart, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey, signal: new AbortController().signal })
   connection.checkIdentity()
+  console.log(connection.ended, client.ended, client.identity, new EndedError('x') instanceof NetworkError)
   // @ts-expect-error notes is not live
   connection.subscribe(live.notes, {}, { next: () => {}, error: () => {} })
   // @ts-expect-error a mutation's body
@@ -148,7 +162,8 @@ export function composables(): void {
     const parts = useLive(live.parts, { limit: 10 }, { cache: true, connection })
     const first: FixturePart | undefined = parts.data.value?.items[0]
     const loading: boolean = parts.loading.value
-    const dashboard = useLive(live.dashboard, () => ({ board: 'b' }), { connection })
+    const dashboard = useLive(live.dashboard, () => ({ board: 'b' }), { connection: () => pair.value.connection })
+    console.log(useLiveConnection(() => pair.value.connection).value.identity())
     const list = useLiveList(live.parts, { connection, mode: 'cursor', limit: 20, sort: ['-createdAt'] })
     list.filter.value = { where: { field: 'name', op: 'startsWith', value: 'b' } }
     list.loadMore()
