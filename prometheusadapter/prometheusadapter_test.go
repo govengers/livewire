@@ -127,4 +127,13 @@ func TestNewValidatesAndReturnsRegistrationErrors(t *testing.T) {
 	require.NoError(t, err)
 	_, err = prometheusadapter.New(&prometheusadapter.Options{Registerer: registry})
 	require.ErrorContains(t, err, "register", "a second set on one registry is refused, not panicked")
+
+	taken := prometheus.NewRegistry()
+	sockets := prometheus.NewGauge(prometheus.GaugeOpts{Name: "livewire_sockets", Help: "Open sockets."})
+	require.NoError(t, taken.Register(sockets))
+	_, err = prometheusadapter.New(&prometheusadapter.Options{Registerer: taken})
+	require.Error(t, err, "the fifth collector's name is taken")
+	require.True(t, taken.Unregister(sockets))
+	_, err = prometheusadapter.New(&prometheusadapter.Options{Registerer: taken})
+	require.NoError(t, err, "the failed New left none of its collectors behind")
 }

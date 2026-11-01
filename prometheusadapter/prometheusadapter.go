@@ -41,7 +41,8 @@ type Metrics struct {
 }
 
 // New builds the collectors and registers them on options.Registerer; a registration error
-// (a collector registered twice) is returned.
+// (a collector registered twice) is returned, with the collectors registered before it
+// unregistered again, so a corrected retry starts from a clean registry.
 func New(options *Options) (*Metrics, error) {
 	if options == nil || options.Registerer == nil {
 		return nil, errors.New("prometheusadapter: New needs options with a Registerer")
@@ -59,8 +60,12 @@ func New(options *Options) (*Metrics, error) {
 		queryWaits:         histogramVector(namespace, "query_wait_seconds", "Wait of the socket work for the engine's query slots, by socket operation (rerun and revalidate for the background work).", "operation"),
 		backgroundFailures: counterVector(namespace, "background_failures_total", "Failures of the background work: the change feed, the presence heartbeat, the identity re-validation.", "kind"),
 	}
-	for _, collector := range metrics.collectors() {
+	collectors := metrics.collectors()
+	for index, collector := range collectors {
 		if err := options.Registerer.Register(collector); err != nil {
+			for _, registered := range collectors[:index] {
+				options.Registerer.Unregister(registered)
+			}
 			return nil, fmt.Errorf("prometheusadapter: register the livewire collectors: %w", err)
 		}
 	}
