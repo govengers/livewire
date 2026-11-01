@@ -3,13 +3,16 @@ package livewire_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"testing"
 
 	"github.com/govengers/auth"
+	"github.com/govengers/auth/authorization"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
+	"github.com/govengers/livewire/query"
 )
 
 func TestExportStreamsTheVisibleColumns(t *testing.T) {
@@ -63,4 +66,29 @@ func TestExportStreamsTheVisibleColumns(t *testing.T) {
 			requireStatus(t, err, testCase.status)
 		})
 	}
+}
+
+func TestExportColumnsNameTheColumnsInOrder(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	var columns []string
+	resource := livewire.NewResource("ordered", "/ordered", &livewire.ResourceOptions[gadget]{
+		Read: authorization.IsUser(), Fields: gadgetFields(), ExportColumns: []string{"name", "id"},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[gadget], error) {
+			return &livewire.Page[gadget]{}, nil
+		},
+		Export: func(_ context.Context, _ *query.ListQuery, fields query.Fields, _ io.Writer) (int, error) {
+			for _, field := range fields {
+				columns = append(columns, field.Name)
+			}
+			return 0, nil
+		},
+	})
+	require.NoError(t, registry.Add(resource))
+	require.Equal(t, "/ordered/export", resource.ExportPath())
+	engine, err := livewire.NewEngine(&livewire.EngineOptions{Registry: registry, IdentitySource: newFakeIdentities(), Transactor: &fakeTransactor{}, SameHostOnly: true})
+	require.NoError(t, err)
+	_, err = engine.Export(auth.WithIdentity(t.Context(), person("ada")), livewire.ExportRequest{Target: "ordered", Writer: io.Discard})
+	require.NoError(t, err)
+	require.Equal(t, []string{"name", "id"}, columns)
 }
