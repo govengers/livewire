@@ -1,0 +1,10 @@
+{
+  "name": "livewire-runtime",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "5.9.3",
+    "vue": "3.5.44"
+  }
+}

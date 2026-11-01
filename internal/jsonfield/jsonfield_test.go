@@ -1,4 +1,4 @@
-package livewire
+package jsonfield
 
 import (
 	"encoding/json"
@@ -97,13 +97,13 @@ type shallowDiamond struct {
 	diamondBase
 }
 
-type skipped struct {
+type skippedFields struct {
 	Hidden   string `json:"-"`
 	Exported string
 	hidden   string //nolint:unused // encoding/json skips unexported fields; so must we
 }
 
-func TestJSONFieldsOfMatchesEncodingJSON(t *testing.T) {
+func TestOfMatchesEncodingJSON(t *testing.T) {
 	testCases := []struct {
 		name  string
 		value any
@@ -115,7 +115,7 @@ func TestJSONFieldsOfMatchesEncodingJSON(t *testing.T) {
 		{name: "a tagged field beats an untagged one at the same depth", value: taggedBeatsUntagged{}},
 		{name: "recursive embedding ends", value: recursive{ID: "r"}},
 		{name: "mutually recursive embedding ends", value: mutualA{Left: "a", mutualB: &mutualB{Right: "b"}}},
-		{name: "skipped and unexported fields", value: skipped{Exported: "e"}},
+		{name: "skipped and unexported fields", value: skippedFields{Exported: "e"}},
 		{name: "diamond cancels the shared field", value: diamond{diamondLeft: diamondLeft{Left: "l"}, diamondRight: diamondRight{Right: "r"}}},
 		{name: "shallow occurrence wins the diamond", value: shallowDiamond{diamondBase: diamondBase{Shared: "s"}}},
 	}
@@ -125,20 +125,20 @@ func TestJSONFieldsOfMatchesEncodingJSON(t *testing.T) {
 			require.NoError(t, err)
 			var object map[string]json.RawMessage
 			require.NoError(t, json.Unmarshal(marshaled, &object))
-			require.ElementsMatch(t, slices.Collect(keysOf(object)), slices.Collect(keysOf(jsonFieldsOf(reflect.TypeOf(testCase.value)))), "%s", marshaled)
+			require.ElementsMatch(t, slices.Collect(keysOf(object)), slices.Collect(keysOf(ByName(reflect.TypeOf(testCase.value)))), "%s", marshaled)
 		})
 	}
 }
 
-func TestJSONFieldsOfReportsTheDominantField(t *testing.T) {
-	fields := jsonFieldsOf(reflect.TypeFor[*outerPointerWins]())
+func TestByNameReportsTheDominantField(t *testing.T) {
+	fields := ByName(reflect.TypeFor[outerPointerWins]())
 	require.Equal(t, reflect.TypeFor[string](), fields["id"].Type, "the shallow value field, not the embedded pointer")
 	require.Equal(t, reflect.TypeFor[int](), fields["depth"].Type)
 
-	fields = jsonFieldsOf(reflect.TypeFor[taggedBeatsUntagged]())
+	fields = ByName(reflect.TypeFor[taggedBeatsUntagged]())
 	require.Equal(t, `json:"Value"`, string(fields["Value"].Tag))
 
-	require.Empty(t, jsonFieldsOf(reflect.TypeFor[string]()))
+	require.Empty(t, ByName(reflect.TypeFor[string]()))
 }
 
 func keysOf[Value any](values map[string]Value) func(yield func(string) bool) {
@@ -149,4 +149,31 @@ func keysOf[Value any](values map[string]Value) func(yield func(string) bool) {
 			}
 		}
 	}
+}
+
+type options struct {
+	Plain    string  `json:"plain"`
+	Empty    string  `json:"empty,omitempty"`
+	Zero     int     `json:"zero,omitzero"`
+	Count    int64   `json:"count,string"`
+	Pointer  *bool   `json:"pointer,string"`
+	Ignored  []int   `json:"ignored,string"` //nolint:staticcheck // SA5008: the string option does not apply to a slice, under test
+	Both     *string `json:"both,omitempty,omitzero"`
+	Untagged int
+}
+
+func TestOfReadsTheOptionsInEncodingJSONOrder(t *testing.T) {
+	fields := Of(reflect.TypeFor[options]())
+	names := make([]string, 0, len(fields))
+	for _, field := range fields {
+		names = append(names, field.Name)
+	}
+	require.Equal(t, []string{"plain", "empty", "zero", "count", "pointer", "ignored", "both", "Untagged"}, names)
+	require.Equal(t, Field{Name: "empty", StructField: fields[1].StructField, OmitEmpty: true}, fields[1])
+	require.True(t, fields[2].OmitZero)
+	require.True(t, fields[3].Quoted)
+	require.True(t, fields[4].Quoted, "behind one pointer level")
+	require.False(t, fields[5].Quoted)
+	require.True(t, fields[6].OmitEmpty && fields[6].OmitZero)
+	require.Nil(t, Of(reflect.TypeFor[*options]()), "a pointer is not a struct")
 }
