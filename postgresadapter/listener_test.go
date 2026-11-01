@@ -86,7 +86,7 @@ func TestListenerResynchronizesOnEveryConnectAndDeliversChanges(t *testing.T) {
 	first := insertPart(t, database, "bolt")
 	require.Eventually(t, func() bool { changes, _, _ := delivered.snapshot(); return len(changes) == 1 }, 5*time.Second, 10*time.Millisecond)
 
-	_, err = database.pool.Exec(t.Context(), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'livewire_listener'")
+	_, err = database.pool.Exec(t.Context(), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND application_name = 'livewire_listener'")
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { _, resyncs, _ := delivered.snapshot(); return resyncs == 2 }, 5*time.Second, 10*time.Millisecond)
 	second := insertPart(t, database, "nut")
@@ -112,7 +112,7 @@ func TestListenerPingsASilentConnection(t *testing.T) {
 	runListener(t, listener)
 	require.Eventually(t, func() bool {
 		var pinged bool
-		err := database.pool.QueryRow(t.Context(), "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE application_name = 'livewire_pinged' AND query = '-- ping')").Scan(&pinged)
+		err := database.pool.QueryRow(t.Context(), "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = current_database() AND application_name = 'livewire_pinged' AND query = '-- ping')").Scan(&pinged)
 		return err == nil && pinged
 	}, 5*time.Second, 10*time.Millisecond)
 }

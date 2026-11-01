@@ -136,7 +136,7 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 	require.Eventually(t, func() bool {
 		var listening bool
 		err := database.pool.QueryRow(t.Context(), `SELECT EXISTS (SELECT FROM pg_stat_activity
-			WHERE application_name = 'livewire_engine_feed' AND state = 'idle' AND query LIKE 'LISTEN%')`).Scan(&listening)
+			WHERE datname = current_database() AND application_name = 'livewire_engine_feed' AND state = 'idle' AND query LIKE 'LISTEN%')`).Scan(&listening)
 		return err == nil && listening
 	}, 5*time.Second, 10*time.Millisecond, "the engine's feed listens")
 	return &liveEngine{engine: engine, server: server}

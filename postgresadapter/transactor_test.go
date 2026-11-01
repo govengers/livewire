@@ -155,6 +155,7 @@ func TestWritesAreReadCommittedWhateverTheDefault(t *testing.T) {
 	t.Cleanup(repeatable.Close)
 	write, err := newTransactor(t, repeatable).Begin(t.Context(), livewire.TransactionDetails{Mutation: "createPart"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = write.Rollback(context.Background()) }) // before repeatable.Close, or a failed assertion hangs it; ErrTxClosed after the rollback below
 	require.Equal(t, "read committed", settings(t, write.Handle().(postgresadapter.DBTX)).Isolation,
 		"a write sees the record a concurrent call committed (D16)")
 	require.NoError(t, write.Rollback(t.Context()))
