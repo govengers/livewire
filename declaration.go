@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/govengers/auth/authorization"
+
+	"github.com/govengers/livewire/internal/jsonfield"
 )
 
 // Kind is the kind of a declaration.
@@ -198,193 +200,11 @@ func intOrDefault(value, fallback int) int {
 	return value
 }
 
-// jsonFieldsOf maps the JSON names of a struct's marshaled fields to the fields, following
-// encoding/json's typeFields: one embedding level at a time, a type visited once (the
-// shallowest occurrence), a type embedded twice at one level cancels its fields, embedded
-// structs (by value or pointer) flatten unless their tag names them, a tagged field beats
-// untagged ones at the same depth, and a name that stays ambiguous is dropped. Every field
-// carries its index path from itemType, as reflect's FieldByName reports it. A type that is
-// not a struct has no fields.
+// jsonFieldsOf maps the JSON names of a type's marshaled fields (pointers unwrapped) to the
+// fields, as encoding/json picks them (jsonfield.ByName); a type that is not a struct has
+// none.
 func jsonFieldsOf(itemType reflect.Type) map[string]reflect.StructField {
-	itemType = unwrapPointer(itemType)
-	fields := map[string]reflect.StructField{}
-	if itemType.Kind() != reflect.Struct {
-		return fields
-	}
-	byName := collectJSONFields(itemType)
-	for name, candidates := range byName {
-		if winner, ok := dominantJSONField(candidates); ok {
-			fields[name] = winner
-		}
-	}
-	return fields
-}
-
-type jsonFieldCandidate struct {
-	field  reflect.StructField
-	depth  int
-	tagged bool
-}
-
-// embeddedLevel is a struct type on one embedding level with the index path that reaches
-// it from the outer type.
-type embeddedLevel struct {
-	structType reflect.Type
-	depth      int
-	index      []int
-}
-
-// collectJSONFields walks the embedding levels breadth first and returns every candidate by
-// JSON name; a type that occurs twice on one level has its candidates listed twice so the
-// dominance rule drops them, like encoding/json.
-func collectJSONFields(itemType reflect.Type) map[string][]jsonFieldCandidate {
-	collector := &jsonFieldCollector{byName: map[string][]jsonFieldCandidate{}, visited: map[reflect.Type]bool{}}
-	current := []embeddedLevel{{structType: itemType, depth: 0}}
-	count := map[reflect.Type]int{itemType: 1}
-	for len(current) > 0 {
-		current, count = collector.collectLevel(current, count)
-	}
-	return collector.byName
-}
-
-type jsonFieldCollector struct {
-	byName  map[string][]jsonFieldCandidate
-	visited map[reflect.Type]bool
-}
-
-// collectLevel records the named fields of one embedding level and returns the next level
-// with how often each type occurs on it.
-func (c *jsonFieldCollector) collectLevel(current []embeddedLevel, count map[reflect.Type]int) ([]embeddedLevel, map[reflect.Type]int) {
-	var next []embeddedLevel
-	nextCount := map[reflect.Type]int{}
-	for _, level := range current {
-		if c.visited[level.structType] {
-			continue
-		}
-		c.visited[level.structType] = true
-		for position := range level.structType.NumField() {
-			field := level.structType.Field(position)
-			field.Index = append(slices.Clone(level.index), position)
-			embeddedType := unwrapPointer(field.Type)
-			switch classifyJSONField(field, embeddedType) {
-			case jsonFieldSkipped:
-			case jsonFieldFlattens:
-				nextCount[embeddedType]++
-				if nextCount[embeddedType] == 1 {
-					next = append(next, embeddedLevel{structType: embeddedType, depth: level.depth + 1, index: field.Index})
-				}
-			case jsonFieldNamed:
-				c.record(field, level.depth, count[level.structType])
-			}
-		}
-	}
-	return next, nextCount
-}
-
-// record lists the candidate once per occurrence of its struct on the level, so a struct
-// embedded twice cancels its fields in the dominance rule.
-func (c *jsonFieldCollector) record(field reflect.StructField, depth, occurrences int) {
-	name, tagged, _ := jsonName(field)
-	candidate := jsonFieldCandidate{field: field, depth: depth, tagged: tagged}
-	for range max(occurrences, 1) {
-		c.byName[name] = append(c.byName[name], candidate)
-	}
-}
-
-type jsonFieldClass int
-
-const (
-	jsonFieldSkipped jsonFieldClass = iota
-	jsonFieldFlattens
-	jsonFieldNamed
-)
-
-func classifyJSONField(field reflect.StructField, embeddedType reflect.Type) jsonFieldClass {
-	_, tagged, included := jsonName(field)
-	embeddedStruct := field.Anonymous && embeddedType.Kind() == reflect.Struct
-	switch {
-	case !included:
-		return jsonFieldSkipped
-	case embeddedStruct && !tagged:
-		return jsonFieldFlattens
-	case field.IsExported() || embeddedStruct:
-		return jsonFieldNamed
-	default:
-		return jsonFieldSkipped
-	}
-}
-
-func dominantJSONField(candidates []jsonFieldCandidate) (reflect.StructField, bool) {
-	shallowest := slices.MinFunc(candidates, func(left, right jsonFieldCandidate) int { return left.depth - right.depth })
-	var atDepth, tagged []jsonFieldCandidate
-	for _, candidate := range candidates {
-		if candidate.depth == shallowest.depth {
-			atDepth = append(atDepth, candidate)
-			if candidate.tagged {
-				tagged = append(tagged, candidate)
-			}
-		}
-	}
-	switch {
-	case len(atDepth) == 1:
-		return atDepth[0].field, true
-	case len(tagged) == 1:
-		return tagged[0].field, true
-	default:
-		return reflect.StructField{}, false
-	}
-}
-
-// jsonName is the field's JSON name, whether the tag names it and whether encoding/json
-// marshals the field at all (`json:"-"` does not). A tag with options only
-// (`json:",omitempty"`) does not name the field. The name is read back from encoding/json
-// itself (a one-field struct with the field's tag is marshaled), so it follows the
-// toolchain's own tag rules: which names it accepts, where it cuts an odd one, when it falls
-// back to the Go name.
-func jsonName(field reflect.StructField) (name string, tagged, included bool) {
-	tagName, _, _ := strings.Cut(field.Tag.Get("json"), ",")
-	if tagName == "" {
-		return field.Name, false, true
-	}
-	key, included := probeJSONKey(field.Tag, jsonProbeField)
-	if !included {
-		return "", false, false
-	}
-	if key == jsonProbeField {
-		// Either the tag names the field "Probe" or encoding/json fell back to the Go name: a
-		// second probe under another Go name tells them apart.
-		if other, _ := probeJSONKey(field.Tag, jsonOtherProbeField); other == jsonOtherProbeField {
-			return field.Name, false, true
-		}
-	}
-	return key, true, true
-}
-
-const (
-	jsonProbeField      = "Probe"
-	jsonOtherProbeField = "OtherProbe"
-)
-
-var stringType = reflect.TypeFor[string]()
-
-// probeJSONKey marshals a one-field struct named goName carrying tag and returns the key
-// encoding/json wrote, or false when it wrote none.
-func probeJSONKey(tag reflect.StructTag, goName string) (string, bool) {
-	probeType := reflect.StructOf([]reflect.StructField{{Name: goName, Type: stringType, Tag: tag}})
-	probe := reflect.New(probeType).Elem()
-	probe.Field(0).SetString("x")
-	marshaled, err := json.Marshal(probe.Interface())
-	if err != nil {
-		return "", false
-	}
-	var keys map[string]json.RawMessage
-	if json.Unmarshal(marshaled, &keys) != nil {
-		return "", false
-	}
-	for key := range keys {
-		return key, true
-	}
-	return "", false
+	return jsonfield.ByName(unwrapPointer(itemType))
 }
 
 // unwrapPointer follows pointers to the type they point to; a pointer chain that loops
