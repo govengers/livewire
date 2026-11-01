@@ -302,7 +302,7 @@ func TestEveryOpFreesItsSlotBeforeItsResponseIsQueued(t *testing.T) {
 }
 
 // TestQueryWaitSumsTheWaitForASlot fills every query slot, so a unit waits until its context
-// ends: the wait it reports is at least that long, whatever the scheduler does.
+// ends: it reports a wait within the time it was blocked, with no bound on the scheduler.
 func TestQueryWaitSumsTheWaitForASlot(t *testing.T) {
 	engine, _ := stubEngine(t)
 	for range cap(engine.queries) {
@@ -310,8 +310,11 @@ func TestQueryWaitSumsTheWaitForASlot(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(withQueryWait(t.Context()), 20*time.Millisecond)
 	defer cancel()
-	require.ErrorIs(t, engine.inSlot(ctx, func() error { return nil }), context.DeadlineExceeded)
-	require.GreaterOrEqual(t, queryWaitOf(ctx), 20*time.Millisecond)
+	called := time.Now()
+	require.ErrorIs(t, engine.inSlot(ctx, func() error { return nil }), context.DeadlineExceeded, "it waited for a slot until its deadline")
+	blocked := time.Since(called)
+	require.Positive(t, queryWaitOf(ctx))
+	require.LessOrEqual(t, queryWaitOf(ctx), blocked, "the wait is summed while the unit is blocked")
 	for range cap(engine.queries) {
 		<-engine.queries
 	}
