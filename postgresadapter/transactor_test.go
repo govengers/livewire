@@ -70,6 +70,7 @@ func TestTransactorSetsTheSettingsForTheTransactionOnly(t *testing.T) {
 		Tenant: "north", Identity: identity, Mutation: "createPart", Parameters: map[string]int{"x": 1}, RequestID: "request-1",
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = write.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	handle := write.Handle().(postgresadapter.DBTX)
 	seen := settings(t, handle)
 	require.JSONEq(t, `{"actor":"github:42","realActor":"password:admin","mutation":"createPart","requestId":"request-1"}`, seen.Actor)
@@ -82,6 +83,7 @@ func TestTransactorSetsTheSettingsForTheTransactionOnly(t *testing.T) {
 
 	read, err := transactor.Begin(t.Context(), livewire.TransactionDetails{Tenant: "south", ReadOnly: true})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = read.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	handle = read.Handle().(postgresadapter.DBTX)
 	require.Equal(t, transactionSettings{Tenant: "south", Isolation: "repeatable read", ReadOnly: "on"}, settings(t, handle))
 	_, err = handle.Exec(t.Context(), "INSERT INTO parts (name) VALUES ('bolt')")
@@ -98,6 +100,7 @@ func TestTheHandleRunsEveryQueryMethodButCannotEndTheTransaction(t *testing.T) {
 	database := newDatabase(t)
 	transaction, err := newTransactor(t, database.pool).Begin(t.Context(), livewire.TransactionDetails{Mutation: "createPart"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = transaction.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	handle := transaction.Handle()
 	_, commits := handle.(interface{ Commit(context.Context) error })
 	require.False(t, commits)
@@ -143,6 +146,7 @@ func TestTransactorFailures(t *testing.T) {
 	require.Error(t, err, "a setting PostgreSQL refuses fails the begin")
 	transaction, err := transactor.Begin(t.Context(), livewire.TransactionDetails{Tenant: "north"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = transaction.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	require.NoError(t, transaction.Rollback(t.Context()))
 	require.Zero(t, database.pool.Stat().AcquiredConns(), "the failed begins returned their connections")
 }

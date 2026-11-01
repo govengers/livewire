@@ -11,6 +11,7 @@ import (
 
 	"github.com/govengers/auth"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
@@ -40,6 +41,7 @@ func TestTriggerNotifiesNothingOnRollback(t *testing.T) {
 	listening := notifications(t, database)
 	transaction, err := database.pool.Begin(t.Context())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = transaction.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	_, err = transaction.Exec(t.Context(), "INSERT INTO parts (name) VALUES ('bolt')")
 	require.NoError(t, err)
 	require.NoError(t, transaction.Rollback(t.Context()))
@@ -188,6 +190,7 @@ func TestHistoryAppendsVersionsWithTheActorOfTheTransaction(t *testing.T) {
 
 	transaction, err := transactor.Begin(t.Context(), livewire.TransactionDetails{Identity: impersonated, Mutation: "createPart", RequestID: "request-1"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = transaction.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	handle := transaction.Handle().(postgresadapter.DBTX)
 	var id string
 	require.NoError(t, handle.QueryRow(t.Context(), "INSERT INTO parts (name) VALUES ('bolt') RETURNING id::text").Scan(&id))
@@ -298,39 +301,30 @@ func TestAuditMaintainCutsUTCMonthsWhateverTheSessionTimeZone(t *testing.T) {
 
 func TestAuditMaintainHoldsUnderConcurrentWrites(t *testing.T) {
 	t.Parallel()
-	database := newDatabase(t)
-	ctx, stop := context.WithCancel(t.Context())
-	var writers sync.WaitGroup
-	var written atomic.Int64
-	var mutex sync.Mutex
-	var failures []error
-	for range 4 {
-		writers.Go(func() {
-			for ctx.Err() == nil {
-				_, err := database.pool.Exec(ctx, `INSERT INTO livewire_audit (at, mutation, request_id, status, duration_ms)
-					VALUES ('2026-03-15T12:00:00Z', 'createPart', 'concurrent', 201, 1)`)
-				switch {
-				case err == nil:
-					written.Add(1)
-				case ctx.Err() == nil:
-					mutex.Lock()
-					failures = append(failures, err)
-					mutex.Unlock()
-				}
-			}
-		})
-	}
-	require.Eventually(t, func() bool { return written.Load() > 50 }, 5*time.Second, time.Millisecond, "the writers write into the default partition")
-	_, maintained := database.pool.Exec(t.Context(), "SELECT livewire_audit_maintain(interval '400 days', '2026-03-15T12:00:00Z')")
-	before := written.Load()
-	require.Eventually(t, func() bool { return written.Load() > before+50 }, 5*time.Second, time.Millisecond, "the writers go on into the new partition")
-	stop()
-	writers.Wait()
-	require.NoError(t, maintained, "the move and the attach hold against concurrent inserts")
-	require.Empty(t, failures, "no writer failed, the ones queued behind the attach included")
-	var stranded int
-	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT count(*) FROM livewire_audit_default`).Scan(&stranded))
-	require.Zero(t, stranded, "no row of the month stays in the default partition")
+	t.Run("the function at a fixed month", func(t *testing.T) {
+		t.Parallel()
+		database := newDatabase(t)
+		maintain := func() error {
+			_, err := database.pool.Exec(t.Context(), "SELECT livewire_audit_maintain(interval '400 days', '2026-03-15T12:00:00Z')")
+			return err
+		}
+		writeConcurrently(t, database, `INSERT INTO livewire_audit (at, mutation, request_id, status, duration_ms)
+			VALUES ('2026-03-15T12:00:00Z', 'createPart', 'concurrent', 201, 1)`, maintain)
+		var stranded int
+		require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT count(*) FROM livewire_audit_default`).Scan(&stranded))
+		require.Zero(t, stranded, "no row of the month stays in the default partition")
+	})
+	t.Run("the store on a repeatable read default", func(t *testing.T) {
+		t.Parallel()
+		database := newDatabase(t)
+		repeatable, err := pgxpool.New(t.Context(), database.dsn()+"?default_transaction_isolation=repeatable%20read")
+		require.NoError(t, err)
+		t.Cleanup(repeatable.Close)
+		store, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: repeatable})
+		require.NoError(t, err)
+		writeConcurrently(t, database, `INSERT INTO livewire_audit (mutation, request_id, status, duration_ms) VALUES ('createPart', 'concurrent', 201, 1)`,
+			func() error { return store.Maintain(t.Context()) })
+	})
 }
 
 func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {
@@ -348,6 +342,7 @@ func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {
 
 	rolledBack, err := transactor.Begin(t.Context(), livewire.TransactionDetails{Identity: identity, Mutation: "createPart"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = rolledBack.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	require.NoError(t, store.Write(livewire.WithTransaction(t.Context(), rolledBack.Handle()), entry))
 	require.NoError(t, rolledBack.Rollback(t.Context()))
 	var rows int
@@ -356,6 +351,7 @@ func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {
 
 	committed, err := transactor.Begin(t.Context(), livewire.TransactionDetails{Identity: identity, Mutation: "createPart"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = committed.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
 	require.NoError(t, store.Write(livewire.WithTransaction(t.Context(), committed.Handle()), entry))
 	require.NoError(t, committed.Commit(t.Context()))
 	var tenant, actor, realActor, mutation, requestID, key string
@@ -508,4 +504,62 @@ func TestAuditWriteStoresTheIdempotencyKeyCanonically(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"none", key, key}, keys)
 	require.Error(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", IdempotencyKey: "nope"}))
+}
+
+func TestTriggerSQLKeepsNamesThatHoldItsDollarQuote(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	_, err := database.pool.Exec(t.Context(), `CREATE TABLE "x$livewire$y" (id uuid PRIMARY KEY DEFAULT uuidv7());
+		CREATE TABLE plain (id uuid PRIMARY KEY DEFAULT uuidv7(), "c$livewire$" text NOT NULL)`)
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), postgresadapter.TriggerSQL("x$livewire$y"))
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), postgresadapter.PartitionedTriggerSQL("plain", "c$livewire$"))
+	require.NoError(t, err)
+	listening := notifications(t, database)
+	_, err = database.pool.Exec(t.Context(), `TRUNCATE "x$livewire$y"`)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"table":"x$livewire$y","op":"delete","id":"","partition":""}`, nextPayload(t, listening, time.Second))
+	var id string
+	require.NoError(t, database.pool.QueryRow(t.Context(), `INSERT INTO plain ("c$livewire$") VALUES ('north') RETURNING id::text`).Scan(&id))
+	require.JSONEq(t, `{"table":"plain","op":"insert","id":"`+id+`","partition":"north"}`, nextPayload(t, listening, time.Second))
+	_, err = database.pool.Exec(t.Context(), "TRUNCATE plain")
+	require.NoError(t, err)
+	require.JSONEq(t, `{"table":"plain","op":"delete","id":"","partition":""}`, nextPayload(t, listening, time.Second))
+}
+
+func writeConcurrently(t *testing.T, database *testDatabase, statement string, maintain func() error) {
+	t.Helper()
+	ctx, stop := context.WithCancel(t.Context())
+	var writers sync.WaitGroup
+	var written atomic.Int64
+	var mutex sync.Mutex
+	var failures []error
+	for range 4 {
+		writers.Go(func() {
+			for ctx.Err() == nil {
+				_, err := database.pool.Exec(ctx, statement)
+				switch {
+				case err == nil:
+					written.Add(1)
+				case ctx.Err() == nil:
+					mutex.Lock()
+					failures = append(failures, err)
+					mutex.Unlock()
+				}
+			}
+		})
+	}
+	defer func() {
+		stop()
+		writers.Wait()
+	}()
+	require.Eventually(t, func() bool { return written.Load() > 50 }, 5*time.Second, time.Millisecond, "the writers write into the default partition")
+	maintained := maintain()
+	before := written.Load()
+	require.Eventually(t, func() bool { return written.Load() > before+50 }, 5*time.Second, time.Millisecond, "the writers go on into the new partition")
+	stop()
+	writers.Wait()
+	require.NoError(t, maintained, "the move and the attach hold against concurrent inserts")
+	require.Empty(t, failures, "no writer failed, the ones queued behind the attach included")
 }
