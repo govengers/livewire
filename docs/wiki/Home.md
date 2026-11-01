@@ -1,24 +1,46 @@
 # govengers/livewire
 
-Filled in as the work packages of [docs/design.md](../design.md) land. Until then the design is the documentation.
+Declare an API once in Go; serve it as REST, as a live WebSocket and to generated clients. Module `github.com/govengers/livewire`, Go 1.26, PostgreSQL 18, Apache 2.0.
 
-## Root package `livewire` (WP2)
+## Model
 
-The registry is the single source of truth: `NewRegistry(&RegistryOptions{BasePath, Tenant, Observer})`, then `registry.Add(...)` with the five declaration kinds. A constructor never panics (D43); a mistake in a declaration is returned by `Add`, which adds nothing and changes no declaration when one fails. A declaration belongs to one registry.
+A **registry** (`livewire.NewRegistry`) holds every **declaration** of an API by name. There are five kinds: a **resource** is a filterable list with item, distinct and history reads and an export; a **list** and an **object** are reads with typed parameters; a **mutation** is a write with a JSON body; an **upload** is a binary write. A read is **live** when it names the `Tables` its loader reads. The **engine** (`livewire.NewEngine`) runs every read and write for both transports: the REST adapter calls `Engine.Read`, `Call`, `Batch`, `Upload` and `Export`, the socket's ops run the same code, so a REST body is the socket's payload byte for byte. A **change feed** (the Postgres `Listener`) tells the engine which table changed; the engine re-runs the subscriptions of that table and pushes what changed. The **generator** turns the registry into the TypeScript client, the OpenAPI document, the Go client and the CLI.
 
-| Kind | Constructor | Reads | Writes |
-|------|-------------|-------|--------|
-| `Resource` | `NewResource[Item](name, path, &ResourceOptions[Item]{...})` | `GET path`, `GET path/{key}`, `GET path/distinct`; reserved parameters `filter`, `filterId`, `sort`, `limit`, `offset`, `after`, `field` | |
-| `List` | `NewList[Item, Parameters](...)` | `GET path`, typed parameters, answers `ListResponse` | |
-| `Object` | `NewObject[Item, Parameters](...)` | `GET path`, typed parameters | |
-| `Mutation` | `NewMutation[Parameters, Request, Response](name, method, path, ...)` | | JSON body: `DecodeBody` refuses unknown fields at any depth (D40), checks a create's client id (D18), the field write checks (D39) and the `validate` tags (D44; an unparseable tag fails `Add`) |
-| `Upload` | `NewUpload[Parameters, Response](name, path, ...)` | | `POST`, binary body as `*File`, REST only (D17) |
+Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `authorization.Check` the check type. livewire never logs; every outcome goes to the registry's `Observer`.
 
-The type parameters are inferred from the options struct, so call sites write `livewire.NewResource("parts", "/parts", &livewire.ResourceOptions[part.Item]{...})`. Options are copied; live declarations may name a `Partition` resolver (D25).
+## Packages
 
-- Parameters: `path:"id"` and `query:"status"` tags, embedded structs (by value) flattened, `enum:"a,b"`; string, bool, int kinds, `uuid.UUID`, `time.Time` (RFC 3339, decoded in UTC), pointers, `[]string` for query lists. A repeated scalar query key is 400. A `ParameterSource` feeds the decoder; `MapSource` is the one the socket frames use.
-- Filterable reads: `Resource.ListQuery`, `DistinctQuery` and `ItemQuery` turn the reserved parameters into a `*query.ListQuery` for the loader. The whole request is parsed first (unknown fields, bad page or cursor are 400 `invalid_*`), then the named fields are checked once through `query.Fields.Visible` (403 `forbidden_field`); `RedactItems` and `RedactItem` strip guarded fields from the marshaled items; when a field is hidden they refuse any other shape, when nothing is hidden for the identity they return the input unchecked. `Field.Nullable` is derived from pointer fields of the item type with encoding/json's field rules.
-- Errors: one body `{code, message, fields?}` with fixed texts; `NotFound`, `Conflict`, `InProgress`, `Invalid(fields)`, `ForbiddenField(name)`; `ResponseFor(err)` lets the outermost known error decide, maps `*query.Error` and the auth refusals (by kind, into the closed code set), everything else to 500 `internal`.
-- Wire: `RequestFrame`, `ResponseFrame`, `PushFrame`, `ListChange` (the wire's `diff`), the `Operation*`, `Push*` and `Close*` constants; `ListState` computes list changes by item id (numbers in canonical spelling) and refuses duplicate or non-scalar ids.
-- Tenant (D42): `WithTenant`/`TenantFrom`, `OwnerOf(ctx)` gives the `Owner{Key, Tenant}` every stored row carries, or false without an identity (the engine then skips idempotency and stored filters).
-- Adapter contracts: `ChangeFeed`, `IdentitySource` (auth's unauthenticated or forbidden refusal means the identity is gone), `Transactor`/`Transaction` (D45: every engine unit of work has one, reads included; the engine holds Commit and Rollback, the context carries the query-only `Transaction.Handle()` through `TransactionFrom(ctx)`, which `postgresadapter.TransactionFrom` types as sqlc's DBTX), `FilterStore`, `IdempotencyStore` (non-blocking reservation per owner, key and mutation), `PresenceStore`, `Observer`/`Outcome`. `IdempotencyKeyFrom(ctx)` is what handlers read.
+| Import `github.com/govengers/livewire/...` | Use it for | Page |
+|---|---|---|
+| (root) `livewire` | the registry, declarations, errors, the engine | [Declarations](Declarations.md), [Reads-and-Filters](Reads-and-Filters.md), [Live-Engine](Live-Engine.md) |
+| `query` | fields, filter documents, SQL compilation | [Reads-and-Filters](Reads-and-Filters.md) |
+| `postgresadapter` | migrations, change feed, transactor, stores, list and export helpers | [Postgres](Postgres.md) |
+| `ginadapter`, `prometheusadapter` | REST routes and the socket on gin, wide events, metrics | [REST-and-Metrics](REST-and-Metrics.md) |
+| `generate`, `client` | the generated clients and the Go client's runtime | [Generated-Clients](Generated-Clients.md) |
+| `livewiretest` | the contract gates | [Testing](Testing.md) |
+
+## Wiring order in main
+
+[examples/todo](../../examples/todo) does each step; [cmd/todo/application.go](../../examples/todo/cmd/todo/application.go) is the order.
+
+1. Open the pool and run the goose migrations, which execute livewire's SQL ([Postgres](Postgres.md#migrations)).
+2. Build the repositories: sqlc on the engine's transaction, the pool outside one.
+3. Build livewire's Postgres adapters: `Transactor`, `Listener` and the stores the features need.
+4. Build the services, then the registry with its `Tenant` function and its `Observer` (`prometheusadapter.Metrics.Observe` and one wide event per socket outcome).
+5. `livewire.NewEngine` with the registry, the adapters, the `IdentitySource` (`session.Guard`) and the allowed origins.
+6. The govengers/jobs worker with the maintenance schedules of the stores.
+7. The gin router: the authentication middleware, `ginadapter.RegisterRoutes`, `ginadapter.SocketHandler` behind the same middleware.
+8. Run `engine.Run`, the worker and the servers in one errgroup; on SIGTERM withdraw readiness, shut the server down, then `engine.Close(ctx)` ends every socket with 1001.
+
+## Pages
+
+- [Declarations](Declarations.md): the five kinds, fields, column checks, client ids, optimistic effects, tenant.
+- [Reads-and-Filters](Reads-and-Filters.md): filter documents, stored filters, distinct, cursor mode, history, export.
+- [Live-Engine](Live-Engine.md): subscriptions, re-runs, identity re-validation, presence, limits, the Observer.
+- [Postgres](Postgres.md): migrations and deploy order, the transactor, the stores and their sweeps, `ListPage` and friends, Row Level Security.
+- [REST-and-Metrics](REST-and-Metrics.md): the routes, uploads, the export trailer, wide events, Prometheus.
+- [Generated-Clients](Generated-Clients.md): `generate.Write`, TypeScript and Vue, OpenAPI, the Go client, the CLI.
+- [Testing](Testing.md): the four gates and the end-to-end pattern.
+- [Migration](Migration.md): from `github.com/mxcd/livewire` v0.2.x.
+
+Reference: [README](../../README.md) (overview), [design](../design.md) (decisions), [pkg.go.dev](https://pkg.go.dev/github.com/govengers/livewire) (API).

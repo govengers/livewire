@@ -258,7 +258,9 @@ func (a *testApplication) apiKey(t *testing.T, username string) string {
 // client is the generated Go client with the user's API key.
 func (a *testApplication) client(t *testing.T, username string) *todoclient.Client {
 	t.Helper()
+	// snippet:begin go-client-new
 	todos, err := todoclient.New(&client.Options{BaseURL: a.baseURL(), APIKey: a.apiKey(t, username)})
+	// snippet:end go-client-new
 	require.NoError(t, err)
 	return todos
 }

@@ -46,6 +46,8 @@ func NewJobController(options *JobControllerOptions) (*JobController, error) {
 	return &JobController{todos: options.TodoService, filters: options.FilterStore, idempotency: options.IdempotencyStore, audit: options.AuditStore}, nil
 }
 
+// snippet:begin schedules
+
 // Schedules are the maintenance jobs every worker enqueues once per period with every other
 // worker (JOB-009); pass them as WorkerOptions.Schedules.
 func Schedules() []jobs.Schedule {
@@ -55,6 +57,8 @@ func Schedules() []jobs.Schedule {
 		{Name: model.AuditMaintainKind.Name(), Next: jobs.Every(maintainInterval), Job: model.AuditMaintainKind.New(struct{}{}, nil)},
 	}
 }
+
+// snippet:end schedules
 
 // Register registers the handler of every job kind on the worker.
 func (c *JobController) Register(worker *jobs.Worker) error {

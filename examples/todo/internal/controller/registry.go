@@ -52,18 +52,23 @@ func Contract() (*livewire.Registry, error) {
 }
 
 func newRegistry(todos *todoController, accounts *accountController, observer livewire.Observer) (*livewire.Registry, error) {
+	// snippet:begin new-registry
 	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: observer})
+	// snippet:end new-registry
 	if err != nil {
 		return nil, err
 	}
 	return registry, registry.Add(
 		todos.resource(),
+		// snippet:begin typed-reads
 		livewire.NewList("activity", "/activity", &livewire.ListOptions[api.ActivityItem, api.ActivityParameters]{
 			Tables: []string{"activity"}, Read: authorization.IsUser(), Load: todos.activity,
 		}),
 		livewire.NewObject("summary", "/summary", &livewire.ObjectOptions[api.SummaryItem, livewire.NoParameters]{
 			Tables: []string{"todos", "attachments"}, Read: authorization.IsUser(), Load: todos.summary,
 		}),
+		// snippet:end typed-reads
+		// snippet:begin mutations
 		livewire.NewMutation("createTodo", http.MethodPost, "/todos", &livewire.MutationOptions[livewire.NoParameters, api.CreateTodoRequest, api.TodoItem]{
 			Check: authorization.IsUser(), Status: http.StatusCreated, ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"),
 			Handle: todos.create,
@@ -76,11 +81,14 @@ func newRegistry(todos *todoController, accounts *accountController, observer li
 			Check: authorization.IsUser(), Effect: livewire.Removes("todos"),
 			Handle: todos.delete,
 		}),
+		// snippet:end mutations
+		// snippet:begin upload
 		livewire.NewUpload("uploadAttachment", "/todos/{id}/attachments", &livewire.UploadOptions[api.TodoParameters, api.AttachmentItem]{
 			Check: authorization.IsUser(), Status: http.StatusCreated,
 			ContentTypes: []string{"text/plain", "image/png", "application/pdf"}, MaximumBytes: maximumAttachmentBytes,
 			Handle: todos.attach,
 		}),
+		// snippet:end upload
 		livewire.NewMutation("createKey", http.MethodPost, "/keys", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, api.KeyItem]{
 			Check: authorization.IsUser(), Status: http.StatusCreated,
 			Handle: accounts.createKey,
@@ -94,6 +102,7 @@ type todoController struct {
 }
 
 func (c *todoController) resource() *livewire.Resource {
+	// snippet:begin resource
 	return livewire.NewResource("todos", "/todos", &livewire.ResourceOptions[api.TodoItem]{
 		Tables:       []string{"todos"},
 		Read:         authorization.IsUser(),
@@ -122,6 +131,7 @@ func (c *todoController) resource() *livewire.Resource {
 		History:  c.history,
 		Export:   c.todos.Export,
 	})
+	// snippet:end resource
 }
 
 func (c *todoController) history(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[api.TodoItem]], error) {
@@ -205,6 +215,8 @@ func (c *accountController) createKey(ctx context.Context, _ *livewire.NoParamet
 	return &api.KeyItem{ID: created.ID, Key: created.Key, CreatedAt: created.CreatedAt}, nil
 }
 
+// snippet:begin response-error
+
 // responseError maps the domain's errors to livewire's refusals in one place (API-002); any
 // other error stays as it is, an *auth.Error answers its kind, the rest a 500 without text.
 func responseError(err error) error {
@@ -217,6 +229,8 @@ func responseError(err error) error {
 		return err
 	}
 }
+
+// snippet:end response-error
 
 func toTodoItem(todo model.Todo) api.TodoItem {
 	return api.TodoItem{

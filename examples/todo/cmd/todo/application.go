@@ -136,6 +136,8 @@ func newApplication(options *applicationOptions) (*application, error) {
 	}, nil
 }
 
+// snippet:begin move-member
+
 // moveMember puts a user into another workspace and re-validates the user's sockets at once
 // (section 6, push-driven revocation): the workspace is part of the identity, so each socket
 // ends the subscriptions of the old tenant now instead of at its next re-validation tick.
@@ -147,6 +149,8 @@ func (a *application) moveMember(ctx context.Context, userID uuid.UUID, workspac
 	return nil
 }
 
+// snippet:end move-member
+
 // removeMember removes a user from its workspace, with its API keys, and ends its sockets at
 // once with 4401.
 func (a *application) removeMember(ctx context.Context, userID uuid.UUID) error {
@@ -157,12 +161,18 @@ func (a *application) removeMember(ctx context.Context, userID uuid.UUID) error 
 	return nil
 }
 
+// snippet:begin revalidate
+
 // revalidateUser re-validates every socket of the user, by session and by API key.
 func (a *application) revalidateUser(userID uuid.UUID) {
 	for _, provider := range []string{"password", "apikey"} {
 		a.engine.RevalidateOwner(livewire.OwnerKey(&auth.Identity{Provider: provider, Subject: userID.String()}))
 	}
 }
+
+// snippet:end revalidate
+
+// snippet:begin stores
 
 func newStores(pool *pgxpool.Pool) (*stores, error) {
 	var created stores
@@ -181,24 +191,30 @@ func newStores(pool *pgxpool.Pool) (*stores, error) {
 	return &created, errors.Join(failures[:]...)
 }
 
+// snippet:end stores
+
 // newEngine builds the registry with its Observer (Prometheus and wide events) and the
 // engine on livewire's Postgres stores.
 func newEngine(options *applicationOptions, livewireStores *stores, identities *authentication.Authentication, todoService *service.TodoService, accountService *service.AccountService) (*livewire.Engine, error) {
+	// snippet:begin metrics
 	metrics, err := prometheusadapter.New(&prometheusadapter.Options{Registerer: options.Metrics, Namespace: "todo"})
 	if err != nil {
 		return nil, err
 	}
+	// snippet:end metrics
 	registry, err := controller.NewRegistry(&controller.RegistryOptions{
 		TodoService: todoService, AccountService: accountService, Observer: server.NewObserver(metrics, options.Emitter),
 	})
 	if err != nil {
 		return nil, err
 	}
+	// snippet:begin engine
 	return livewire.NewEngine(&livewire.EngineOptions{
 		Registry: registry, ChangeFeed: livewireStores.listener, IdentitySource: identities, Transactor: livewireStores.transactor,
 		FilterStore: livewireStores.filters, IdempotencyStore: livewireStores.idempotency, AuditStore: livewireStores.audit,
 		PresenceStore: livewireStores.presences, AllowedOrigins: options.AllowedOrigins, SameHostOnly: len(options.AllowedOrigins) == 0,
 	})
+	// snippet:end engine
 }
 
 // newWorker builds the job worker with the completion and maintenance handlers, one wide
