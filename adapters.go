@@ -206,7 +206,8 @@ type AuditEntry struct {
 // writes the entry in the mutation's transaction (TransactionFrom(ctx)) between the handler
 // and the idempotency record, so the entry commits and rolls back with the call (section 7);
 // a failing Write fails the call. For a call that failed it writes the entry after the
-// rollback, without a transaction in ctx, so the store writes it on its own: the failed
+// rollback, without a transaction in ctx and on a context the caller's cancellation does not
+// reach (bounded), so the store writes it on its own: the failed
 // calls of a batch each with the status the batch answered. A refusal before the handler (a
 // check, a decoding, a replayed or in-flight key) writes none.
 type AuditStore interface {

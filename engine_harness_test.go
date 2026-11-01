@@ -73,6 +73,8 @@ type testbed struct {
 	release chan struct{}
 	// anonymousRuns counts the handler runs of "anonymousGadget".
 	anonymousRuns atomic.Int64
+	// cancelCall, when set, is what "cancelGadget" calls before it fails: its caller went away.
+	cancelCall atomic.Pointer[context.CancelFunc]
 	// versions are the versions of the documents, by id; historyQueries what the History
 	// loader was asked.
 	versionMutex    sync.Mutex
@@ -147,7 +149,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget()))
 	return registry
 }
 
@@ -535,6 +537,19 @@ func (b *testbed) blockGadget() *livewire.Mutation {
 				return nil, ctx.Err()
 			}
 			return &countItem{Count: 1}, nil
+		},
+	})
+}
+
+// cancelGadget cancels its caller's context, then fails: the handler ran, its call ended.
+func (b *testbed) cancelGadget() *livewire.Mutation {
+	return livewire.NewMutation("cancelGadget", http.MethodPost, "/gadgets/cancel", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, livewire.NoContent]{
+		Check: authorization.HasRole(roleWriter),
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*livewire.NoContent, error) {
+			if cancel := b.cancelCall.Load(); cancel != nil {
+				(*cancel)()
+			}
+			return nil, livewire.Conflict()
 		},
 	})
 }

@@ -504,9 +504,13 @@ type auditRecord struct {
 	inTransaction bool
 }
 
+// Write fails on a cancelled context, as a database driver does.
 func (f *fakeAudit) Write(ctx context.Context, entry *livewire.AuditEntry) error {
 	if f.failWrite.Load() {
 		return errors.New("the audit table is gone")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	transaction := transactionOf(ctx)
 	record := auditRecord{entry: *entry, inTransaction: transaction != nil}

@@ -1,6 +1,7 @@
 package livewire_test
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -94,4 +95,31 @@ func TestAFailingAuditFailsTheCall(t *testing.T) {
 	require.False(t, exists, "the audit is part of the transaction: no entry, no write")
 	outcome := bed.outcomes.of(livewire.OutcomeCall)[0]
 	require.ErrorContains(t, outcome.Err, "the audit table is gone")
+}
+
+func TestAFailedCallIsAuditedThoughItsCallerWentAway(t *testing.T) {
+	bed := newTestbed(t, nil)
+	cancelled := func(run func(ctx context.Context) error) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(auth.WithIdentity(t.Context(), person("ada", roleReader, roleWriter)))
+		defer cancel()
+		bed.cancelCall.Store(&cancel)
+		defer bed.cancelCall.Store(nil)
+		requireStatus(t, run(ctx), http.StatusConflict)
+	}
+	cancelled(func(ctx context.Context) error {
+		_, _, err := bed.engine.Call(ctx, livewire.CallRequest{Target: "cancelGadget"})
+		return err
+	})
+	cancelled(func(ctx context.Context) error {
+		_, err := bed.engine.Batch(ctx, livewire.BatchRequest{Body: mustJSON([]livewire.BatchCall{{Target: "cancelGadget"}})})
+		return err
+	})
+	entries := bed.audit.landed()
+	require.Len(t, entries, 2, "the call and the batch call are audited after their caller cancelled")
+	for _, entry := range entries {
+		require.Equal(t, "cancelGadget", entry.entry.Mutation)
+		require.Equal(t, http.StatusConflict, entry.entry.Status)
+		require.Equal(t, "ada", entry.entry.Identity.Subject, "the identity survives the cancellation")
+	}
 }

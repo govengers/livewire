@@ -64,7 +64,11 @@ type BatchResult struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
-const maximumBatchCalls = 100
+const (
+	maximumBatchCalls = 100
+	// auditFailureTimeout bounds the audit of a failed call after its rollback.
+	auditFailureTimeout = 5 * time.Second
+)
 
 // Call runs one mutation for the identity in ctx (section 7), the pipeline the socket's call
 // op runs too: the static Check (D8), the parameters, the tenant (D42), the body (unknown
@@ -566,8 +570,12 @@ func (e *Engine) audit(ctx context.Context, plan writePlan, call auditedCall, st
 
 // auditFailure writes the entries of calls that ran and failed, after the rollback, with the
 // status failure answers; a failing Write is joined to failure, whose answer it does not
-// change.
+// change. It writes on a context the caller's cancellation does not reach (a socket that
+// closed, a REST client that went away), bounded by auditFailureTimeout, so a handler that
+// ran is audited whatever ended its call.
 func (e *Engine) auditFailure(ctx context.Context, plan writePlan, calls []auditedCall, failure error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditFailureTimeout)
+	defer cancel()
 	status := statusOf(failure)
 	for _, call := range calls {
 		if err := e.audit(ctx, plan, call, status); err != nil {
