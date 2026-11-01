@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
@@ -102,22 +103,49 @@ func TestFilterSaveBoundsTheFiltersOfAnOwner(t *testing.T) {
 
 func TestFilterMaximumsHoldUnderConcurrentSaves(t *testing.T) {
 	t.Parallel()
-	database := newDatabase(t)
-	store := newFilterStore(t, database, postgresadapter.FilterStoreOptions{MaximumUnnamedPerOwner: 1, MaximumNamedPerOwner: 1})
-	var saves sync.WaitGroup
-	for index := range 8 {
-		saves.Go(func() {
-			_, _ = store.Save(t.Context(), unnamed("concurrent-"+strconv.Itoa(index))) // counted below
-			named := unnamed("named-" + strconv.Itoa(index))
-			named.Name = "Mine " + strconv.Itoa(index)
-			_, _ = store.Save(t.Context(), named) // all but one are refused
+	for name, parameters := range map[string]string{"server default": "", "repeatable read default": "?default_transaction_isolation=repeatable%20read"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			database := newDatabase(t)
+			pool, err := pgxpool.New(t.Context(), database.dsn()+parameters)
+			require.NoError(t, err)
+			t.Cleanup(pool.Close)
+			store, err := postgresadapter.NewFilterStore(&postgresadapter.FilterStoreOptions{Pool: pool, MaximumUnnamedPerOwner: 1, MaximumNamedPerOwner: 1})
+			require.NoError(t, err)
+			var saves sync.WaitGroup
+			var mutex sync.Mutex
+			deduplicated := map[string]int{}
+			var failures []error
+			for range 8 {
+				saves.Go(func() {
+					stored, err := store.Save(t.Context(), unnamed("same")) // one row, one id for all
+					mutex.Lock()
+					defer mutex.Unlock()
+					if err != nil {
+						failures = append(failures, err)
+						return
+					}
+					deduplicated[stored.ID]++
+				})
+			}
+			saves.Wait()
+			require.Empty(t, failures, "concurrent Saves of one document all answer")
+			require.Len(t, deduplicated, 1, "and answer the same filter")
+			for index := range 8 {
+				saves.Go(func() {
+					_, _ = store.Save(t.Context(), unnamed("concurrent-"+strconv.Itoa(index))) // each replaces the one before
+					named := unnamed("named-" + strconv.Itoa(index))
+					named.Name = "Mine " + strconv.Itoa(index)
+					_, _ = store.Save(t.Context(), named) // all but one are refused
+				})
+			}
+			saves.Wait()
+			var unnamedRows, namedRows int
+			require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT count(*) FILTER (WHERE name IS NULL), count(*) FILTER (WHERE name IS NOT NULL) FROM livewire_filters").
+				Scan(&unnamedRows, &namedRows))
+			require.Equal(t, []int{1, 1}, []int{unnamedRows, namedRows})
 		})
 	}
-	saves.Wait()
-	var unnamedRows, namedRows int
-	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT count(*) FILTER (WHERE name IS NULL), count(*) FILTER (WHERE name IS NOT NULL) FROM livewire_filters").
-		Scan(&unnamedRows, &namedRows))
-	require.Equal(t, []int{1, 1}, []int{unnamedRows, namedRows})
 }
 
 func TestFilterIDsAreReadInEverySpellingOfTheUUID(t *testing.T) {
@@ -256,4 +284,19 @@ func TestFilterSaveRefusesIncompleteOrOversizedFilters(t *testing.T) {
 	require.Error(t, err)
 	_, err = postgresadapter.NewFilterStore(&postgresadapter.FilterStoreOptions{Pool: database.pool, MaximumNamedPerOwner: -1})
 	require.Error(t, err)
+}
+
+func TestFilterNameTakenIsAConflictAtTheMaximumToo(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	store := newFilterStore(t, database, postgresadapter.FilterStoreOptions{MaximumNamedPerOwner: 1})
+	named := unnamed("a")
+	named.Name = "Mine"
+	_, err := store.Save(t.Context(), named)
+	require.NoError(t, err)
+	_, err = store.Save(t.Context(), named)
+	requireCode(t, err, livewire.CodeConflict)
+	named.Name = "Another"
+	_, err = store.Save(t.Context(), named)
+	requireCode(t, err, livewire.CodeInvalidRequest)
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -357,4 +358,20 @@ func TestAnOffsetPageNeedsNoCursorForm(t *testing.T) {
 	require.NotNil(t, page.Next)
 	_, err = page.Next.Encode()
 	require.Error(t, err, "cursor mode, which encodes it, fails")
+}
+
+func TestDistinctSpellsNonFiniteNumbers(t *testing.T) {
+	t.Parallel()
+	database := seedParts(t)
+	for _, numberType := range []string{"float8", "float4"} {
+		field := query.Field{
+			Name: "ratio", Type: query.TypeText, Filter: true,
+			SQL: "(CASE parts.rank WHEN 0 THEN 'NaN' WHEN 1 THEN 'Infinity' ELSE '-Infinity' END)::" + numberType,
+		}
+		values, err := postgresadapter.Distinct(t.Context(), database.pool, partSQL, compile(t, `{"where":{"field":"rank","op":"isNull","value":false}}`, "", query.Page{Limit: 5}), field)
+		require.NoError(t, err, numberType)
+		_, err = json.Marshal(values)
+		require.NoError(t, err, "JSON has no NaN or Infinity")
+		require.ElementsMatch(t, []livewire.DistinctValue{{Value: "NaN", Count: 9}, {Value: "Infinity", Count: 10}, {Value: "-Infinity", Count: 9}}, values, numberType)
+	}
 }

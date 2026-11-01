@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"time"
 
@@ -285,13 +286,31 @@ func hydrateInOrder[Item any](ctx context.Context, database DBTX, rows []PageRow
 }
 
 // jsonValue is a driver value as the JSON body writes it: a uuid hyphenated, an infinite
-// timestamp as its spelling.
+// timestamp and a non-finite float as PostgreSQL spells them (JSON has no NaN or Infinity).
 func jsonValue(value any) any {
 	switch typed := value.(type) {
 	case [16]byte:
 		return uuid.UUID(typed).String()
 	case pgtype.InfinityModifier:
 		return typed.String()
+	case float32:
+		return nonFinite(float64(typed), value)
+	case float64:
+		return nonFinite(typed, value)
+	default:
+		return value
+	}
+}
+
+// nonFinite is the PostgreSQL spelling of a NaN or infinite number, value otherwise.
+func nonFinite(number float64, value any) any {
+	switch {
+	case math.IsNaN(number):
+		return "NaN"
+	case math.IsInf(number, 1):
+		return "Infinity"
+	case math.IsInf(number, -1):
+		return "-Infinity"
 	default:
 		return value
 	}

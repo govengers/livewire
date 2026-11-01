@@ -69,7 +69,8 @@ const filterColumns = "id::text, owner, tenant, resource, context, coalesce(name
 // other, so the maximums hold exactly. An unnamed filter is deduplicated on the owner,
 // resource, context and hash, and marked used; a new one beyond MaximumUnnamedPerOwner
 // replaces the owner's least recently used unnamed filter, because unnamed filters are
-// registrations a client can send again (D54). A named filter beyond MaximumNamedPerOwner is
+// registrations a client can send again (D54): a 404 on an unnamed filterId means register the
+// filter inline again. A named filter beyond MaximumNamedPerOwner is
 // refused with livewire.Invalid at "filter", a name the owner already gave a filter of the
 // resource with livewire.Conflict, a Name or Context longer than 200 characters with
 // livewire.Invalid.
@@ -82,7 +83,9 @@ func (s *FilterStore) Save(ctx context.Context, filter *livewire.StoredFilter) (
 		save = s.saveNamed
 	}
 	var stored *livewire.StoredFilter
-	err := pgx.BeginFunc(ctx, s.options.Pool, func(transaction pgx.Tx) error {
+	// READ COMMITTED whatever the default: each statement after the lock sees the Saves
+	// committed before it.
+	err := pgx.BeginTxFunc(ctx, s.options.Pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadWrite}, func(transaction pgx.Tx) error {
 		_, err := transaction.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended(json_build_array('livewire_filters', $1::text, $2::text)::text, 0))",
 			filter.Owner.Key, filter.Owner.Tenant)
 		if err != nil {
@@ -194,12 +197,18 @@ func (s *FilterStore) saveUnnamed(ctx context.Context, transaction pgx.Tx, filte
 }
 
 // saveNamed inserts a named filter below the owner's maximum; it runs under the owner's lock.
+// A name the owner already gave a filter of the resource is a conflict at any count.
 func (s *FilterStore) saveNamed(ctx context.Context, transaction pgx.Tx, filter *livewire.StoredFilter) (*livewire.StoredFilter, error) {
 	var kept int
-	err := transaction.QueryRow(ctx, "SELECT count(*) FROM livewire_filters WHERE owner = $1 AND tenant = $2 AND name IS NOT NULL",
-		filter.Owner.Key, filter.Owner.Tenant).Scan(&kept)
+	var taken bool
+	err := transaction.QueryRow(ctx, `SELECT count(*), coalesce(bool_or(resource = $3 AND name = $4), false)
+		FROM livewire_filters WHERE owner = $1 AND tenant = $2 AND name IS NOT NULL`,
+		filter.Owner.Key, filter.Owner.Tenant, filter.Resource, filter.Name).Scan(&kept, &taken)
 	if err != nil {
 		return nil, err
+	}
+	if taken {
+		return nil, livewire.Conflict()
 	}
 	if kept >= s.options.MaximumNamedPerOwner {
 		return nil, livewire.Invalid(map[string]string{"filter": "at most " + strconv.Itoa(s.options.MaximumNamedPerOwner) + " named filters per owner"})
