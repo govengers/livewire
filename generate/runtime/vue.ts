@@ -28,7 +28,9 @@ import {
   type LiveStatus,
   type LiveSubscription,
   type LiveTarget,
+  type NetworkError,
   type PresenceItem,
+  type PresenceRegistration,
 } from './runtime'
 
 /** The key the application provides its LiveConnection under (livePlugin does). */
@@ -57,7 +59,11 @@ export interface SnapshotStorage {
 
 export interface UseLiveOptions {
   connection?: LiveConnection
-  /** Keep the last data in storage and show it, stale, before the socket answers (D21). */
+  /**
+   * Keep the last data in storage and show it, stale, before the socket answers (D21). The
+   * snapshot belongs to the connection's identity: without one nothing is kept, and an identity
+   * change clears every snapshot of the one before.
+   */
   cache?: boolean
   storage?: SnapshotStorage
 }
@@ -85,11 +91,12 @@ function defaultStorage(): SnapshotStorage | undefined {
 }
 
 /**
- * Reads the snapshot under key for the connection's identity; a snapshot of another identity
- * is never shown: an identity change clears every livewire snapshot first (D21).
+ * Reads the snapshot under key for the identity; a snapshot of another identity is never shown:
+ * a new identity clears every livewire snapshot first, and nobody ("") has none (D21).
  */
 function readSnapshot(storage: SnapshotStorage, identity: string, key: string): unknown {
   forgetOtherIdentities(storage, identity)
+  if (identity === '') return undefined
   const stored = storage.getItem(key)
   if (stored === null) return undefined
   try {
@@ -102,6 +109,7 @@ function readSnapshot(storage: SnapshotStorage, identity: string, key: string): 
 
 function writeSnapshot(storage: SnapshotStorage, identity: string, key: string, data: unknown): void {
   forgetOtherIdentities(storage, identity)
+  if (identity === '') return
   try {
     storage.setItem(key, JSON.stringify(data))
   } catch {
@@ -130,8 +138,10 @@ type ReadArguments<Parameters, Options> = Record<string, never> extends Paramete
   : [parameters: MaybeRefOrGetter<Parameters>, options?: Options]
 
 /**
- * Subscribes to a live read for as long as the calling scope lives; a change of the reactive
- * parameters subscribes again and keeps the old data, stale, meanwhile.
+ * Subscribes to a live read for as long as the calling scope lives. A change of the reactive
+ * parameters subscribes again and keeps the old data, stale, meanwhile; a change of the
+ * connection's identity drops the data, the pending changes and the old identity's snapshots
+ * first, lets the connection replace its socket and subscribes again under the new identity.
  */
 export function useLive<Parameters extends object, Data>(target: LiveTarget<Parameters, Data>, ...rest: ReadArguments<Parameters, UseLiveOptions>): LiveRead<Data> {
   const [parameters, options = {}] = rest as [MaybeRefOrGetter<Parameters>?, UseLiveOptions?]
@@ -147,38 +157,50 @@ function liveRead<Parameters extends object, Data>(target: LiveTarget<Parameters
   const pending = shallowRef<readonly string[]>([])
   const filterId = ref<string>()
   let subscription: LiveSubscription | undefined
+  let identity: string | undefined
 
   const current = (): Parameters => (toValue(parameters) ?? {}) as Parameters
   const subscribe = (): void => {
     subscription?.unsubscribe()
+    const subscribedIdentity = connection.identity()
+    if (identity !== undefined && identity !== subscribedIdentity) {
+      // connection.subscribe replaces a socket of the old identity
+      data.value = undefined
+      pending.value = []
+      filterId.value = undefined
+    }
+    identity = subscribedIdentity
     const wire = wireParameters(current())
-    const cacheKey = snapshotKey(connection.identity(), target.target, wire)
+    const cacheKey = snapshotKey(subscribedIdentity, target.target, wire)
     if (storage !== undefined) {
-      const cached = readSnapshot(storage, connection.identity(), cacheKey)
+      const cached = readSnapshot(storage, subscribedIdentity, cacheKey)
       if (cached !== undefined) data.value = cached as Data
     }
     error.value = undefined
     stale.value = true
-    subscription = connection.subscribe(target, current(), {
+    const owned: LiveSubscription = connection.subscribe(target, current(), {
       next: (state: LiveState<Data>) => {
+        if (subscription !== owned) return
         data.value = state.data
         pending.value = state.pending
         filterId.value = state.filterId
         error.value = undefined
         stale.value = connection.status !== 'open'
-        if (storage !== undefined) writeSnapshot(storage, connection.identity(), cacheKey, state.data)
+        if (storage !== undefined) writeSnapshot(storage, subscribedIdentity, cacheKey, state.data)
       },
       error: (refusal) => {
-        error.value = refusal
+        if (subscription === owned) error.value = refusal
       },
     })
+    subscription = owned
   }
-  watch(() => JSON.stringify(wireParameters(current())), subscribe, { immediate: true })
+  watch(() => [JSON.stringify(wireParameters(current())), connection.identity()], subscribe, { immediate: true })
   const stopStatus = connection.onStatus((status: LiveStatus) => {
     if (status !== 'open') stale.value = true
   })
   onScopeDispose(() => {
     subscription?.unsubscribe()
+    subscription = undefined
     stopStatus()
   })
   return {
@@ -200,7 +222,8 @@ interface ListQuery {
   after?: string
 }
 
-export interface UseLiveListOptions<Query extends ListQuery> extends UseLiveOptions {
+export interface UseLiveListOptions<Query extends ListQuery> {
+  connection?: LiveConnection
   /** The initial filter document. */
   filter?: Query['filter']
   /** The initial sort, "-field" for descending; none is the resource's default sort. */
@@ -217,7 +240,8 @@ export interface LiveList<Query extends ListQuery, Item> {
   items: ComputedRef<Item[]>
   /** The total under scope and filter (at most CountCap + 1 under a cap, D14). */
   total: ComputedRef<number | undefined>
-  error: ComputedRef<ApiError | undefined>
+  /** The refusal that ended a page, or the failed read of a page's next cursor (D64); retry() starts both again. */
+  error: ComputedRef<ApiError | NetworkError | undefined>
   stale: ComputedRef<boolean>
   loading: ComputedRef<boolean>
   pending: ComputedRef<readonly string[]>
@@ -238,20 +262,24 @@ export interface LiveList<Query extends ListQuery, Item> {
 /** One live page of a list: offset mode has one, cursor mode tiles several. */
 interface Tile<Item> {
   after: string | undefined
-  /** The cursor after the page: its first push's, then what a read of the page answered (a diff carries none). */
+  /** The cursor after the page: what its last snapshot or the last read of the page answered (a diff carries none). */
   next: Ref<string | undefined>
   data: ShallowRef<ListResponse<Item> | undefined>
   error: ShallowRef<ApiError | undefined>
+  refreshError: ShallowRef<ApiError | NetworkError | undefined>
+  /** Counts the reads of the page's next cursor; only the answer of the newest counts. */
+  refreshes: number
   pending: ShallowRef<readonly string[]>
   received: Ref<boolean>
-  subscription: LiveSubscription
+  subscription: LiveSubscription | undefined
 }
 
 /**
- * A live list with its filter, sort and page state (D21). In cursor mode (D38) the first tile
- * is the first page, loadMore() subscribes the page after the last tile's `next`, and when a
- * tile's membership changes (a row arrived or left) its `next` is read again so the tile below
- * follows it and no row falls between two tiles.
+ * A live list with its filter, sort and page state (D21). In cursor mode (D38, D64) the first
+ * tile is the first page and loadMore() subscribes the page after the last tile's `next`. A
+ * tile's `next` is its snapshot's; when its rows change or its last row changes (a sort value
+ * moved), the page is read again for its current `next`, the newest read wins, and the tile
+ * below follows it, so no row falls between two tiles. An identity change starts over.
  */
 export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Query, ListResponse<Item>>, options: UseLiveListOptions<Query> = {}): LiveList<Query, Item> {
   const connection = useLiveConnection(options.connection)
@@ -262,6 +290,7 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
   const tiles = shallowRef<Tile<Item>[]>([])
   const open = ref(connection.status === 'open')
   const cursor = options.mode === 'cursor'
+  let disposed = false
 
   const queryOf = (after: string | undefined): Query => {
     const query: Record<string, unknown> = { ...(toValue(options.parameters) ?? {}) }
@@ -278,19 +307,25 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
 
   const startTile = (after: string | undefined, position: number): Tile<Item> => {
     const tile: Tile<Item> = {
-      after, next: ref(), data: shallowRef(), error: shallowRef(), pending: shallowRef([]), received: ref(false),
-      subscription: undefined as unknown as LiveSubscription,
+      after, next: ref(), data: shallowRef(), error: shallowRef(), refreshError: shallowRef(), refreshes: 0,
+      pending: shallowRef([]), received: ref(false), subscription: undefined,
     }
     tile.subscription = connection.subscribe(target, queryOf(after), {
       next: (state) => {
+        if (disposed || tiles.value[position] !== tile) return
         const before = tile.data.value
         tile.data.value = state.data
         tile.pending.value = state.pending
         tile.error.value = undefined
         tile.received.value = true
-        if (!cursor || tiles.value[position] !== tile) return
-        if (before === undefined) follow(position, (tile.next.value = state.data.next))
-        else if (membershipChanged(before, state.data)) refreshNext(position)
+        if (!cursor) return
+        if (before === undefined || state.data.next !== before.next) {
+          // A snapshot carries the page's next: take it.
+          tile.next.value = state.data.next
+          follow(position, state.data.next)
+        } else if (boundaryMoved(before, state.data)) {
+          refreshNext(position)
+        }
       },
       error: (refusal) => {
         tile.error.value = refusal
@@ -303,33 +338,43 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
   // in turn moves the tile below it once its first page arrived.
   const follow = (position: number, next: string | undefined): void => {
     const below = tiles.value[position + 1]
-    if (below === undefined || below.after === next) return
-    below.subscription.unsubscribe()
+    if (disposed || below === undefined || below.after === next) return
     const replaced = [...tiles.value]
-    if (next === undefined) {
-      for (const dropped of replaced.splice(position + 1)) if (dropped !== below) dropped.subscription.unsubscribe()
-    } else {
-      replaced[position + 1] = startTile(next, position + 1)
-    }
+    const dropped = next === undefined ? replaced.splice(position + 1) : [below]
+    if (next !== undefined) replaced[position + 1] = startTile(next, position + 1)
     tiles.value = replaced
+    for (const tile of dropped) tile.subscription?.unsubscribe()
   }
 
-  // A diff carries no `next`: a tile whose rows changed reads its page again for it.
+  // A diff carries no `next`: a tile whose boundary moved reads its page again for it.
   const refreshNext = (position: number): void => {
     const tile = tiles.value[position]
     if (tile === undefined) return
-    connection.query(target, queryOf(tile.after)).then((fresh) => {
-      if (tiles.value[position] !== tile) return
-      tile.next.value = fresh.next
-      follow(position, fresh.next)
-    }, () => {})
+    const refresh = ++tile.refreshes
+    connection.query(target, queryOf(tile.after)).then(
+      (fresh) => {
+        if (disposed || tiles.value[position] !== tile || refresh !== tile.refreshes) return
+        tile.refreshError.value = undefined
+        tile.next.value = fresh.next
+        follow(position, fresh.next)
+      },
+      (failure: ApiError | NetworkError) => {
+        if (!disposed && tiles.value[position] === tile && refresh === tile.refreshes) tile.refreshError.value = failure
+      },
+    )
   }
 
+  const stopTiles = (): void => {
+    const stopped = tiles.value
+    tiles.value = []
+    for (const tile of stopped) tile.subscription?.unsubscribe()
+  }
   const restart = (): void => {
-    for (const tile of tiles.value) tile.subscription.unsubscribe()
+    stopTiles()
     tiles.value = [startTile(undefined, 0)]
   }
-  watch(() => JSON.stringify([toValue(options.parameters), filter.value, sort.value, limit.value]), () => {
+  // An identity change starts over too; connection.subscribe replaces a socket of the old identity.
+  watch(() => [JSON.stringify([toValue(options.parameters), filter.value, sort.value, limit.value]), connection.identity()], () => {
     if (page.value !== 1 && !cursor) page.value = 1 // the page watcher restarts
     else restart()
   })
@@ -338,7 +383,8 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     open.value = status === 'open'
   })
   onScopeDispose(() => {
-    for (const tile of tiles.value) tile.subscription.unsubscribe()
+    disposed = true
+    stopTiles()
     stopStatus()
   })
 
@@ -357,7 +403,13 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     return merged
   })
   const first = computed(() => tiles.value[0])
-  const error = computed(() => tiles.value.find((tile) => tile.error.value !== undefined)?.error.value)
+  const error = computed(() => {
+    for (const tile of tiles.value) {
+      const failure = tile.error.value ?? tile.refreshError.value
+      if (failure !== undefined) return failure
+    }
+    return undefined
+  })
   const stale = computed(() => !open.value || tiles.value.some((tile) => !tile.received.value))
   const total = computed(() => first.value?.data.value?.total)
   return {
@@ -371,18 +423,24 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
       if (cursor && next !== undefined) tiles.value = [...tiles.value, startTile(next, tiles.value.length)]
     },
     retry: () => {
-      for (const tile of tiles.value) {
+      tiles.value.forEach((tile, position) => {
         if (tile.error.value !== undefined) {
           tile.error.value = undefined
-          tile.subscription.retry()
+          tile.subscription?.retry()
         }
-      }
+        if (tile.refreshError.value !== undefined) {
+          tile.refreshError.value = undefined
+          refreshNext(position)
+        }
+      })
     },
   }
 }
 
-function membershipChanged(before: ListResponse<unknown>, after: ListResponse<unknown>): boolean {
-  return before.items.length !== after.items.length || before.items.some((item, index) => itemID(item) !== itemID(after.items[index]))
+/** Whether a page's boundary moved: its rows changed, or its last row (whose sort values the next cursor holds) did. */
+function boundaryMoved(before: ListResponse<unknown>, after: ListResponse<unknown>): boolean {
+  const changedRows = before.items.length !== after.items.length || before.items.some((item, index) => itemID(item) !== itemID(after.items[index]))
+  return changedRows || JSON.stringify(before.items.at(-1)) !== JSON.stringify(after.items.at(-1))
 }
 
 /** The connection's status, for an online indicator. */
@@ -398,14 +456,17 @@ export function useLiveStatus(connection?: LiveConnection): Ref<LiveStatus> {
 
 export interface LivePresence<State> {
   presences: ComputedRef<PresenceItem<State>[]>
-  error: ShallowRef<ApiError | undefined>
+  /** The refusal of the presence read, or of a join or leave. */
+  error: ComputedRef<ApiError | NetworkError | undefined>
   stale: Ref<boolean>
 }
 
 /**
  * Joins the record of a presence read with the reactive state and subscribes to who is there
  * (D37), for as long as the calling scope lives: a state change joins again (an update), a
- * parameter change leaves the old record and joins the new one, the end of the scope leaves.
+ * change of the parameters (by value, so a mutated parameters object counts) leaves the old
+ * record and joins the new one, the end of the scope leaves. Two components on one record share
+ * the socket's presence; it ends with the last of them.
  */
 export function useLivePresence<Parameters extends object, State>(
   target: LiveTarget<Parameters, ListResponse<PresenceItem>>,
@@ -415,28 +476,29 @@ export function useLivePresence<Parameters extends object, State>(
 ): LivePresence<State> {
   const connection = useLiveConnection(options.connection)
   const live = liveRead(target, parameters, { ...options, connection })
-  let joined: Parameters | undefined
-  const failed = (refusal: unknown): void => {
-    live.error.value = refusal as ApiError
-  }
+  const presenceError = shallowRef<ApiError | NetworkError>()
+  let registration: PresenceRegistration | undefined
   watch(
-    () => JSON.stringify([wireParameters(toValue(parameters)), toValue(state)]),
+    () => JSON.stringify(wireParameters(toValue(parameters))),
     () => {
-      const next = toValue(parameters)
-      if (joined !== undefined && JSON.stringify(wireParameters(joined)) !== JSON.stringify(wireParameters(next))) {
-        connection.leave(target, joined).catch(() => {})
-      }
-      joined = next
-      connection.join(target, next, toValue(state)).catch(failed)
+      registration?.leave()
+      presenceError.value = undefined
+      registration = connection.join(target, toValue(parameters), toValue(state), {
+        onError: (failure) => {
+          presenceError.value = failure as ApiError | NetworkError
+        },
+      })
     },
     { immediate: true },
   )
+  watch(() => JSON.stringify(toValue(state)), () => registration?.update(toValue(state)))
   onScopeDispose(() => {
-    if (joined !== undefined) connection.leave(target, joined).catch(() => {})
+    registration?.leave()
+    registration = undefined
   })
   return {
     presences: computed(() => (live.data.value?.items ?? []) as PresenceItem<State>[]),
-    error: live.error,
+    error: computed(() => live.error.value ?? presenceError.value),
     stale: live.stale,
   }
 }

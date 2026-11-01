@@ -1,7 +1,7 @@
 // Test doubles of the runtime's tests: a WebSocket the test drives frame by frame and a fetch
 // that answers from a queue. Not copied by the generator.
 
-import type { WebSocketLike } from './runtime'
+import type { Clock, WebSocketLike } from './runtime'
 
 export interface SentFrame {
   id: string
@@ -104,12 +104,37 @@ export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 }
 
-/** Waits until condition holds, polling every millisecond, at most a second. */
-export async function waitFor(condition: () => boolean): Promise<void> {
-  const deadline = Date.now() + 1000
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error('the condition did not hold within a second')
-    await new Promise((resolve) => setTimeout(resolve, 1))
+/** A clock the test moves: timers run only in advance(), in the order they are due. */
+export class FakeClock implements Clock {
+  private current = 0
+  private lastHandle = 0
+  private timers: { at: number; handle: number; callback: () => void }[] = []
+
+  now(): number {
+    return this.current
+  }
+
+  setTimeout(callback: () => void, milliseconds: number): unknown {
+    const handle = ++this.lastHandle
+    this.timers.push({ at: this.current + milliseconds, handle, callback })
+    return handle
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.timers = this.timers.filter((timer) => timer.handle !== handle)
+  }
+
+  /** Moves the clock by milliseconds and runs every timer due on the way, timers they set included. */
+  advance(milliseconds: number): void {
+    const end = this.current + milliseconds
+    for (;;) {
+      const due = this.timers.filter((timer) => timer.at <= end).sort((left, right) => left.at - right.at || left.handle - right.handle)[0]
+      if (due === undefined) break
+      this.timers = this.timers.filter((timer) => timer !== due)
+      this.current = due.at
+      due.callback()
+    }
+    this.current = end
   }
 }
 

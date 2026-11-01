@@ -1,12 +1,13 @@
 import { describe, expect, test } from 'bun:test'
-import { createApp, effectScope, nextTick, ref } from 'vue'
-import { fakeSockets, settle } from './fakes'
+import { createApp, effectScope, nextTick, reactive, ref } from 'vue'
+import { FakeClock, fakeSockets, settle } from './fakes'
 import { LiveConnection, liveRead, mutation, type ListResponse, type PresenceItem } from './runtime'
 import { livePlugin, liveConnectionKey, useLive, useLiveConnection, useLiveList, useLivePresence, useLiveStatus, type SnapshotStorage } from './vue'
 
 interface Part {
   id: string
   name: string
+  price?: number
 }
 
 interface PartsQuery {
@@ -46,16 +47,20 @@ class MemoryStorage implements SnapshotStorage {
   }
 }
 
-function connect(identity = 'password:alice') {
+function connect(identity: string | null = 'password:alice') {
   const fakes = fakeSockets()
-  const user = ref(identity)
-  const connection = new LiveConnection({ url: 'wss://example.com/socket', WebSocket: fakes.Socket, identity: () => user.value, reconnectDelay: 1 })
-  return { connection, user, ...fakes }
+  const user = ref(identity ?? '')
+  const clock = new FakeClock()
+  const options = { url: 'wss://example.com/socket', WebSocket: fakes.Socket, reconnectDelay: 1, clock }
+  const connection = new LiveConnection(identity === null ? options : { ...options, identity: () => user.value })
+  return { connection, user, clock, ...fakes }
 }
 
 function list(items: Part[], extra: Partial<ListResponse<Part>> = {}): ListResponse<Part> {
   return { limit: 2, offset: 0, total: items.length, items, ...extra }
 }
+
+const subscribes = (frames: { op: string }[]) => frames.filter((frame) => frame.op === 'subscribe').length
 
 describe('useLive', () => {
   test('subscribes, follows the pushes, resubscribes on a parameter change and ends with its scope', async () => {
@@ -115,6 +120,40 @@ describe('useLive', () => {
     storage.setItem('livewire:password:bob:dashboard:[["board","z"]]', '{broken')
     const broken = effectScope().run(() => useLive(dashboard, { board: 'z' }, { connection: connect('password:bob').connection, cache: true, storage }))!
     expect(broken.data.value).toBeUndefined()
+  })
+
+  test('without an identity nothing is cached, and a cache of somebody before is cleared (D21)', () => {
+    const storage = new MemoryStorage()
+    storage.setItem('livewire:identity', 'password:alice')
+    storage.setItem('livewire:password:alice:dashboard:[["board","a"]]', '{"title":"secret of alice"}')
+    const nobody = connect(null)
+    const live = effectScope().run(() => useLive(dashboard, { board: 'a' }, { connection: nobody.connection, cache: true, storage }))!
+    expect(live.data.value).toBeUndefined()
+    nobody.current().open()
+    nobody.current().answer('subscribe', { subscription: 's1' })
+    nobody.current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'public' } })
+    expect([...storage.values.entries()]).toEqual([['livewire:identity', '']])
+  })
+
+  test('an identity change in a mounted view drops the old data and subscribes on a new socket (D21, D6)', async () => {
+    const storage = new MemoryStorage()
+    const { connection, user, sockets, current } = connect('password:alice')
+    const live = effectScope().run(() => useLive(parts, {}, { connection, cache: true, storage }))!
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'secret of alice' }]) })
+    void connection.call(deletePart, { id: 'a' }, undefined).catch(() => {})
+    expect(live.pending.value).toEqual(['a'])
+    user.value = 'password:bob'
+    await nextTick()
+    expect([live.data.value, live.pending.value, live.stale.value]).toEqual([undefined, [], true])
+    expect([...storage.values.keys()]).toEqual(['livewire:identity'])
+    expect(sockets).toHaveLength(2)
+    current().open()
+    current().answer('subscribe', { subscription: 's2' })
+    current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: list([{ id: 'b', name: 'of bob' }]) })
+    expect(live.data.value?.items[0]?.name).toBe('of bob')
+    expect([...storage.values.keys()].some((key) => key.includes('password:bob'))).toBe(true)
   })
 
   test('a full storage keeps the old snapshot', () => {
@@ -191,6 +230,12 @@ describe('useLiveList', () => {
     expect(current().last('subscribe').params).toEqual({ filter: '{"search":"bolt"}', limit: '2' })
     live.loadMore()
     expect(live.pending.value).toEqual([])
+    const typeOnly = effectScope()
+    typeOnly.run(() => {
+      // @ts-expect-error a list keeps no snapshot: cache is no option of it
+      useLiveList(parts, { connection, cache: true })
+    })
+    typeOnly.stop()
   })
 
   test('an error of a page is the list\'s, and retry subscribes again', () => {
@@ -200,30 +245,44 @@ describe('useLiveList', () => {
     expect(current().last('subscribe').params).toEqual({ board: 'x' })
     current().answer('subscribe', { subscription: 's1' })
     current().receive({ sub: 's1', seq: 1, kind: 'error', payload: { code: 'invalid_filter', message: 'bad' } })
-    expect([live.error.value?.code, live.loading.value, live.pages.value]).toEqual(['invalid_filter', false, undefined])
+    expect([live.error.value instanceof Error, live.loading.value, live.pages.value]).toEqual([true, false, undefined])
     live.retry()
     expect(live.error.value).toBeUndefined()
-    expect(current().sent.filter((frame) => frame.op === 'subscribe')).toHaveLength(2)
+    expect(subscribes(current().sent)).toBe(2)
   })
 
-  test('cursor mode tiles live pages and a tile whose rows changed moves the tile below (D38)', async () => {
-    const { connection, current } = connect()
-    const scope = effectScope()
-    const live = scope.run(() => useLiveList(parts, { connection, mode: 'cursor', limit: 2 }))!
-    current().open()
-    current().answer('subscribe', { subscription: 't1' })
-    current().receive({ sub: 't1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], { next: 'after-b', total: 4 }) })
-    expect(live.hasMore.value).toBe(true)
-    live.loadMore()
-    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-b' })
-    current().answer('subscribe', { subscription: 't2' })
-    current().receive({ sub: 't2', seq: 1, kind: 'snapshot', payload: list([{ id: 'c', name: 'C' }, { id: 'd', name: 'D' }]) })
-    expect(live.items.value.map((item) => item.id)).toEqual(['a', 'b', 'c', 'd'])
-    expect(live.hasMore.value).toBe(false)
-    live.loadMore()
-    expect(current().sent.filter((frame) => frame.op === 'subscribe')).toHaveLength(2)
+  test('an identity change starts the list over', async () => {
+    const { connection, user, sockets } = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection }))!
+    sockets[0]?.open()
+    sockets[0]?.answer('subscribe', { subscription: 's1' })
+    sockets[0]?.receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }]) })
+    user.value = 'password:bob'
+    await nextTick()
+    expect(live.items.value).toEqual([])
+    expect(sockets).toHaveLength(2)
+  })
 
-    // A new row on the first page pushes b out of it: the first page's next moves.
+  /** A cursor list with two loaded tiles: t1 holds a, b (next after-b), t2 c, d (next after-d). */
+  function twoTiles() {
+    const connected = connect()
+    const scope = effectScope()
+    const live = scope.run(() => useLiveList(parts, { connection: connected.connection, mode: 'cursor', limit: 2 }))!
+    connected.current().open()
+    connected.current().answer('subscribe', { subscription: 't1' })
+    connected.current().receive({ sub: 't1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A', price: 10 }, { id: 'b', name: 'B', price: 20 }], { next: 'after-b', total: 4 }) })
+    live.loadMore()
+    connected.current().answer('subscribe', { subscription: 't2' })
+    connected.current().receive({ sub: 't2', seq: 1, kind: 'snapshot', payload: list([{ id: 'c', name: 'C' }, { id: 'd', name: 'D' }], { next: 'after-d' }) })
+    const ids = () => live.items.value.map((item) => item.id)
+    return { ...connected, scope, live, ids }
+  }
+
+  test('cursor mode tiles live pages and a tile whose rows changed moves the tile below (D38, D64)', async () => {
+    const { live, current, ids, scope } = twoTiles()
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-b' })
+    expect([ids(), live.hasMore.value]).toEqual([['a', 'b', 'c', 'd'], true])
+
     current().receive({ sub: 't1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'n', name: 'N' }], removes: ['b'], order: ['n', 'a'], total: 5 } })
     expect(current().last('query')).toMatchObject({ target: 'parts', params: { limit: '2' } })
     current().answer('query', { payload: list([{ id: 'n', name: 'N' }, { id: 'a', name: 'A' }], { next: 'after-a' }) })
@@ -232,30 +291,73 @@ describe('useLiveList', () => {
     expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-a' })
     current().answer('subscribe', { subscription: 't3' })
     current().receive({ sub: 't3', seq: 1, kind: 'snapshot', payload: list([{ id: 'b', name: 'B' }, { id: 'c', name: 'C' }], { next: 'after-c' }) })
-    expect(live.items.value.map((item) => item.id)).toEqual(['n', 'a', 'b', 'c'])
-    expect(live.total.value).toBe(5)
+    expect([ids(), live.total.value]).toEqual([['n', 'a', 'b', 'c'], 5])
 
     // The first page loses a row and has no next any more: the tiles below go.
     current().receive({ sub: 't1', seq: 3, kind: 'diff', payload: { upserts: [], removes: ['a'], order: ['n'], total: 1 } })
     current().answer('query', { payload: list([{ id: 'n', name: 'N' }]) })
     await settle()
-    expect(live.items.value.map((item) => item.id)).toEqual(['n'])
-    expect(live.hasMore.value).toBe(false)
+    expect([ids(), live.hasMore.value]).toEqual([['n'], false])
+    live.loadMore()
+    expect(subscribes(current().sent)).toBe(3)
     scope.stop()
   })
 
+  test('two reads of one tile\'s next answered out of order keep the newer one (D64)', async () => {
+    const { current } = twoTiles()
+    current().receive({ sub: 't1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'x', name: 'X' }], removes: ['b'], order: ['x', 'a'] } })
+    const older = current().last('query')
+    current().receive({ sub: 't1', seq: 3, kind: 'diff', payload: { upserts: [{ id: 'n', name: 'N' }], removes: ['a'], order: ['x', 'n'] } })
+    const newer = current().last('query')
+    current().receive({ id: newer.id, ok: true, status: 200, payload: list([{ id: 'x', name: 'X' }, { id: 'n', name: 'N' }], { next: 'after-n' }) })
+    current().receive({ id: older.id, ok: true, status: 200, payload: list([{ id: 'x', name: 'X' }, { id: 'a', name: 'A' }], { next: 'after-a' }) })
+    await settle()
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-n' })
+  })
+
+  test('a read of a tile\'s next that answers after the view ended subscribes nothing (D64)', async () => {
+    const { current, scope } = twoTiles()
+    current().receive({ sub: 't1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'n', name: 'N' }], removes: ['b'], order: ['n', 'a'] } })
+    scope.stop()
+    current().answer('query', { payload: list([{ id: 'n', name: 'N' }, { id: 'a', name: 'A' }], { next: 'after-a' }) })
+    await settle()
+    expect(subscribes(current().sent)).toBe(2)
+  })
+
+  test('a moved sort value of the boundary row and a snapshot\'s new next move the tile below (D64)', async () => {
+    const { current } = twoTiles()
+    current().receive({ sub: 't1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'b', name: 'B', price: 15 }], removes: [] } })
+    current().answer('query', { payload: list([{ id: 'a', name: 'A', price: 10 }, { id: 'b', name: 'B', price: 15 }], { next: 'after-b-15' }) })
+    await settle()
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-b-15' })
+    current().answer('subscribe', { subscription: 't3' })
+    current().receive({ sub: 't3', seq: 1, kind: 'snapshot', payload: list([{ id: 'c', name: 'C' }], { next: 'after-c' }) })
+
+    current().receive({ sub: 't1', seq: 3, kind: 'snapshot', payload: list([{ id: 'a', name: 'A', price: 10 }, { id: 'b', name: 'B', price: 15 }], { next: 'after-b-resync' }) })
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-b-resync' })
+  })
+
+  test('a refused read of a tile\'s next is the list\'s error, and retry reads again (D64)', async () => {
+    const { live, current } = twoTiles()
+    current().receive({ sub: 't1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'n', name: 'N' }], removes: ['b'], order: ['n', 'a'] } })
+    const refused = current().last('query')
+    current().receive({ id: refused.id, ok: false, status: 500, error: { code: 'internal', message: 'x' } })
+    await settle()
+    expect((live.error.value as { code?: string } | undefined)?.code).toBe('internal')
+    live.retry()
+    expect(live.error.value).toBeUndefined()
+    expect(current().last('query').id).not.toBe(refused.id)
+    current().answer('query', { payload: list([{ id: 'n', name: 'N' }, { id: 'a', name: 'A' }], { next: 'after-a' }) })
+    await settle()
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'after-a' })
+  })
+
   test('cursor mode: a filter change starts over at the first page', async () => {
-    const { connection, current } = connect()
-    const live = effectScope().run(() => useLiveList(parts, { connection, mode: 'cursor' }))!
-    current().open()
-    current().answer('subscribe', { subscription: 't1' })
-    current().receive({ sub: 't1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }], { next: 'n1' }) })
-    live.loadMore()
-    current().answer('subscribe', { subscription: 't2' })
+    const { live, current } = twoTiles()
     live.filter.value = { search: 'x' }
     await nextTick()
     expect(current().sent.filter((frame) => frame.op === 'unsubscribe').map((frame) => frame.target)).toEqual(['t1', 't2'])
-    expect(current().last('subscribe').params).toEqual({ filter: '{"search":"x"}' })
+    expect(current().last('subscribe').params).toEqual({ filter: '{"search":"x"}', limit: '2' })
   })
 })
 
@@ -269,14 +371,15 @@ describe('useLivePresence', () => {
     current().open()
     expect(current().last('join')).toMatchObject({ target: 'parts', params: { key: 'p1' }, body: { cursor: 1 } })
     current().answer('join')
-    const subscribe = current().last('subscribe')
-    current().receive({ id: subscribe.id, ok: true, status: 200, subscription: 's1' })
+    current().answer('subscribe', { subscription: 's1' })
     current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: { limit: 1000, offset: 0, total: 1, items: [{ id: 'socket', display: 'Bob', state: { cursor: 4 } }] } })
     expect(live.presences.value[0]?.display).toBe('Bob')
+    await settle()
     cursor.value = 2
     await nextTick()
     expect(current().last('join').body).toEqual({ cursor: 2 })
     current().answer('join')
+    await settle()
     key.value = 'p2'
     await nextTick()
     expect(current().last('leave')).toMatchObject({ target: 'parts', params: { key: 'p1' } })
@@ -284,8 +387,36 @@ describe('useLivePresence', () => {
     expect(refused.params).toEqual({ key: 'p2' })
     current().receive({ id: refused.id, ok: false, status: 404, error: { code: 'not_found', message: 'gone' } })
     await settle()
-    expect(live.error.value?.code).toBe('not_found')
+    expect(live.error.value?.message).toBe('gone')
     scope.stop()
     expect(current().last('leave').params).toEqual({ key: 'p2' })
+  })
+
+  test('a mutated parameters object leaves the record it joined (D37)', async () => {
+    const { connection, current } = connect()
+    const parameters = reactive({ key: 'a' })
+    effectScope().run(() => useLivePresence(presence, parameters, { cursor: 1 }, { connection }))
+    current().open()
+    current().answer('join')
+    await settle()
+    parameters.key = 'b'
+    await nextTick()
+    expect(current().last('leave').params).toEqual({ key: 'a' })
+    expect(current().last('join').params).toEqual({ key: 'b' })
+  })
+
+  test('two views on one record share it; the socket leaves with the last (D37)', async () => {
+    const { connection, current } = connect()
+    const first = effectScope()
+    first.run(() => useLivePresence(presence, { key: 'k' }, { cursor: 1 }, { connection }))
+    const second = effectScope()
+    second.run(() => useLivePresence(presence, { key: 'k' }, { cursor: 2 }, { connection }))
+    current().open()
+    current().answer('join')
+    await settle()
+    first.stop()
+    expect(current().sent.some((frame) => frame.op === 'leave')).toBe(false)
+    second.stop()
+    expect(current().last('leave').params).toEqual({ key: 'k' })
   })
 })
