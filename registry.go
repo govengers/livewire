@@ -51,7 +51,8 @@ func NewRegistry(options *RegistryOptions) (*Registry, error) {
 
 // Add registers declarations in order. It returns the first mistake it finds: a nil or
 // wrapped declaration, one that failed its own validation or belongs to another registry, the
-// reserved name "batch" (the target of a batch's outcomes, D33), a duplicate name, a
+// reserved names "batch" and "filters" (the targets of a batch's and the stored filter
+// routes' outcomes, D33, D59), a duplicate name, a
 // duplicate method and route pattern (placeholder names aside; a resource's item and
 // distinct routes count), a mutation whose Resource or Effect target is not registered by
 // the end of the call, a route of the library's own (BatchPath, FiltersPath). Nothing is added and no declaration is changed when any
@@ -143,8 +144,8 @@ func (s *staging) stage(declaration Declaration) error {
 		return fmt.Errorf("livewire: %s %q: %w", kind, name, shared.err)
 	case shared.registry != nil && shared.registry != s.registry:
 		return fmt.Errorf("livewire: %s %q is registered with another registry", kind, name)
-	case name == batchMutation:
-		return fmt.Errorf("livewire: %s %q: the name is reserved: a batch's outcomes carry it as their target (D33)", kind, name)
+	case name == batchMutation || name == filtersTarget:
+		return fmt.Errorf("livewire: %s %q: the name is reserved: the outcomes of a batch and of the stored filter routes carry it as their target (D33, D59)", kind, name)
 	}
 	if _, exists := s.byName[name]; exists {
 		return fmt.Errorf("livewire: %s %q: the name is already registered", kind, name)

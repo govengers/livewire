@@ -747,12 +747,8 @@ func (s *subscription) markEndedLocked() func() {
 
 // endOutcome is the OutcomeEnd of the subscription, its target named as the subscribe did.
 func (s *subscription) endOutcome() Outcome {
-	target := s.request.Target
-	if s.request.Kind != ReadMain {
-		target += "." + string(s.request.Kind)
-	}
 	return Outcome{
-		Kind: OutcomeEnd, Operation: OperationSubscribe, Target: target, Subscription: s.id,
+		Kind: OutcomeEnd, Operation: OperationSubscribe, Target: s.request.target(), Subscription: s.id,
 		Tenant: s.tenant, Identity: s.socket.lastIdentity(), Status: http.StatusOK,
 	}
 }

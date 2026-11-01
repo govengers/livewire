@@ -160,3 +160,32 @@ func TestSubscriptionEndsAndQueryWaitsAreReported(t *testing.T) {
 	rest := bed.outcomes.of(livewire.OutcomeRequest)
 	require.Zero(t, rest[len(rest)-1].QueryWait, "REST takes no query slot (D52)")
 }
+
+func TestOutcomeTargetsAreAClosedSet(t *testing.T) {
+	bed := newTestbed(t, nil)
+	socket := bed.dial("ada")
+	for _, target := range []string{"nothing", "gadgets.bogus", "gadgets.item"} {
+		socket.do(livewire.OperationQuery, target, map[string]string{"id": "x"}, nil)
+	}
+	subscription := subscribed(t, socket.do(livewire.OperationSubscribe, "gadgets", nil, nil))
+	require.True(t, socket.do(livewire.OperationUnsubscribe, subscription, nil, nil).OK)
+	ctx := auth.WithIdentity(t.Context(), person("ada", roleReader))
+	_, err := bed.engine.Read(ctx, livewire.ReadRequest{Target: "gadgets", Kind: livewire.ReadDistinct, Source: livewire.MapSource{"field": "group"}})
+	require.NoError(t, err)
+
+	var targets []string
+	for _, outcome := range bed.outcomes.of(livewire.OutcomeRequest) {
+		targets = append(targets, outcome.Target)
+		if outcome.Operation == livewire.OperationUnsubscribe {
+			require.Equal(t, subscription, outcome.Subscription)
+		}
+	}
+	require.Equal(t, []string{"", "", "gadgets.item", "", "gadgets.distinct"}, targets, "unknown names and subscription ids report no target")
+
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.ErrorContains(t, registry.Add(livewire.NewList("filters", "/filter-list", &livewire.ListOptions[gadget, livewire.NoParameters]{
+		Read: authorization.IsUser(),
+		Load: func(context.Context, *livewire.NoParameters) ([]gadget, error) { return nil, nil },
+	})), "reserved")
+}

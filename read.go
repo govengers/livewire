@@ -42,6 +42,15 @@ type ReadRequest struct {
 	Source ParameterSource
 }
 
+// target is the read as a socket target names it: the declaration's name, then the read kind
+// after a dot unless it is the main read (D46).
+func (r ReadRequest) target() string {
+	if r.Kind == ReadMain {
+		return r.Target
+	}
+	return r.Target + "." + string(r.Kind)
+}
+
 // PresenceItem is one presence as a presence read answers it: the socket that joined, its
 // display name and the state it sent.
 type PresenceItem struct {
@@ -60,7 +69,7 @@ type PresenceItem struct {
 // refusal or failure is the error, answered through ResponseFor. Read reports an
 // OutcomeRequest to the registry's Observer.
 func (e *Engine) Read(ctx context.Context, request ReadRequest) (json.RawMessage, error) {
-	unit := startUnit(OutcomeRequest, "", request.Target)
+	unit := startUnit(OutcomeRequest, "", request.target())
 	resolved, result, err := e.read(ctx, request)
 	e.observe(ctx, unit.readOutcome(ctx, resolved, err))
 	if err != nil {

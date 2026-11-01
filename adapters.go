@@ -261,7 +261,9 @@ const (
 )
 
 // Outcome is one unit of work the engine or an adapter finished (D4, D30). Target is the
-// declaration's name; Operation is set on the socket, empty on REST; Subscription is set for
+// declaration's name, with the read kind after a dot for a read other than the main one
+// (D46), "batch" for a batch, "filters" for the stored filter routes, and "" when the request
+// named no declaration (D59); Operation is set on the socket, empty on REST; Subscription is set for
 // subscribe and rerun; Tenant is the resolved tenant (D42); Parameters is the decoded
 // parameters value (a *Parameters) when they were decoded; Status is the HTTP status answered
 // (the close code for OutcomeClose); Err is the refusal or failure, with the server-side
