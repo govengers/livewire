@@ -124,8 +124,8 @@ func TestSlowWriteClosesTheSocket1013(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.Body.Close())
 	defer func() { _ = connection.Close() }()
-	for index := range 16 {
-		if connection.WriteJSON(livewire.RequestFrame{ID: strconv.Itoa(index), Operation: livewire.OperationQuery, Target: "gadgets"}) != nil {
+	for index := range 16 { // openGadgets guards no field: its answers are large but cheap, no redaction under -race
+		if connection.WriteJSON(livewire.RequestFrame{ID: strconv.Itoa(index), Operation: livewire.OperationQuery, Target: "openGadgets"}) != nil {
 			break
 		}
 	}
