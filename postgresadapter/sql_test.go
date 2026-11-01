@@ -3,12 +3,14 @@ package postgresadapter_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/govengers/auth"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -393,28 +395,11 @@ func TestAMoveBetweenNativePartitionsIsADeleteAndAnInsert(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"insert eu", "delete eu", "insert us"}, versions, "as HistorySQL documents it")
 
-	historyOf := func(filter string) *livewire.Page[livewire.Version[map[string]any]] {
-		t.Helper()
-		var document *query.Document
-		if filter != "" {
-			document, err = query.Parse(livewire.HistoryFields(), []byte(filter))
-			require.NoError(t, err)
-		}
-		scope := func(builder *query.Builder) { builder.WriteString("id = ").Argument(id) }
-		listQuery, err := query.Compile(livewire.HistoryFields(), document, []query.SortTerm{{Field: "id"}}, query.Page{Limit: 10}, scope)
-		require.NoError(t, err)
-		page, err := postgresadapter.HistoryPage(t.Context(), database.pool, "orders", listQuery, func(row []byte) (*map[string]any, error) {
-			var data map[string]any
-			return &data, json.Unmarshal(row, &data)
-		})
-		require.NoError(t, err)
-		return page
-	}
-	moved := historyOf("")
+	moved := historyPage(t, database, "orders", id, "")
 	require.Equal(t, 3, moved.Total, "a partition move stays in its life: the row keeps its whole history")
 	require.Equal(t, []livewire.ChangeOperation{livewire.ChangeInsert, livewire.ChangeDelete, livewire.ChangeInsert},
 		[]livewire.ChangeOperation{moved.Items[0].Operation, moved.Items[1].Operation, moved.Items[2].Operation})
-	deletes := historyOf(`{"where":{"field":"operation","op":"eq","value":"delete"}}`)
+	deletes := historyPage(t, database, "orders", id, `{"where":{"field":"operation","op":"eq","value":"delete"}}`)
 	require.Equal(t, 1, deletes.Total, "the delete of a move is a version the filter reaches")
 }
 
@@ -587,4 +572,85 @@ func writeConcurrently(t *testing.T, database *testDatabase, statement string, m
 	writers.Wait()
 	require.NoError(t, maintained, "the move and the attach hold against concurrent inserts")
 	require.Empty(t, failures, "no writer failed, the ones queued behind the attach included")
+}
+
+// historyPage reads id's history of table through HistoryPage, filtered by filter ("" for
+// none), oldest first.
+func historyPage(t *testing.T, database *testDatabase, table, id, filter string) *livewire.Page[livewire.Version[map[string]any]] {
+	t.Helper()
+	page, err := readHistoryPage(t.Context(), database, table, id, filter)
+	require.NoError(t, err)
+	return page
+}
+
+func readHistoryPage(ctx context.Context, database *testDatabase, table, id, filter string) (*livewire.Page[livewire.Version[map[string]any]], error) {
+	var document *query.Document
+	if filter != "" {
+		var err error
+		if document, err = query.Parse(livewire.HistoryFields(), []byte(filter)); err != nil {
+			return nil, err
+		}
+	}
+	scope := func(builder *query.Builder) { builder.WriteString("id = ").Argument(id) }
+	listQuery, err := query.Compile(livewire.HistoryFields(), document, []query.SortTerm{{Field: "id"}}, query.Page{Limit: 10}, scope)
+	if err != nil {
+		return nil, err
+	}
+	return postgresadapter.HistoryPage(ctx, database.pool, table, listQuery, func(row []byte) (*map[string]any, error) {
+		var data map[string]any
+		return &data, json.Unmarshal(row, &data)
+	})
+}
+
+// names are the names the versions of a page left.
+func names(page *livewire.Page[livewire.Version[map[string]any]]) []string {
+	result := []string{}
+	for _, version := range page.Items {
+		result = append(result, string(version.Operation)+":"+fmt.Sprint((*version.Data)["name"]))
+	}
+	return result
+}
+
+func TestHistoryLifeStartsWheneverARowArrivesUnderAnID(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	exec := func(statement string, arguments ...any) {
+		t.Helper()
+		_, err := database.pool.Exec(t.Context(), statement, arguments...)
+		require.NoError(t, err)
+	}
+	truncated := uuid.NewString()
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'alices-secret')", truncated)
+	exec("UPDATE parts SET name = 'alices-other' WHERE id = $1", truncated)
+	exec("TRUNCATE parts")
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'mallorys')", truncated)
+	require.Equal(t, []string{"insert:mallorys"}, names(historyPage(t, database, "parts", truncated, "")), "a re-create after a TRUNCATE")
+
+	dead, moving := uuid.NewString(), uuid.NewString()
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'alices-secret')", dead)
+	exec("DELETE FROM parts WHERE id = $1", dead)
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'mallorys')", moving)
+	exec("UPDATE parts SET id = $1 WHERE id = $2", dead, moving)
+	require.Equal(t, []string{"update:mallorys"}, names(historyPage(t, database, "parts", dead, "")), "an id change onto a deleted id")
+
+	away, target := uuid.NewString(), uuid.NewString()
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'alices-secret')", away)
+	exec("UPDATE parts SET id = $1 WHERE id = $2", target, away)
+	exec("INSERT INTO parts (id, name) VALUES ($1, 'mallorys')", away)
+	require.Equal(t, []string{"insert:mallorys"}, names(historyPage(t, database, "parts", away, "")), "an id moved away and re-created")
+	require.Equal(t, []string{"update:alices-secret"}, names(historyPage(t, database, "parts", target, "")), "the new id's history starts at the change")
+}
+
+func TestHistoryPageReadsALongHistoryInLinearTime(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	id := uuid.NewString()
+	_, err := database.pool.Exec(t.Context(), `INSERT INTO parts_history (id, version, operation, data, valid_from, life)
+		SELECT $1, version, 'update', '{"name":"bolt"}', now(), 1 FROM generate_series(1, 5000) AS version`, id)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	page, err := readHistoryPage(ctx, database, "parts", id, "")
+	require.NoError(t, err, "5000 versions read well within the deadline; a scope re-run per version takes seconds")
+	require.Equal(t, 5000, page.Total)
 }

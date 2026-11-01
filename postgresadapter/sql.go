@@ -220,6 +220,7 @@ DECLARE
 	last_operation text;
 	last_transaction xid8;
 	current_life integer;
+	starts boolean := TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND (to_jsonb(OLD)->>'id') IS DISTINCT FROM (current_row->>'id'));
 BEGIN
 	IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = to_jsonb(NEW) THEN
 		RETURN NULL;
@@ -230,13 +231,14 @@ BEGIN
 	END IF;
 	EXECUTE format('SELECT coalesce(max(version), 0) + 1, greatest(clock_timestamp(), max(valid_from), max(valid_to)) FROM %s WHERE id = $1', history)
 		INTO next_version, stamp USING row_id;
-	-- The life of the version: an insert after a delete of another transaction is a new item
-	-- under an old id, so it starts the next life; a delete and an insert of one transaction (a
-	-- partition move) and every update stay in the life they continue.
+	-- The life of the version: a row arriving under an id (an insert, or an update that changes
+	-- the id onto it) starts the id's next life, unless the id's last version is a delete of
+	-- this very transaction, the delete half of a partition move; every other version
+	-- continues the life of the one before.
 	EXECUTE format('SELECT life, operation, transaction_id FROM %s WHERE id = $1 ORDER BY version DESC LIMIT 1', history)
 		INTO last_life, last_operation, last_transaction USING row_id;
 	current_life := coalesce(last_life, 1);
-	IF TG_OP = 'INSERT' AND last_operation = 'delete' AND last_transaction <> pg_current_xact_id() THEN
+	IF starts AND last_life IS NOT NULL AND NOT (last_operation = 'delete' AND last_transaction = pg_current_xact_id()) THEN
 		current_life := last_life + 1;
 	END IF;
 	EXECUTE format('UPDATE %s SET valid_to = $2 WHERE id = $1 AND valid_to IS NULL', history) USING row_id, stamp;
@@ -266,12 +268,15 @@ $$;
 // PostgreSQL's 63 bytes is refused.
 //
 // Every version carries the life of its id (life, from 1) and the transaction that wrote it
-// (transaction_id): an insert after a delete written by another transaction is a new item
-// under an old id (a ClientID create, D18) and starts the next life; every other version
-// continues the life of the one before, so a partition move (a delete and an insert in one
-// transaction) and an id change keep a row's history whole. A delete and a re-create of one
-// id inside one transaction cannot be told from a move and stay one life. HistoryPage reads
-// the current life only (D56).
+// (transaction_id). A row that arrives under an id, by an insert or by an update that
+// changes its id onto it, starts that id's next life: a re-create after a delete or a
+// TRUNCATE, a ClientID create of an old id (D18) and an id change onto an id that lived
+// before never continue the old item's history. Only the insert half of a partition move,
+// whose id's last version is a delete of the same transaction, continues the life, so a
+// moved row keeps its whole history; a delete and a re-create of one id inside one
+// transaction cannot be told from a move and stay one life too. An id change starts the new
+// id's history at the change; the old versions stay under the old id. Every other version
+// continues the life of the one before. HistoryPage reads the current life only (D56).
 func HistorySQL(table string) (string, error) {
 	if len(table)+len(historySuffix) > maximumIdentifierBytes {
 		return "", fmt.Errorf("postgresadapter: HistorySQL(%q): %q is longer than PostgreSQL's %d bytes", table, table+historySuffix, maximumIdentifierBytes)
