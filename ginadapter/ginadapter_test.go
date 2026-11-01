@@ -391,6 +391,7 @@ func TestExportTrailerTellsACompleteCSVOnHTTP2BehindRecovery(t *testing.T) {
 		status  int
 		trailer http.Header
 		body    string
+		read    error
 	}
 	export := func(query string) exported {
 		t.Helper()
@@ -399,17 +400,19 @@ func TestExportTrailerTellsACompleteCSVOnHTTP2BehindRecovery(t *testing.T) {
 		request.Header.Set(subjectHeader, "rita")
 		response, err := httpServer.Client().Do(request)
 		require.NoError(t, err)
-		body, _ := io.ReadAll(response.Body) // a reset stream errors; the trailer decides either way
+		body, read := io.ReadAll(response.Body)
 		require.NoError(t, response.Body.Close())
 		require.Equal(t, 2, response.ProtoMajor)
-		return exported{status: response.StatusCode, trailer: response.Trailer, body: string(body)}
+		return exported{status: response.StatusCode, trailer: response.Trailer, body: string(body), read: read}
 	}
 
 	complete := export("")
+	require.NoError(t, complete.read)
 	require.Equal(t, "id,name\n"+firstID+",bolt\n", complete.body)
 	require.Equal(t, "1", complete.trailer.Get(ginadapter.ExportRowsTrailer), "a complete export ends with its rows")
 	broken := export("?filter=" + url.QueryEscape(`{"where":{"field":"name","op":"eq","value":"fail"}}`))
 	require.Equal(t, http.StatusOK, broken.status)
-	require.Empty(t, broken.trailer.Get(ginadapter.ExportRowsTrailer), "an export cut after its first byte has no trailer, though Recovery ended the stream cleanly")
+	require.Error(t, broken.read, "the stream is reset though gin.Recovery swallowed the abort")
+	require.Empty(t, broken.trailer.Get(ginadapter.ExportRowsTrailer), "and an export cut after its first byte has no trailer")
 	httpServer.Client().CloseIdleConnections()
 }

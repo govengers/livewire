@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -15,16 +16,16 @@ import (
 )
 
 // ExportRowsTrailer is the trailer of a complete export: the rows it wrote. The response
-// declares it with its headers and sets it only when the export finished, so a client tells
-// a complete CSV from a cut one by the trailer, whatever the transport did with the abort.
+// declares it with its headers and sets it only when the export finished: a signal on top of
+// the aborted body, for a client that reads trailers.
 const ExportRowsTrailer = "Livewire-Export-Rows"
 
 // export streams a resource's export as CSV (D35). The headers go out with the first byte
 // the loader writes, so a refusal before it is answered as an error body; a success ends with
-// the ExportRowsTrailer. A failure after the first byte aborts the response: on HTTP/1.1 the
-// connection is closed under it, else the handler panics with http.ErrAbortHandler, which
-// resets an HTTP/2 stream only when no recovery middleware swallows it (gin.Recovery does:
-// the body then ends cleanly, without the trailer).
+// the ExportRowsTrailer. A failure after the first byte aborts the response, so the client's
+// read of the body fails, whatever middleware runs: on HTTP/1.1 the connection is closed
+// under it; on HTTP/2 a write deadline in the past resets the stream, and the handler panics
+// with http.ErrAbortHandler for the middleware that lets it through.
 func (h *handlers) export(name string) gin.HandlerFunc {
 	recorded := unit{target: name, kind: "export"}
 	return func(ginContext *gin.Context) {
@@ -71,8 +72,9 @@ func (w *exportWriter) start() {
 }
 
 // abort ends a response whose body is broken: the connection is closed under it (HTTP/1.1),
-// else the handler panics with http.ErrAbortHandler, which net/http turns into a reset
-// stream.
+// else a write deadline in the past resets the stream (HTTP/2; a recovery middleware that
+// swallows http.ErrAbortHandler, as gin.Recovery does, cannot undo it) and the handler panics
+// with http.ErrAbortHandler.
 func abort(ginContext *gin.Context) {
 	ginContext.Writer.Flush()
 	if unwrapper, ok := ginContext.Writer.(interface{ Unwrap() http.ResponseWriter }); ok {
@@ -83,6 +85,7 @@ func abort(ginContext *gin.Context) {
 			}
 		}
 	}
+	_ = http.NewResponseController(ginContext.Writer).SetWriteDeadline(time.Now().Add(-time.Second)) // a writer without deadlines leaves the panic alone to abort
 	panic(http.ErrAbortHandler)
 }
 
