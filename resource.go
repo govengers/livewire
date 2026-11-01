@@ -110,7 +110,7 @@ const (
 // DistinctMaximum caps a distinct read (default 1000). Cursor allows keyset pagination with
 // the `after` parameter and answers the Next of List's Page as ListResponse.next (D38, D55).
 // Versioned marks the item as carrying `version` (D34); History, which needs Versioned and
-// an Item key of type uuid, reads one item's versions for the history route (HistoryQuery
+// the Item key on the uuid field "id" (its SQL the table's id column), reads one item's versions for the history route (HistoryQuery
 // says what it gets) and the subscription of it re-runs on the resource's Tables, which
 // every version is written with. Export streams every row under scope, filter and sort to
 // the writer for the export route (D35) and returns how many it wrote: the columns are
@@ -679,8 +679,10 @@ func cloneFields(fields query.Fields) query.Fields {
 	return cloned
 }
 
-// validateHistory checks the history read's needs: a versioned resource with an item key on
-// a uuid field, the id of `<table>_history`.
+// validateHistory checks the history read's needs: a versioned resource whose item key is
+// its uuid field "id", the column `<table>_history` keys its versions by. The history is
+// scoped by the key's value, so a key on any other field would let an item the caller may
+// read name the history of another row whose id equals that field's value.
 func (r *Resource) validateHistory() error {
 	if r.history == nil {
 		return nil
@@ -689,8 +691,8 @@ func (r *Resource) validateHistory() error {
 		return errors.New("a History loader needs Versioned and Item: the history route is below the item route")
 	}
 	field, _ := r.fields.Lookup(r.item.Field)
-	if field.Type != query.TypeUUID {
-		return fmt.Errorf("a History loader needs an item key of type uuid, the id of the history table; Item.Field %q is %s", r.item.Field, field.Type)
+	if field.Name != keyFieldJSON || field.Type != query.TypeUUID {
+		return fmt.Errorf("a History loader needs the item key on the uuid field %q, the id the history table keys its versions by; Item.Field is %q (%s)", keyFieldJSON, r.item.Field, field.Type)
 	}
 	return nil
 }
