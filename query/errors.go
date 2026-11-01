@@ -1,6 +1,11 @@
 package query
 
-import "fmt"
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+)
 
 // Code names what a client got wrong. Every code answers 400.
 type Code string
@@ -29,12 +34,15 @@ type Error struct {
 	Fields  map[string]string
 }
 
+// Error names the code, its message and the paths of the offending parts, never what is
+// wrong with them: a field's text may quote the client's value, which stays out of logs and
+// wide events; the client gets it through the Fields.
 func (e *Error) Error() string {
-	text := string(e.Code) + ": " + e.Message
-	for path, message := range e.Fields {
-		text += " (" + path + ": " + message + ")"
+	paths := slices.Sorted(maps.Keys(e.Fields))
+	if len(paths) == 0 {
+		return string(e.Code) + ": " + e.Message
 	}
-	return text
+	return string(e.Code) + ": " + e.Message + " (" + strings.Join(paths, ", ") + ")"
 }
 
 var messages = map[Code]string{

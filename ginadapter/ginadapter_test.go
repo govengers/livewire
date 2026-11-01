@@ -416,3 +416,14 @@ func TestExportTrailerTellsACompleteCSVOnHTTP2BehindRecovery(t *testing.T) {
 	require.Empty(t, broken.trailer.Get(ginadapter.ExportRowsTrailer), "and an export cut after its first byte has no trailer")
 	httpServer.Client().CloseIdleConnections()
 }
+
+func TestRefusalsKeepClientValuesOffTheWideEvent(t *testing.T) {
+	server := newServer(t)
+	filter := url.QueryEscape(`{"where":{"field":"id","op":"eq","value":"alice@example.org"}}`)
+	refused := server.do(http.MethodGet, "/api/parts?filter="+filter, "rita", nil, nil)
+	require.Equal(t, http.StatusBadRequest, refused.Code)
+	require.Contains(t, refused.Body.String(), "alice@example.org", "the client learns what was wrong")
+	event := server.lastEvent()
+	require.Contains(t, event["error"], "invalid_filter")
+	require.NotContains(t, event["error"], "alice@example.org", "the wide event names the code and the path only (LOG-009)")
+}
