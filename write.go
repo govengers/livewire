@@ -425,7 +425,7 @@ func (e *Engine) Upload(ctx context.Context, request UploadRequest) (status int,
 	ctx = WithTenant(ctx, prepared.tenant)
 	plan := callPlan(request.Target, prepared.parameters, request.IdempotencyKey, request.RequestID)
 	answer, err := e.writeAudited(ctx, plan, unit.started, func(ctx context.Context) (int, json.RawMessage, error) {
-		response, err := prepared.upload.Handle(ctx, prepared.parameters, request.File)
+		response, err := prepared.upload.Handle(ctx, prepared.parameters, prepared.file)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -443,6 +443,7 @@ type preparedUpload struct {
 	upload     *Upload
 	parameters any
 	tenant     string
+	file       *File
 }
 
 func (e *Engine) prepareUpload(ctx context.Context, request UploadRequest) (*preparedUpload, error) {
@@ -465,7 +466,9 @@ func (e *Engine) prepareUpload(ctx context.Context, request UploadRequest) (*pre
 	if err := checkFile(upload, request.File); err != nil {
 		return nil, err
 	}
-	return &preparedUpload{upload: upload, parameters: parameters, tenant: tenant}, nil
+	file := *request.File
+	file.ContentType = upload.Accepts(file.ContentType) // the declared type, without parameters
+	return &preparedUpload{upload: upload, parameters: parameters, tenant: tenant, file: &file}, nil
 }
 
 // checkFile holds the file against the declared content types and size (D17).
