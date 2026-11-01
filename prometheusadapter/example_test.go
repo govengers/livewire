@@ -4,11 +4,17 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
 
+	"github.com/gorilla/websocket"
 	"github.com/govengers/auth"
 	"github.com/govengers/auth/authorization"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/prometheusadapter"
@@ -70,4 +76,33 @@ func Example() {
 
 	fmt.Println(testutil.CollectAndCount(metricsRegistry, "shop_livewire_units_total"))
 	// Output: 2
+}
+
+func TestInvalidSocketFramesAddNoSeries(t *testing.T) {
+	metricsRegistry := prometheus.NewRegistry()
+	metrics, err := prometheusadapter.New(&prometheusadapter.Options{Registerer: metricsRegistry})
+	require.NoError(t, err)
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{Observer: metrics.Observe})
+	require.NoError(t, err)
+	engine, err := livewire.NewEngine(&livewire.EngineOptions{Registry: registry, IdentitySource: anyone{}, Transactor: noTransactor{}, SameHostOnly: true})
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		identity := &auth.Identity{Provider: "example", Subject: "ada", Active: true}
+		engine.Handler().ServeHTTP(writer, request.WithContext(auth.WithIdentity(request.Context(), identity)))
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { require.NoError(t, engine.Close(context.Background())) })
+	connection, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	t.Cleanup(func() { _ = connection.Close() }) // the engine closes it first; the error carries nothing
+	for index := range 50 {
+		require.NoError(t, connection.WriteJSON(livewire.RequestFrame{ID: strconv.Itoa(index), Operation: livewire.Operation("bogus" + strconv.Itoa(index)), Target: "x" + strconv.Itoa(index)}))
+	}
+	for range 50 {
+		var answer livewire.ResponseFrame
+		require.NoError(t, connection.ReadJSON(&answer))
+		require.Equal(t, http.StatusBadRequest, answer.Status)
+	}
+	require.Equal(t, 1, testutil.CollectAndCount(metricsRegistry, "livewire_units_total"), "50 invalid frames, one series")
 }

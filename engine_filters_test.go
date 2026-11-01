@@ -230,3 +230,16 @@ func TestListedFiltersAreAuthorizedAgain(t *testing.T) {
 		require.Empty(t, listed(person("ada"), resource), "no filter of a resource the owner may no longer read (%q)", resource)
 	}
 }
+
+func TestUnknownOperationsReportOther(t *testing.T) {
+	bed := newTestbed(t, nil)
+	socket := bed.dial("ada")
+	for _, operation := range []livewire.Operation{"bogus0", "bogus1", livewire.OperationPing} {
+		socket.response(socket.sendFrame(livewire.RequestFrame{Operation: operation}))
+	}
+	var operations []livewire.Operation
+	for _, outcome := range bed.outcomes.of(livewire.OutcomeRequest) {
+		operations = append(operations, outcome.Operation)
+	}
+	require.Equal(t, []livewire.Operation{"other", "other", livewire.OperationPing}, operations)
+}

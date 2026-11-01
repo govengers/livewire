@@ -15,6 +15,7 @@ import (
 // outcome and nothing else.
 func (e *Engine) observe(ctx context.Context, outcome Outcome) {
 	outcome.Target = e.reportedTarget(outcome.Target)
+	outcome.Operation = reportedOperation(outcome.Operation)
 	_ = recovering(func() error { // the panic of an Observer has nobody left to report to
 		e.registry.Observe(ctx, outcome)
 		return nil
@@ -37,6 +38,25 @@ func (e *Engine) reportedTarget(target string) string {
 		return ""
 	}
 	return target
+}
+
+// operations are the socket operations an outcome reports by name; unknownOperation stands
+// for every other a frame named.
+var operations = []Operation{
+	OperationQuery, OperationSubscribe, OperationUnsubscribe, OperationCall, OperationBatch,
+	OperationJoin, OperationLeave, OperationPing,
+}
+
+const unknownOperation = "other"
+
+// reportedOperation is the operation an outcome reports: a socket operation, "" on REST, or
+// "other" for an operation the socket does not know, so a metric label on it stays a closed
+// set (MET-004).
+func reportedOperation(operation Operation) Operation {
+	if operation == "" || slices.Contains(operations, operation) {
+		return operation
+	}
+	return Operation(unknownOperation)
 }
 
 // unitOfWork carries what an outcome reports from the start of a frame, request, re-run or
