@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -36,6 +37,42 @@ func GeneratedIsCurrent(tb testing.TB, registry *livewire.Registry, options *gen
 			tb.Errorf("livewiretest: GeneratedIsCurrent: %s is not what the registry generates now: run the generator and commit its output\n%s",
 				file.Path, lineDifference(committed, file.Content))
 		default:
+		}
+	}
+}
+
+// GeneratedIsCurrentStrict is GeneratedIsCurrent for an application whose output directories
+// belong to the generator: it also fails on every file below the TypeScript, Go client and CLI
+// directories that the registry no longer generates, such as the client of a removed
+// declaration's leftover file. An application that keeps its own files there uses
+// GeneratedIsCurrent.
+func GeneratedIsCurrentStrict(tb testing.TB, registry *livewire.Registry, options *generate.Options) {
+	tb.Helper()
+	GeneratedIsCurrent(tb, registry, options)
+	files, err := generate.Render(registry, options)
+	if err != nil {
+		return // GeneratedIsCurrent failed the test with it
+	}
+	rendered := map[string]bool{}
+	for _, file := range files {
+		rendered[filepath.Clean(file.Path)] = true
+	}
+	for _, directory := range []string{options.TypeScriptDirectory, options.GoClient.Directory, options.CommandLine.Directory} {
+		if directory == "" {
+			continue
+		}
+		err := filepath.WalkDir(directory, func(path string, entry fs.DirEntry, err error) error {
+			switch {
+			case err != nil:
+				return err
+			case !entry.IsDir() && !rendered[filepath.Clean(path)]:
+				tb.Errorf("livewiretest: GeneratedIsCurrentStrict: %s is not generated from the registry: delete it", path)
+			default:
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			tb.Errorf("livewiretest: GeneratedIsCurrentStrict: %v", err)
 		}
 	}
 }

@@ -27,8 +27,9 @@ type Write struct {
 // StaleOptions configures Stale. Application, Authenticate (as for ParityOptions) and Writes
 // are required: Writes needs a write for every table a live declaration lists in Tables, each
 // of a row the fixture identity reads, so it changes a live read of a declaration that lists
-// the table; a write to a table no declaration lists is allowed and checks that the reads it
-// changes re-run anyway. Reads gives the parameters of the live reads that need them, as
+// the table. A write to a table no live declaration lists may change nothing; what it changes
+// must re-run like any other change, so it is how a test proves that a loader reading an
+// undeclared table goes stale. Reads gives the parameters of the live reads that need them, as
 // ParityOptions.Reads does. Timeout bounds the wait for a subscription to catch up with one
 // write (default 5 s).
 type StaleOptions struct {
@@ -48,8 +49,13 @@ const defaultStaleTimeout = 5 * time.Second
 // whose state does not reach that REST body within the timeout: a write the subscription
 // should have re-run on and did not, because the declaration does not list the table the
 // write changed, or the table sends no notification (TriggerSQL missing), or the change feed
-// does not reach the engine. A write that changes no live read of a declaration that lists its
-// table fails too: it proves nothing about that table.
+// does not reach the engine. A write to a declared table that changes no live read of a
+// declaration listing it fails too: it proves nothing about that table.
+//
+// What it cannot catch: a table no Write writes. It requires a write for every declared table,
+// but no gate can discover a table a loader reads without declaring it; give the writes of
+// every table the loaders read, declared or not, and Stale catches the undeclared ones. It
+// also checks only what the fixture identity reads, through the reads it is given.
 func Stale(tb testing.TB, options *StaleOptions) {
 	tb.Helper()
 	if options == nil {
@@ -75,7 +81,7 @@ func Stale(tb testing.TB, options *StaleOptions) {
 		tb.Fatalf("livewiretest: Stale: %v", err)
 		return
 	}
-	run := &staleRun{server: server, connection: connection, subscriptions: subscriptions, timeout: options.Timeout}
+	run := &staleRun{server: server, connection: connection, subscriptions: subscriptions, timeout: options.Timeout, declared: declaredTables(targets)}
 	if run.timeout <= 0 {
 		run.timeout = defaultStaleTimeout
 	}
@@ -90,6 +96,18 @@ type staleRun struct {
 	connection    *socket
 	subscriptions []*liveRead
 	timeout       time.Duration
+	declared      map[string]bool // the tables a live declaration lists
+}
+
+// declaredTables are the tables the live targets' declarations list.
+func declaredTables(targets []readTarget) map[string]bool {
+	declared := map[string]bool{}
+	for _, target := range targets {
+		for _, table := range target.declaration.Tables() {
+			declared[table] = true
+		}
+	}
+	return declared
 }
 
 // requireWrites fails the gate for every table a live declaration lists without a write.
@@ -138,7 +156,7 @@ func subscribeAll(ctx context.Context, server *testServer, connection *socket, r
 }
 
 // checkWrite commits one write and requires every subscription to catch up with its REST read
-// and at least one read of a declaration listing the table to have changed.
+// and, for a table a live declaration lists, at least one read of one of those to have changed.
 func (r *staleRun) checkWrite(ctx context.Context, tb testing.TB, write Write) {
 	tb.Helper()
 	before := make([]json.RawMessage, len(r.subscriptions))
@@ -159,9 +177,9 @@ func (r *staleRun) checkWrite(ctx context.Context, tb testing.TB, write Write) {
 			continue
 		}
 		listsTable := slices.Contains(live.read.target.declaration.Tables(), write.Table)
-		changed = changed || (listsTable && !sameState(before[index], live.state))
+		changed = changed || (listsTable && !sameState(before[index], live.state, live.read.target.undiffed()))
 	}
-	if !changed {
+	if !changed && r.declared[write.Table] {
 		tb.Errorf("livewiretest: Stale: the write to %s changed no live read of a declaration that lists it: write a row the fixture identity reads", write.Table)
 	}
 }
@@ -173,7 +191,7 @@ func (l *liveRead) catchUp(ctx context.Context, server *testServer, connection *
 	if err != nil {
 		return err
 	}
-	for l.state == nil || !sameState(l.state, rest) {
+	for l.state == nil || !sameState(l.state, rest, l.read.target.undiffed()) {
 		push, err := connection.push(l.subscription, deadline)
 		if errors.Is(err, errWaitedTooLong) {
 			return fmt.Errorf("its pushed state stays behind its REST read\nREST:   %s\nsocket: %s", abbreviate(rest), abbreviate(l.state))
@@ -256,19 +274,34 @@ func applyChange(state json.RawMessage, change *livewire.ListChange) (json.RawMe
 	return json.Marshal(list)
 }
 
-// sameState reports whether a pushed state and a REST body carry the same JSON. A list's limit
-// and next are left out: a diff carries neither (D14, D64), and a typed list's limit is the
-// count of its items.
-func sameState(state, rest json.RawMessage) bool {
+// undiffed are the members of a read's body that a diff does not carry, so a pushed state
+// keeps the snapshot's: a resource list's and a history's next (D64), and a typed list's
+// limit, the count of its items (D73). Every other read is compared whole.
+func (r readTarget) undiffed() []string {
+	switch r.declaration.(type) {
+	case *livewire.Resource:
+		if r.kind == livewire.ReadMain || r.kind == livewire.ReadHistory {
+			return []string{"next"}
+		}
+	case *livewire.List:
+		return []string{"limit"}
+	default:
+	}
+	return nil
+}
+
+// sameState reports whether a pushed state and a REST body carry the same JSON, the members a
+// diff does not carry aside.
+func sameState(state, rest json.RawMessage, undiffed []string) bool {
 	if bytes.Equal(state, rest) {
 		return true
 	}
-	left, leftErr := decodedJSON(state)
-	right, rightErr := decodedJSON(rest)
-	return leftErr == nil && rightErr == nil && reflect.DeepEqual(left, right)
+	stateValue, stateError := decodedJSON(state, undiffed)
+	restValue, restError := decodedJSON(rest, undiffed)
+	return stateError == nil && restError == nil && reflect.DeepEqual(stateValue, restValue)
 }
 
-func decodedJSON(body json.RawMessage) (any, error) {
+func decodedJSON(body json.RawMessage, undiffed []string) (any, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	var value any
@@ -276,9 +309,8 @@ func decodedJSON(body json.RawMessage) (any, error) {
 		return nil, err
 	}
 	if object, isObject := value.(map[string]any); isObject {
-		if _, isList := object["items"]; isList {
-			delete(object, "limit")
-			delete(object, "next")
+		for _, member := range undiffed {
+			delete(object, member)
 		}
 	}
 	return value, nil

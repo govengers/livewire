@@ -71,6 +71,7 @@ func TestParityFailsWhenRESTAndSocketAnswerDifferently(t *testing.T) {
 			Authenticate: as("alice"),
 			Reads: []livewiretest.Read{
 				{Target: "notes.item", Parameters: map[string]string{"id": application.firstNote("north")}},
+				{Target: "notes.history", Parameters: map[string]string{"id": application.firstNote("north")}},
 				{Target: "notes.distinct", Parameters: map[string]string{"field": "title"}},
 			},
 		})
@@ -110,6 +111,7 @@ func TestStaleFailsWhenADeclarationMissesATable(t *testing.T) {
 			Authenticate: as("alice"),
 			Reads: []livewiretest.Read{
 				{Target: "notes.item", Parameters: map[string]string{"id": application.firstNote("north")}},
+				{Target: "notes.history", Parameters: map[string]string{"id": application.firstNote("north")}},
 				{Target: "notes.distinct", Parameters: map[string]string{"field": "title"}},
 			},
 			Writes:  []livewiretest.Write{application.addNote("north", "second"), application.addTag("north", "later")},
@@ -124,6 +126,7 @@ func TestStaleFailsOnWritesThatProveNothing(t *testing.T) {
 	application := newApplication(t, brokenBy{})
 	reads := []livewiretest.Read{
 		{Target: "notes.item", Parameters: map[string]string{"id": application.firstNote("north")}},
+		{Target: "notes.history", Parameters: map[string]string{"id": application.firstNote("north")}},
 		{Target: "notes.distinct", Parameters: map[string]string{"field": "title"}},
 	}
 	failures := gateFailures(func(t testing.TB) {
@@ -170,16 +173,104 @@ func TestTenantIsolationNeedsRowsOfBothTenants(t *testing.T) {
 			Tenants:     [2]livewiretest.Tenant{{Name: "north", Authenticate: as("alice")}, {Name: "west", Authenticate: as("dave")}},
 		})
 	})
-	requireFailure(t, failures, "west reads no row of notes")
+	requireFailure(t, failures, "notes: west reads no row")
 	unauthenticated := gateFailures(func(t testing.TB) {
 		livewiretest.TenantIsolation(t, &livewiretest.TenantIsolationOptions{
 			Application: application.Application,
 			Tenants:     [2]livewiretest.Tenant{{Name: "north", Authenticate: as("alice")}, {Name: "nobody", Authenticate: as("nobody")}},
 		})
 	})
-	requireFailure(t, unauthenticated, "notes as nobody: REST answered 401", "nobody's export answered 401")
+	requireFailure(t, unauthenticated, "notes: as nobody: REST answered 401")
 	requireFailure(t, gateFailures(func(t testing.TB) { livewiretest.TenantIsolation(t, nil) }), "TenantIsolation needs options")
 	requireFailure(t, gateFailures(func(t testing.TB) {
 		livewiretest.TenantIsolation(t, &livewiretest.TenantIsolationOptions{Application: application.Application})
 	}), "needs two tenants")
+}
+
+// isolationFailures runs TenantIsolation as north and south on an application broken as told.
+func isolationFailures(t *testing.T, broken brokenBy) []string {
+	t.Helper()
+	application := newApplication(t, broken)
+	return gateFailures(func(t testing.TB) {
+		livewiretest.TenantIsolation(t, &livewiretest.TenantIsolationOptions{
+			Application: application.Application,
+			Tenants:     [2]livewiretest.Tenant{{Name: "north", Authenticate: as("alice")}, {Name: "south", Authenticate: as("bob")}},
+		})
+	})
+}
+
+// TestTenantIsolationFindsEachSelectiveLeak pins every way a loader leaks without its list
+// leaking: each passed the first version of the gate.
+func TestTenantIsolationFindsEachSelectiveLeak(t *testing.T) {
+	t.Parallel()
+	require.Empty(t, isolationFailures(t, brokenBy{notesPerTenant: 12, pageSize: 2, countCap: 3}), "a sound application passes")
+	for name, testCase := range map[string]struct {
+		broken brokenBy
+		parts  []string
+	}{
+		"a distinct read":                   {brokenBy{leakingDistinct: true}, []string{"north's distinct title counts", "its own rows 0 times"}},
+		"a tenant's own history":            {brokenBy{leakingHistory: true}, []string{"/notes/{id}/history of north's row", "answers the row", "of south"}},
+		"rows past the capped total":        {brokenBy{notesPerTenant: 3, pageSize: 2, countCap: 1, leakingPastCap: true}, []string{"north lists the row", "of south"}},
+		"the eleventh foreign item":         {brokenBy{notesPerTenant: 12, leakingItemsFrom: 10}, []string{"north reads /notes/{id} of south's row"}},
+		"an export without its key":         {brokenBy{exportWithoutKey: true}, []string{`north's export writes no "id" column`}},
+		"a resource whose rows have no key": {brokenBy{keylessMemos: true}, []string{"memos: as north: a listed row cannot be checked", `no usable "id"`}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requireFailure(t, isolationFailures(t, testCase.broken), testCase.parts...)
+		})
+	}
+}
+
+func TestStaleComparesAnObjectWhole(t *testing.T) {
+	t.Parallel()
+	application := newApplication(t, brokenBy{boardObject: true})
+	failures := gateFailures(func(t testing.TB) {
+		livewiretest.Stale(t, &livewiretest.StaleOptions{
+			Application: application.Application, Authenticate: as("alice"), Reads: notesReads(application),
+			Writes:  []livewiretest.Write{application.addNote("north", "second"), application.addTag("north", "later")},
+			Timeout: 500 * time.Millisecond,
+		})
+	})
+	require.Len(t, failures, 1, "an object with items and a limit is no list: its limit counts")
+	requireFailure(t, failures, "Stale: board map[] did not re-run after the write to tags", `"limit":2`)
+}
+
+func TestStaleAcceptsAWriteToAnUndeclaredTable(t *testing.T) {
+	t.Parallel()
+	application := newApplication(t, brokenBy{})
+	require.Empty(t, gateFailures(func(t testing.TB) {
+		livewiretest.Stale(t, &livewiretest.StaleOptions{
+			Application: application.Application, Authenticate: as("alice"), Reads: notesReads(application),
+			Writes: []livewiretest.Write{
+				application.addNote("north", "second"), application.addTag("north", "later"),
+				{Table: "comments", Commit: func(context.Context) error { return nil }}, // no declaration reads it
+			},
+		})
+	}))
+}
+
+func TestGeneratedIsCurrentStrictFailsOnAFileTheRegistryNoLongerGenerates(t *testing.T) {
+	t.Parallel()
+	application := newApplication(t, brokenBy{})
+	options := &generate.Options{TypeScriptDirectory: filepath.Join(t.TempDir(), "api")}
+	require.NoError(t, generate.Write(application.Engine.Registry(), options))
+	strict := func(t testing.TB) { livewiretest.GeneratedIsCurrentStrict(t, application.Engine.Registry(), options) }
+	require.Empty(t, gateFailures(strict))
+	leftover := filepath.Join(options.TypeScriptDirectory, "removed.ts")
+	require.NoError(t, os.WriteFile(leftover, []byte("// a removed declaration's client\n"), 0o600))
+	requireFailure(t, gateFailures(strict), leftover+" is not generated from the registry")
+	require.Empty(t, gateFailures(func(t testing.TB) {
+		livewiretest.GeneratedIsCurrent(t, application.Engine.Registry(), options)
+	}), "the default mode leaves other files alone")
+}
+
+// notesReads are the reads of the notes that need parameters.
+func notesReads(application *notesApplication) []livewiretest.Read {
+	id := map[string]string{"id": application.firstNote("north")}
+	return []livewiretest.Read{
+		{Target: "notes.item", Parameters: id},
+		{Target: "notes.history", Parameters: id},
+		{Target: "notes.distinct", Parameters: map[string]string{"field": "title"}},
+	}
 }

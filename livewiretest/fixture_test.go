@@ -39,8 +39,9 @@ var tenantOf = map[string]string{"alice": "north", "bob": "south", "dave": "west
 
 type (
 	note struct {
-		ID    uuid.UUID `json:"id"`
-		Title string    `json:"title"`
+		ID      uuid.UUID `json:"id"`
+		Title   string    `json:"title"`
+		Version int       `json:"version"`
 	}
 	tag struct {
 		ID   uuid.UUID `json:"id"`
@@ -50,13 +51,32 @@ type (
 		Notes int `json:"notes"`
 		Tags  int `json:"tags"`
 	}
+	// board is an object whose body has items and a limit, like a list's.
+	board struct {
+		Items []string `json:"items"`
+		Limit int      `json:"limit"`
+	}
+	// memo is a row of a resource without any key.
+	memo struct {
+		Title string `json:"title"`
+	}
 )
 
 // brokenBy names the ways the application is broken; the zero value is a sound application.
 type brokenBy struct {
-	leakingTenants bool     // the notes loaders ignore the tenant
-	unstableNotes  bool     // every notes list read answers another title
-	summaryTables  []string // the summary's Tables instead of notes and tags
+	notesPerTenant   int      // the notes of each tenant (default 1)
+	leakingTenants   bool     // the notes list, item and export ignore the tenant
+	leakingDistinct  bool     // the distinct read ignores the tenant
+	leakingHistory   bool     // a note's history carries every note's version
+	leakingItemsFrom int      // above zero: the item read answers the other tenant's notes from this position on
+	leakingPastCap   bool     // the list appends the other tenant's notes after its own
+	pageSize         int      // the notes' MaximumLimit (default 100)
+	countCap         int      // the notes' CountCap
+	exportWithoutKey bool     // the export writes the title only
+	keylessMemos     bool     // a resource memos whose rows carry no key
+	boardObject      bool     // an object board whose limit counts the tags but lists notes only
+	summaryTables    []string // the summary's Tables instead of notes and tags
+	unstableNotes    bool     // every notes list read answers another title
 }
 
 // notesApplication is the running application and its data.
@@ -71,11 +91,13 @@ type notesApplication struct {
 	stop   func()
 }
 
-// startNotes starts the application with one note and one tag per tenant.
+// startNotes starts the application with notes and one tag per tenant.
 func startNotes(broken brokenBy) (*notesApplication, error) {
 	application := &notesApplication{feed: &feed{connected: make(chan struct{})}, notes: map[string][]note{}, tags: map[string][]tag{}, broken: broken}
 	for _, tenant := range []string{"north", "south"} {
-		application.notes[tenant] = []note{{ID: uuid.New(), Title: "first of " + tenant}}
+		for position := range max(1, broken.notesPerTenant) {
+			application.notes[tenant] = append(application.notes[tenant], note{ID: uuid.New(), Title: fmt.Sprintf("%s %02d", tenant, position+1), Version: 1})
+		}
 		application.tags[tenant] = []tag{{ID: uuid.New(), Name: "urgent"}}
 	}
 	registry, err := application.registry()
@@ -134,20 +156,25 @@ func (a *notesApplication) registry() (*livewire.Registry, error) {
 	if summaryTables == nil {
 		summaryTables = []string{"notes", "tags"}
 	}
-	return registry, registry.Add(
+	declarations := []livewire.Declaration{
 		livewire.NewResource("notes", "/notes", &livewire.ResourceOptions[note]{
 			Tables: []string{"notes"},
 			Read:   authorization.IsUser(),
 			Fields: query.Fields{
 				{Name: "id", Type: query.TypeUUID, SQL: "notes.id", Filter: true, Sort: true},
 				{Name: "title", Type: query.TypeText, SQL: "notes.title", Filter: true, Sort: true},
+				{Name: "version", Type: query.TypeInteger, SQL: "notes.version"},
 			},
-			DefaultSort: []query.SortTerm{{Field: "title"}},
-			Item:        &livewire.ItemKey{Parameter: "id", Field: "id"},
-			List:        a.listNotes,
-			Get:         a.getNote,
-			Distinct:    a.distinctNotes,
-			Export:      a.exportNotes,
+			DefaultSort:  []query.SortTerm{{Field: "title"}},
+			MaximumLimit: a.broken.pageSize,
+			CountCap:     a.broken.countCap,
+			Item:         &livewire.ItemKey{Parameter: "id", Field: "id"},
+			Versioned:    true,
+			List:         a.listNotes,
+			Get:          a.getNote,
+			Distinct:     a.distinctNotes,
+			History:      a.noteHistory,
+			Export:       a.exportNotes,
 		}),
 		livewire.NewList("tags", "/tags", &livewire.ListOptions[tag, livewire.NoParameters]{
 			Tables: []string{"tags"}, Read: authorization.IsUser(),
@@ -166,50 +193,109 @@ func (a *notesApplication) registry() (*livewire.Registry, error) {
 				return &summary{Notes: len(a.notes[tenant]), Tags: len(a.tags[tenant])}, nil
 			},
 		}),
-	)
+	}
+	if a.broken.boardObject {
+		declarations = append(declarations, livewire.NewObject("board", "/board", &livewire.ObjectOptions[board, livewire.NoParameters]{
+			Tables: []string{"notes"}, Read: authorization.IsUser(),
+			Load: func(ctx context.Context, _ *livewire.NoParameters) (*board, error) {
+				a.mutex.Lock()
+				defer a.mutex.Unlock()
+				return &board{Items: []string{}, Limit: len(a.tags[livewire.TenantFrom(ctx)])}, nil
+			},
+		}))
+	}
+	if a.broken.keylessMemos {
+		declarations = append(declarations, livewire.NewResource("memos", "/memos", &livewire.ResourceOptions[memo]{
+			Read:   authorization.IsUser(),
+			Fields: query.Fields{{Name: "title", Type: query.TypeText, SQL: "memos.title", Filter: true}},
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[memo], error) {
+				return &livewire.Page[memo]{Items: []memo{{Title: "a secret of either tenant"}}, Total: 1}, nil
+			},
+		}))
+	}
+	return registry, registry.Add(declarations...)
 }
 
-// visibleNotes are the notes the request's tenant reads, every tenant's when they leak.
-func (a *notesApplication) visibleNotes(ctx context.Context) []note {
+// notesOf are the notes the request's tenant reads, with every other tenant's after them when
+// they leak.
+func (a *notesApplication) notesOf(ctx context.Context, leaking bool) []note {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
-	var visible []note
-	for tenant, notes := range a.notes {
-		if a.broken.leakingTenants || tenant == livewire.TenantFrom(ctx) {
-			visible = append(visible, notes...)
+	tenant := livewire.TenantFrom(ctx)
+	visible := slices.Clone(a.notes[tenant])
+	if leaking {
+		for _, other := range []string{"north", "south"} {
+			if other != tenant {
+				visible = append(visible, a.notes[other]...)
+			}
 		}
 	}
-	slices.SortFunc(visible, func(left, right note) int {
-		return strings.Compare(left.Title+left.ID.String(), right.Title+right.ID.String())
-	})
 	return visible
 }
 
+// foreignNotes are the notes of every other tenant than the request's.
+func (a *notesApplication) foreignNotes(ctx context.Context) []note {
+	all := a.notesOf(ctx, true)
+	return all[len(a.notesOf(ctx, false)):]
+}
+
 func (a *notesApplication) listNotes(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[note], error) {
-	visible := a.visibleNotes(ctx)
+	visible := a.notesOf(ctx, a.broken.leakingTenants || a.broken.leakingPastCap)
 	if a.broken.unstableNotes {
 		for index := range visible {
 			visible[index].Title += " #" + strconv.FormatInt(a.reads.Add(1), 10)
 		}
 	}
+	total := len(visible)
+	if a.broken.countCap > 0 {
+		total = min(total, a.broken.countCap+1) // D14: the total is at most cap+1
+	}
 	start := min(listQuery.Offset, len(visible))
-	return &livewire.Page[note]{Items: visible[start:min(len(visible), start+listQuery.Limit)], Total: len(visible)}, nil
+	return &livewire.Page[note]{Items: visible[start:min(len(visible), start+listQuery.Limit)], Total: total}, nil
+}
+
+// keyedNote is the note a loader's query names by its id, among the candidates.
+func keyedNote(listQuery *query.ListQuery, candidates []note) (*note, bool) {
+	_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "notes", IDColumn: "notes.id"})
+	for _, candidate := range candidates {
+		if slices.ContainsFunc(arguments, func(argument any) bool { return fmt.Sprint(argument) == candidate.ID.String() }) {
+			return &candidate, true
+		}
+	}
+	return nil, false
 }
 
 func (a *notesApplication) getNote(ctx context.Context, listQuery *query.ListQuery) (*note, error) {
-	_, arguments := listQuery.PageSQL(&query.ResourceSQL{From: "notes", IDColumn: "notes.id"})
-	for _, visible := range a.visibleNotes(ctx) {
-		if slices.ContainsFunc(arguments, func(argument any) bool { return fmt.Sprint(argument) == visible.ID.String() }) {
-			return &visible, nil
-		}
+	candidates := a.notesOf(ctx, a.broken.leakingTenants)
+	if from := a.broken.leakingItemsFrom; from > 0 {
+		candidates = append(candidates, a.foreignNotes(ctx)[min(from, len(a.foreignNotes(ctx))):]...)
+	}
+	if found, ok := keyedNote(listQuery, candidates); ok {
+		return found, nil
 	}
 	return nil, livewire.NotFound()
 }
 
-func (a *notesApplication) distinctNotes(ctx context.Context, _ string, _ *query.ListQuery) ([]livewire.DistinctValue, error) {
+// noteHistory answers one version per note: the keyed one's, or every note's when it leaks.
+func (a *notesApplication) noteHistory(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[note]], error) {
+	var versions []livewire.Version[note]
+	for _, candidate := range a.notesOf(ctx, true) {
+		_, keyed := keyedNote(listQuery, []note{candidate})
+		if keyed || a.broken.leakingHistory {
+			versions = append(versions, livewire.Version[note]{ID: len(versions) + 1, Operation: livewire.ChangeInsert, ValidFrom: time.Unix(1, 0).UTC(), Data: &candidate})
+		}
+	}
+	return &livewire.Page[livewire.Version[note]]{Items: versions, Total: len(versions)}, nil
+}
+
+func (a *notesApplication) distinctNotes(ctx context.Context, field string, _ *query.ListQuery) ([]livewire.DistinctValue, error) {
 	counts := map[string]int{}
-	for _, visible := range a.visibleNotes(ctx) {
-		counts[visible.Title]++
+	for _, visible := range a.notesOf(ctx, a.broken.leakingDistinct) {
+		value := visible.Title
+		if field == "id" {
+			value = visible.ID.String()
+		}
+		counts[value]++
 	}
 	values := make([]livewire.DistinctValue, 0, len(counts))
 	for value, count := range counts {
@@ -223,12 +309,17 @@ func (a *notesApplication) distinctNotes(ctx context.Context, _ string, _ *query
 
 func (a *notesApplication) exportNotes(ctx context.Context, _ *query.ListQuery, _ query.Fields, writer io.Writer) (int, error) {
 	output := csv.NewWriter(writer)
-	visible := a.visibleNotes(ctx)
-	if err := output.Write([]string{"id", "title"}); err != nil {
+	visible := a.notesOf(ctx, a.broken.leakingTenants)
+	header := []string{"id", "title"}
+	if a.broken.exportWithoutKey {
+		header = header[1:]
+	}
+	if err := output.Write(header); err != nil {
 		return 0, err
 	}
 	for _, exported := range visible {
-		if err := output.Write([]string{exported.ID.String(), exported.Title}); err != nil {
+		record := []string{exported.ID.String(), exported.Title}
+		if err := output.Write(record[len(record)-len(header):]); err != nil {
 			return 0, err
 		}
 	}
@@ -246,7 +337,7 @@ func (a *notesApplication) firstNote(tenant string) string {
 // addNote and addTag are the committed writes of the fixture: the row, then its change.
 func (a *notesApplication) addNote(tenant, title string) livewiretest.Write {
 	return livewiretest.Write{Table: "notes", Commit: func(context.Context) error {
-		added := note{ID: uuid.New(), Title: title}
+		added := note{ID: uuid.New(), Title: title, Version: 1}
 		a.mutex.Lock()
 		a.notes[tenant] = append(a.notes[tenant], added)
 		a.mutex.Unlock()

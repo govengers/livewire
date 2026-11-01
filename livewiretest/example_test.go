@@ -54,6 +54,7 @@ func ExampleParity() {
 			Authenticate: as("alice"),
 			Reads: []livewiretest.Read{
 				{Target: "notes.item", Parameters: map[string]string{"id": application.firstNote("north")}},
+				{Target: "notes.history", Parameters: map[string]string{"id": application.firstNote("north")}},
 				{Target: "notes.distinct", Parameters: map[string]string{"field": "title"}},
 			},
 		})
@@ -74,6 +75,7 @@ func ExampleStale() {
 			Authenticate: as("alice"),
 			Reads: []livewiretest.Read{
 				{Target: "notes.item", Parameters: map[string]string{"id": application.firstNote("north")}},
+				{Target: "notes.history", Parameters: map[string]string{"id": application.firstNote("north")}},
 				{Target: "notes.distinct", Parameters: map[string]string{"field": "title"}},
 			},
 			Writes: []livewiretest.Write{application.addNote("north", "second"), application.addTag("north", "later")},

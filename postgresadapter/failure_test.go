@@ -56,6 +56,7 @@ func TestWriteCSVNeutralizesSpreadsheetFormulas(t *testing.T) {
 		{Name: "number", SQL: "-parts.rank"},
 		{Name: "past", SQL: "'-infinity'::timestamptz"},
 		{Name: "empty", SQL: "''::text"},
+		{Name: "quoted", SQL: "'''=1'::text"},
 	}
 	_, err := postgresadapter.WriteCSV(t.Context(), database.pool, &postgresadapter.Export{
 		Specification: partSQL,
@@ -65,7 +66,7 @@ func TestWriteCSVNeutralizesSpreadsheetFormulas(t *testing.T) {
 	require.NoError(t, err)
 	records, err := csv.NewReader(&output).ReadAll()
 	require.NoError(t, err)
-	require.Equal(t, []string{`'=HYPERLINK("http://x")`, "'+1", "'-1+1", "'@SUM(A1)", "'\t=1", "'\r=1", "a=b", "-1", "-infinity", ""}, records[1])
+	require.Equal(t, []string{`'=HYPERLINK("http://x")`, "'+1", "'-1+1", "'@SUM(A1)", "'\t=1", "'\r=1", "a=b", "-1", "-infinity", "", "''=1"}, records[1])
 }
 
 func TestStoresReportDatabaseFailures(t *testing.T) {
