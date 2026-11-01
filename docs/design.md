@@ -60,6 +60,8 @@ livewire declares an API once in Go and serves it as REST, as a WebSocket with r
 | D50 | FilterStore and PresenceStore calls run outside the read transaction: a filter lookup marks the filter used (a write a READ ONLY transaction cannot do) and presence rows are the library's own, keyed by the explicit tenant. Every other read runs inside the engine's read transaction (D45). |
 | D51 | Identity re-validation runs on subscribe, query, call, batch, join, leave, every re-run and the RevalidateInterval tick; `ping` and `unsubscribe` are exempt (they carry no data, and the tick closes a revoked socket within the interval). Section 6's "every op" reads with this exemption. |
 | D52 | The engine's query semaphore (`QueryConcurrency`) bounds socket work only: subscribe, query, call, batch, re-runs and identity checks started from sockets. REST calls into `Engine.Read`, `Call`, `Batch` and `Upload` are bounded by the HTTP server and the connection pool, so a burst of socket re-runs can never take the connections REST requests need (the intent behind D10). |
+| D53 | The postgresadapter surface as WP4 built it; it supersedes the repository snippets of D45 and sections 7 and 8. A repository builds its queries per call on the handle: `database := postgresadapter.TransactionFrom(ctx)`, the pool when it is nil, then `sqlc.New(database)` (sqlc's `WithTx` takes a `pgx.Tx`, which the query-only handle is not; `postgresadapter.DBTX` is a superset of sqlc's pgx/v5 DBTX). `postgresadapter.ListPage[Item](ctx, database DBTX, *query.ResourceSQL, *query.ListQuery, Hydrate[Item]) (*Page[Item], error)` with `Hydrate[Item] func(ctx, DBTX, []PageRow) (map[uuid.UUID]Item, error)` (`PageRow{ID, Derived}`, `PageIDs` for `= ANY`) puts the items in page order; `Page{Items, Total, Next *query.Cursor}` carries the cursor unencoded, a cursor-mode resource encodes it. Inside an engine unit of work `ListPage`, `Distinct` and `WriteCSV` run on the engine's transaction whatever DBTX they are given, so section 8's pool argument reads the engine's snapshot under `livewire.tenant`; outside one they open a REPEATABLE READ READ ONLY transaction of their own. Triggers and the Listener share one NOTIFY channel, `postgresadapter.Channel` (`livewire`), not configurable: two apps on one database receive each other's changes, which the engine ignores for tables it does not subscribe. |
+| D54 | Filter caps (D13): `FilterStore` keeps at most `MaximumUnnamedPerOwner` (default 1000) unnamed filters per owner and tenant by replacing the owner's least recently used one, never by refusing, since a refusal would lock an active user's inline subscribes out until the 30-day sweep, and a client sends an evicted filter inline again; at most `MaximumNamedPerOwner` (default 200) named filters, a further one refused with 400 `invalid_request` at `filter`. The Saves of one owner run under an advisory lock, so both bounds are exact. |
 
 ## 2. Packages
 
@@ -160,8 +162,11 @@ Repositories:
 
 ```go
 func (r *Repository) CreatePart(ctx context.Context, p CreatePartParameters) (*part.Item, error) {
-    queries := r.queries.WithTx(postgresadapter.TransactionFrom(ctx)) // the engine's transaction, reads included; nil outside an engine unit of work (D45)
-    row, err := queries.InsertPart(ctx, toInsert(p))
+    database := postgresadapter.TransactionFrom(ctx) // the engine's transaction, reads included (D45, D53)
+    if database == nil {
+        database = r.pool // outside an engine unit of work
+    }
+    row, err := sqlc.New(database).InsertPart(ctx, toInsert(p))
     return toItem(row), mapError(err)
 }
 ```
@@ -172,14 +177,18 @@ func (r *Repository) CreatePart(ctx context.Context, p CreatePartParameters) (*p
 
 ```go
 func (r *Repository) ListParts(ctx context.Context, listQuery *query.ListQuery) ([]part.Item, int, error) {
-    return livewire.ListPage(ctx, r.pool, partSQL, listQuery, func(ctx context.Context, tx pgx.Tx, ids []uuid.UUID) ([]part.Item, error) {
-        rows, err := r.queries.WithTx(tx).ListPartsByIDs(ctx, ids)
-        return toItems(rows), err
+    page, err := postgresadapter.ListPage(ctx, r.pool, partSQL, listQuery, func(ctx context.Context, database postgresadapter.DBTX, rows []postgresadapter.PageRow) (map[uuid.UUID]part.Item, error) {
+        found, err := sqlc.New(database).ListPartsByIDs(ctx, postgresadapter.PageIDs(rows))
+        return toItemsByID(found), err
     })
+    if err != nil {
+        return nil, 0, err
+    }
+    return page.Items, page.Total, nil
 }
 ```
 
-`livewire.ListPage` lives in `postgresadapter`: one `REPEATABLE READ` read-only transaction, the page query (ids, derived columns), the count (capped), the hydration by ids in page order. `partSQL` is a `query.ResourceSQL{From, IDColumn, Derived}`.
+`postgresadapter.ListPage` (D53): one `REPEATABLE READ` read-only snapshot (the engine's transaction inside an engine unit of work, even when the pool is passed, else one of its own), the page query (ids, derived columns), the count (capped), the hydration by ids in page order. `partSQL` is a `query.ResourceSQL{From, IDColumn, Derived}`.
 
 ## 9. Generated artifacts
 

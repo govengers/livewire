@@ -142,7 +142,8 @@ type FilterStore interface {
 	// Get returns the owner's filter and marks it used; it returns NotFound when there is
 	// none.
 	Get(ctx context.Context, owner Owner, id string) (*StoredFilter, error)
-	// List returns the owner's filters of a resource, every resource when resource is empty.
+	// List returns the owner's named filters of a resource, every resource when resource is
+	// empty; unnamed filters (inline subscribe registrations) are not listed.
 	List(ctx context.Context, owner Owner, resource string) ([]StoredFilter, error)
 	// Delete removes the owner's filter; a filter that is not there is no error.
 	Delete(ctx context.Context, owner Owner, id string) error
@@ -195,7 +196,8 @@ type PresenceStore interface {
 	Leave(ctx context.Context, tenant, socket, target, key string) error
 	// Heartbeat refreshes UpdatedAt of every presence of the socket.
 	Heartbeat(ctx context.Context, socket string) error
-	// List returns the presences on a record of the tenant.
+	// List returns the presences on a record of the tenant; a store may bound how many it
+	// returns (postgresadapter: 1000, by socket).
 	List(ctx context.Context, tenant, target, key string) ([]Presence, error)
 	// Sweep removes every presence older than maximumAge and returns how many.
 	Sweep(ctx context.Context, maximumAge time.Duration) (int, error)

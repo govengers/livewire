@@ -29,7 +29,8 @@ type AuditEntry struct {
 }
 
 // AuditStoreOptions configures an AuditStore. Pool is required; Retention (default 365
-// days, not negative) is how long Maintain keeps rows.
+// days, not negative) is how long Maintain keeps rows at least: it drops a month's partition
+// once the whole month is older than Retention, so a row stays up to a month longer.
 type AuditStoreOptions struct {
 	Pool      *pgxpool.Pool
 	Retention time.Duration
@@ -79,9 +80,12 @@ func (s *AuditStore) Write(ctx context.Context, entry *AuditEntry) error {
 	return nil
 }
 
-// Maintain runs livewire_audit_maintain: it creates the partitions of this and the next
-// month and removes the rows older than Retention. The application runs it periodically, at
-// least monthly; without it every row stays in the default partition.
+// Maintain runs livewire_audit_maintain: it creates the partitions of this and the next UTC
+// month, drops the partitions whose whole month is older than Retention and deletes the
+// default partition's rows older than that, so rows go by the month, up to a month after
+// their Retention. Inserts wait while it moves rows out of the default partition. The
+// application runs it periodically, at least monthly; without it every row stays in the
+// default partition.
 func (s *AuditStore) Maintain(ctx context.Context) error {
 	if _, err := s.options.Pool.Exec(ctx, "SELECT livewire_audit_maintain(make_interval(secs => $1))", s.options.Retention.Seconds()); err != nil {
 		return fmt.Errorf("postgresadapter: maintain the audit partitions: %w", err)
