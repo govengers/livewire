@@ -593,8 +593,9 @@ var (
 // UnmarshalJSON on the pointer decodes anything, so nothing below it matters; an UnmarshalText
 // decodes a JSON string, which a MarshalText writes (and a MarshalJSON may), but a value
 // encoding/json writes by its kind (an object, an array, a number) it refuses to read back
-// into UnmarshalText; a MarshalText of a string kind is read back as the string. It reports
-// whether the methods decide the type, and the refusal when they cannot decode it.
+// into UnmarshalText, except a byte slice, which it writes as a base64 string; a MarshalText of
+// a string kind is read back as the string. It reports whether the methods decide the type, and
+// the refusal when they cannot decode it.
 func decodesItself(goType reflect.Type, path string) (bool, error) {
 	pointer := reflect.PointerTo(goType)
 	textDecoder := pointer.Implements(textUnmarshalerType)
@@ -608,11 +609,21 @@ func decodesItself(goType reflect.Type, path string) (bool, error) {
 		return true, fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalJSON but neither UnmarshalJSON nor UnmarshalText", path)
 	case marshalsItselfAnyway(goType):
 		return true, fmt.Errorf("generate: the Go client cannot decode %s: it has MarshalText but no UnmarshalText", path)
-	case textDecoder && goType.Kind() != reflect.String:
+	case textDecoder && goType.Kind() != reflect.String && !writtenAsBase64(goType):
 		return true, fmt.Errorf("generate: the Go client cannot decode %s: encoding/json writes it as its %s and reads only a JSON string into its UnmarshalText", path, goType.Kind())
 	default:
 		return false, nil
 	}
+}
+
+// writtenAsBase64 reports whether encoding/json writes goType, which marshals itself in no way,
+// as a base64 string: a slice of bytes whose element marshals itself in no way either.
+func writtenAsBase64(goType reflect.Type) bool {
+	if goType.Kind() != reflect.Slice || goType.Elem().Kind() != reflect.Uint8 {
+		return false
+	}
+	element := reflect.PointerTo(goType.Elem())
+	return !element.Implements(jsonMarshalerType) && !element.Implements(textMarshalerType)
 }
 
 // refuseUndecodable refuses a type the Go client cannot decode what the server wrote into:

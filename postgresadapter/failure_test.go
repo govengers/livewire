@@ -39,6 +39,35 @@ func TestWriteCSVWritesEveryValueAsText(t *testing.T) {
 	require.Equal(t, []string{"true", "0.5", "1", "1", "1.25", `["part-2","x"]`, `{"rank":1}`, "-infinity"}, records[1])
 }
 
+// TestWriteCSVNeutralizesSpreadsheetFormulas pins D69: a text a spreadsheet would run gets a
+// single quote in front, a number, a time or a text with the character elsewhere does not.
+func TestWriteCSVNeutralizesSpreadsheetFormulas(t *testing.T) {
+	t.Parallel()
+	database := seedParts(t)
+	var output bytes.Buffer
+	columns := query.Fields{
+		{Name: "equals", SQL: "'=HYPERLINK(\"http://x\")'::text"},
+		{Name: "plus", SQL: "'+1'::text"},
+		{Name: "minus", SQL: "'-1+1'::text"},
+		{Name: "at", SQL: "'@SUM(A1)'::text"},
+		{Name: "tab", SQL: "E'\\t=1'"},
+		{Name: "return", SQL: "E'\\r=1'"},
+		{Name: "inside", SQL: "'a=b'::text"},
+		{Name: "number", SQL: "-parts.rank"},
+		{Name: "past", SQL: "'-infinity'::timestamptz"},
+		{Name: "empty", SQL: "''::text"},
+	}
+	_, err := postgresadapter.WriteCSV(t.Context(), database.pool, &postgresadapter.Export{
+		Specification: partSQL,
+		Query:         compile(t, `{"where":{"field":"id","op":"eq","value":"00000000-0000-7000-8000-000000000007"}}`, "", query.Page{}),
+		Columns:       columns,
+	}, &output)
+	require.NoError(t, err)
+	records, err := csv.NewReader(&output).ReadAll()
+	require.NoError(t, err)
+	require.Equal(t, []string{`'=HYPERLINK("http://x")`, "'+1", "'-1+1", "'@SUM(A1)", "'\t=1", "'\r=1", "a=b", "-1", "-infinity", ""}, records[1])
+}
+
 func TestStoresReportDatabaseFailures(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)

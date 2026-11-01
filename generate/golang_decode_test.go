@@ -62,6 +62,7 @@ func TestGoClientAcceptsWhatEncodingJSONDecodes(t *testing.T) {
 		"an embedded UnmarshalJSON":          {objectRegistry[fixture.EmbedsDecoder](t), fixture.EmbedsDecoder{}, new(fixture.EmbedsDecoder)},
 		"pointer-receiver codecs":            {objectRegistry[fixture.PointerCodec](t), &fixture.PointerCodec{}, new(fixture.PointerCodec)},
 		"pointer-receiver codecs in a field": {objectRegistry[fixture.Page[fixture.PointerCodec]](t), fixture.Page[fixture.PointerCodec]{}, new(fixture.Page[fixture.PointerCodec])},
+		"a byte slice with UnmarshalText":    {objectRegistry[fixture.HoldsTextBytes](t), fixture.HoldsTextBytes{Data: fixture.TextBytes("raw")}, new(fixture.HoldsTextBytes)},
 	}
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
