@@ -79,7 +79,7 @@ func TestStoresReportDatabaseFailures(t *testing.T) {
 	require.Error(t, err)
 	audit, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: closed})
 	require.NoError(t, err)
-	require.Error(t, audit.Write(ctx, &postgresadapter.AuditEntry{}))
+	require.Error(t, audit.Write(ctx, &livewire.AuditEntry{}))
 	require.Error(t, audit.Maintain(ctx))
 	_, err = postgresadapter.ListPage(ctx, closed, partSQL, compile(t, "", "", query.Page{Limit: 1}), hydrateParts)
 	require.Error(t, err)

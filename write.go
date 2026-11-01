@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/govengers/auth"
@@ -91,8 +92,8 @@ func (e *Engine) call(ctx context.Context, operation Operation, request CallRequ
 		return 0, nil, err
 	}
 	ctx = WithTenant(ctx, prepared.tenant)
-	plan := writePlan{mutation: request.Target, transactionMutation: request.Target, parameters: prepared.parameters, idempotencyKey: request.IdempotencyKey, requestID: request.RequestID}
-	answer, err := e.write(ctx, plan, prepared.handle)
+	plan := callPlan(request.Target, prepared.parameters, request.IdempotencyKey, request.RequestID)
+	answer, err := e.writeAudited(ctx, plan, unit.started, prepared.handle)
 	if err == nil && answer.replayed {
 		answer.payload, err = redactResponse(ctx, prepared.guards, answer.payload)
 	}
@@ -235,10 +236,12 @@ func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRe
 		return nil, err
 	}
 	ctx = WithTenant(ctx, prepared[0].tenant)
-	plan := writePlan{mutation: batchReservation(prepared), idempotencyKey: request.IdempotencyKey, requestID: request.RequestID}
-	answer, err := e.write(ctx, plan, func(ctx context.Context) (int, json.RawMessage, error) {
-		return e.runBatch(ctx, operation, prepared)
-	})
+	plan := writePlan{mutation: batchReservation(prepared), idempotencyKey: request.IdempotencyKey, requestID: requestIDOr(request.RequestID)}
+	run := &batchRun{engine: e, operation: operation, plan: plan, prepared: prepared}
+	answer, err := e.write(ctx, plan, run.run)
+	if err != nil && len(run.ran) > 0 {
+		err = e.auditFailure(ctx, plan, run.ran, err)
+	}
 	e.observe(ctx, unit.outcome(ctx, err))
 	if err != nil {
 		return nil, err
@@ -319,18 +322,34 @@ func atEnd(decoder *json.Decoder) bool {
 	return errors.Is(err, io.EOF)
 }
 
-// runBatch runs the prepared calls in the transaction of ctx; the first failure ends it.
-func (e *Engine) runBatch(ctx context.Context, operation Operation, prepared []*preparedCall) (int, json.RawMessage, error) {
-	results := make([]BatchResult, 0, len(prepared))
-	for index, call := range prepared {
-		unit := startUnit(OutcomeCall, operation, call.mutation.Name())
+// batchRun is one batch in its transaction: the calls that ran are kept for the audit of a
+// failed batch.
+type batchRun struct {
+	engine    *Engine
+	operation Operation
+	plan      writePlan
+	prepared  []*preparedCall
+	ran       []auditedCall
+}
+
+// run runs the prepared calls in the transaction of ctx, each audited after its handler; the
+// first failure ends it.
+func (b *batchRun) run(ctx context.Context) (int, json.RawMessage, error) {
+	results := make([]BatchResult, 0, len(b.prepared))
+	for index, call := range b.prepared {
+		unit := startUnit(OutcomeCall, b.operation, call.mutation.Name())
+		audited := auditedCall{mutation: call.mutation.Name(), parameters: call.parameters, started: unit.started}
+		b.ran = append(b.ran, audited)
 		status, payload, err := callRecovering(ctx, call)
+		if err == nil {
+			err = b.engine.audit(ctx, b.plan, audited, status)
+		}
 		outcome := unit.outcome(ctx, err)
 		outcome.Parameters = call.parameters
 		if err == nil {
 			outcome.Status = status
 		}
-		e.observe(ctx, outcome)
+		b.engine.observe(ctx, outcome)
 		if err != nil {
 			return 0, nil, batchFailure(index, err)
 		}
@@ -385,8 +404,8 @@ func (e *Engine) Upload(ctx context.Context, request UploadRequest) (status int,
 		return 0, nil, err
 	}
 	ctx = WithTenant(ctx, prepared.tenant)
-	plan := writePlan{mutation: request.Target, transactionMutation: request.Target, parameters: prepared.parameters, idempotencyKey: request.IdempotencyKey, requestID: request.RequestID}
-	answer, err := e.write(ctx, plan, func(ctx context.Context) (int, json.RawMessage, error) {
+	plan := callPlan(request.Target, prepared.parameters, request.IdempotencyKey, request.RequestID)
+	answer, err := e.writeAudited(ctx, plan, unit.started, func(ctx context.Context) (int, json.RawMessage, error) {
 		response, err := prepared.upload.Handle(ctx, prepared.parameters, request.File)
 		if err != nil {
 			return 0, nil, err
@@ -469,6 +488,78 @@ type writePlan struct {
 	requestID           string
 }
 
+// callPlan is the plan of one mutation or upload; an empty request id gets a fresh one.
+func callPlan(mutation string, parameters any, idempotencyKey, requestID string) writePlan {
+	return writePlan{
+		mutation: mutation, transactionMutation: mutation, parameters: parameters,
+		idempotencyKey: idempotencyKey, requestID: requestIDOr(requestID),
+	}
+}
+
+func requestIDOr(requestID string) string {
+	if requestID == "" {
+		return uuid.NewString()
+	}
+	return requestID
+}
+
+// auditedCall is one call as its audit entry names it, from the start of its unit of work.
+type auditedCall struct {
+	mutation   string
+	parameters any
+	started    time.Time
+}
+
+// writeAudited is write for one mutation or upload: its audit entry is written in the
+// transaction after the handler (D32, section 7); a call whose handler ran and failed is
+// audited after the rollback.
+func (e *Engine) writeAudited(ctx context.Context, plan writePlan, started time.Time, handle func(ctx context.Context) (int, json.RawMessage, error)) (*writeAnswer, error) {
+	call := auditedCall{mutation: plan.transactionMutation, parameters: plan.parameters, started: started}
+	ran := false
+	answer, err := e.write(ctx, plan, func(ctx context.Context) (int, json.RawMessage, error) {
+		ran = true
+		status, payload, err := handle(ctx)
+		if err != nil {
+			return 0, nil, err
+		}
+		return status, payload, e.audit(ctx, plan, call, status)
+	})
+	if err != nil && ran {
+		return nil, e.auditFailure(ctx, plan, []auditedCall{call}, err)
+	}
+	return answer, err
+}
+
+// audit writes the entry of one call through the AuditStore, in the transaction of ctx when
+// there is one; without a store it does nothing.
+func (e *Engine) audit(ctx context.Context, plan writePlan, call auditedCall, status int) error {
+	store := e.options.AuditStore
+	if store == nil {
+		return nil
+	}
+	entry := &AuditEntry{
+		Tenant: TenantFrom(ctx), Identity: auth.IdentityFrom(ctx), Mutation: call.mutation, Parameters: call.parameters,
+		RequestID: plan.requestID, IdempotencyKey: plan.idempotencyKey, Status: status, Duration: time.Since(call.started),
+	}
+	if err := recovering(func() error { return store.Write(ctx, entry) }); err != nil {
+		return fmt.Errorf("livewire: write the audit entry of %q: %w", call.mutation, err)
+	}
+	return nil
+}
+
+// auditFailure writes the entries of calls that ran and failed, after the rollback, with the
+// status failure answers; a failing Write is joined to failure, whose answer it does not
+// change.
+func (e *Engine) auditFailure(ctx context.Context, plan writePlan, calls []auditedCall, failure error) error {
+	status := statusOf(failure)
+	for _, call := range calls {
+		if err := e.audit(ctx, plan, call, status); err != nil {
+			failure = errors.Join(failure, err)
+		}
+	}
+	return failure
+}
+
 // writeAnswer is a write's answer; replayed marks a recorded answer of an earlier call.
 type writeAnswer struct {
 	status   int
@@ -484,9 +575,6 @@ func (e *Engine) write(ctx context.Context, plan writePlan, run func(ctx context
 		if _, err := uuid.Parse(plan.idempotencyKey); err != nil {
 			return nil, invalidParameter("idempotencyKey", "must be a UUID")
 		}
-	}
-	if plan.requestID == "" {
-		plan.requestID = uuid.NewString()
 	}
 	transaction, err := e.options.Transactor.Begin(ctx, TransactionDetails{
 		Tenant: TenantFrom(ctx), Identity: auth.IdentityFrom(ctx), Mutation: plan.transactionMutation,

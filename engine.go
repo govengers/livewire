@@ -23,9 +23,9 @@ import (
 // request's own host may open a socket (D9). ChangeFeed is optional: without one, a
 // subscription re-runs only when its socket's identity changes and, when its filter carries
 // a relative time, on the safety tick. FilterStore enables stored filters (D13),
-// IdempotencyStore the replay of mutations (D16), PresenceStore the join and leave ops and
-// the presence reads (D37); each is optional and its feature is off without it. The
-// engine's outcomes go to the registry's Observer (D49).
+// IdempotencyStore the replay of mutations (D16), AuditStore the action audit (D32),
+// PresenceStore the join and leave ops and the presence reads (D37); each is optional and its
+// feature is off without it. The engine's outcomes go to the registry's Observer (D49).
 //
 // The limits (D10) default when zero: SubscriptionsPerSocket 64, InFlightPerSocket 16,
 // PresencesPerSocket 64 (records one socket may join at once), FiltersPerSocket 64 (the
@@ -47,6 +47,7 @@ type EngineOptions struct {
 	Transactor             Transactor
 	FilterStore            FilterStore
 	IdempotencyStore       IdempotencyStore
+	AuditStore             AuditStore
 	PresenceStore          PresenceStore
 	AllowedOrigins         []string
 	SameHostOnly           bool

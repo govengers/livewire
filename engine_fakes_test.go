@@ -476,6 +476,45 @@ func (f *fakeIdempotency) Record(_ context.Context, record *livewire.Idempotency
 	return nil
 }
 
+// fakeAudit is the AuditStore: an entry written in a transaction lands when it commits and is
+// gone when it rolls back; one written outside lands at once.
+type fakeAudit struct {
+	mutex     sync.Mutex
+	entries   []auditRecord
+	failWrite atomic.Bool
+}
+
+// auditRecord is one landed entry and whether it was written in a transaction.
+type auditRecord struct {
+	entry         livewire.AuditEntry
+	inTransaction bool
+}
+
+func (f *fakeAudit) Write(ctx context.Context, entry *livewire.AuditEntry) error {
+	if f.failWrite.Load() {
+		return errors.New("the audit table is gone")
+	}
+	transaction := transactionOf(ctx)
+	record := auditRecord{entry: *entry, inTransaction: transaction != nil}
+	land := func() {
+		f.mutex.Lock()
+		f.entries = append(f.entries, record)
+		f.mutex.Unlock()
+	}
+	if transaction != nil {
+		transaction.hooks(land, func() {})
+		return nil
+	}
+	land()
+	return nil
+}
+
+func (f *fakeAudit) landed() []auditRecord {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return slices.Clone(f.entries)
+}
+
 // fakePresences is the PresenceStore; every change is published on the feed like the
 // presence trigger does.
 type fakePresences struct {

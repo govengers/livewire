@@ -61,6 +61,7 @@ type testbed struct {
 	transactor  *fakeTransactor
 	filters     *fakeFilters
 	idempotency *fakeIdempotency
+	audit       *fakeAudit
 	presences   *fakePresences
 	outcomes    *outcomes
 	engine      *livewire.Engine
@@ -84,14 +85,14 @@ func newTestbedWith(t *testing.T, registryOptions livewire.RegistryOptions, adju
 	feed := newFakeFeed()
 	bed := &testbed{
 		t: t, world: newWorld(feed), feed: feed, identities: newFakeIdentities(),
-		filters: newFakeFilters(), idempotency: newFakeIdempotency(), presences: newFakePresences(feed),
+		filters: newFakeFilters(), idempotency: newFakeIdempotency(), audit: &fakeAudit{}, presences: newFakePresences(feed),
 		outcomes: &outcomes{}, release: make(chan struct{}), registryOptions: registryOptions,
 	}
 	bed.transactor = &fakeTransactor{world: bed.world}
 	bed.identities.set(person("ada", roleReader, roleWriter))
 	options := &livewire.EngineOptions{
 		Registry: bed.registry(), ChangeFeed: feed, IdentitySource: bed.identities, Transactor: bed.transactor,
-		FilterStore: bed.filters, IdempotencyStore: bed.idempotency, PresenceStore: bed.presences,
+		FilterStore: bed.filters, IdempotencyStore: bed.idempotency, AuditStore: bed.audit, PresenceStore: bed.presences,
 		AllowedOrigins: []string{"https://app.example"}, DeliveryBatchWait: 10 * time.Millisecond, RetryInterval: 5 * time.Millisecond,
 	}
 	if adjust != nil {

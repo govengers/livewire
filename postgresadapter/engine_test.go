@@ -92,13 +92,6 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 				if err != nil {
 					return nil, err
 				}
-				err = audit.Write(ctx, &postgresadapter.AuditEntry{
-					Tenant: created.Tenant, Identity: auth.IdentityFrom(ctx), Mutation: "createPart", Parameters: body,
-					RequestID: livewire.IdempotencyKeyFrom(ctx), IdempotencyKey: livewire.IdempotencyKeyFrom(ctx), Status: http.StatusCreated,
-				})
-				if err != nil {
-					return nil, err
-				}
 				if body.Name == "refused" {
 					return nil, livewire.Conflict() // after the writes: the rollback takes them back
 				}
@@ -115,7 +108,7 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 	require.NoError(t, err)
 	engine, err := livewire.NewEngine(&livewire.EngineOptions{
 		Registry: registry, ChangeFeed: listener, IdentitySource: staticIdentity{}, Transactor: transactor,
-		FilterStore: filters, IdempotencyStore: idempotency, PresenceStore: presences,
+		FilterStore: filters, IdempotencyStore: idempotency, AuditStore: audit, PresenceStore: presences,
 		AllowedOrigins: []string{"https://app.example"}, DeliveryBatchWait: 10 * time.Millisecond, RetryInterval: 10 * time.Millisecond,
 	})
 	require.NoError(t, err)
@@ -198,9 +191,9 @@ func TestEngineCommitsAuditsAndReplaysOnPostgres(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payload, &created))
 	require.Equal(t, "north", created.Tenant, "the mutation ran under the tenant")
 	require.Equal(t, []int{1, 1, 1}, counts(t, database, "bolt", key), "the part, its audit row and the idempotency record committed together")
-	var actor, mutation string
-	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT actor, mutation FROM parts_history WHERE id = $1", created.ID).Scan(&actor, &mutation))
-	require.Equal(t, []string{"password:alice", "createPart"}, []string{actor, mutation}, "the history trigger read livewire.actor")
+	var actor, historyMutation string
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT actor, mutation FROM parts_history WHERE id = $1", created.ID).Scan(&actor, &historyMutation))
+	require.Equal(t, []string{"password:alice", "createPart"}, []string{actor, historyMutation}, "the history trigger read livewire.actor")
 
 	status, replayed, err := live.createPart(t, "bolt", "{"+strings.ToUpper(key)+"}")
 	require.NoError(t, err)
@@ -211,7 +204,13 @@ func TestEngineCommitsAuditsAndReplaysOnPostgres(t *testing.T) {
 	refusedKey := uuid.NewString()
 	_, _, err = live.createPart(t, "refused", refusedKey)
 	requireCode(t, err, livewire.CodeConflict)
-	require.Equal(t, []int{0, 0, 0}, counts(t, database, "refused", refusedKey), "the part and its audit row rolled back, the key is free")
+	require.Equal(t, []int{0, 1, 0}, counts(t, database, "refused", refusedKey), "the part rolled back, the key is free, the failed call is audited")
+	var auditStatus int
+	var auditMutation, auditRequestID string
+	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT status, mutation, request_id FROM livewire_audit WHERE idempotency_key = $1::uuid", refusedKey).
+		Scan(&auditStatus, &auditMutation, &auditRequestID))
+	require.Equal(t, http.StatusConflict, auditStatus, "written on the pool after the rollback")
+	require.Equal(t, []string{"createPart", refusedKey}, []string{auditMutation, auditRequestID})
 	var reservations int
 	require.NoError(t, database.pool.QueryRow(t.Context(), "SELECT count(*) FROM livewire_idempotency WHERE key = $1::uuid", refusedKey).Scan(&reservations))
 	require.Zero(t, reservations)

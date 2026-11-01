@@ -335,7 +335,7 @@ func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {
 	transactor, err := postgresadapter.NewTransactor(&postgresadapter.TransactorOptions{Pool: database.pool})
 	require.NoError(t, err)
 	identity := &auth.Identity{Provider: "password", Subject: "alice"}
-	entry := &postgresadapter.AuditEntry{
+	entry := &livewire.AuditEntry{
 		Tenant: "north", Identity: identity, Mutation: "createPart", Parameters: map[string]string{"id": "7"},
 		RequestID: "request-1", IdempotencyKey: "0193a8f0-0000-7000-8000-000000000001", Status: 201, Duration: 1500 * time.Millisecond,
 	}
@@ -363,7 +363,7 @@ func TestAuditWriteFollowsTheEngineTransaction(t *testing.T) {
 		[]any{tenant, actor, realActor, mutation, requestID, key, status, duration})
 	require.JSONEq(t, `{"id":"7"}`, string(parameters))
 
-	err = store.Write(context.Background(), &postgresadapter.AuditEntry{Parameters: func() {}})
+	err = store.Write(context.Background(), &livewire.AuditEntry{Parameters: func() {}})
 	require.Error(t, err, "parameters that are no JSON are refused")
 }
 
@@ -496,14 +496,14 @@ func TestAuditWriteStoresTheIdempotencyKeyCanonically(t *testing.T) {
 	require.NoError(t, err)
 	const key = "0193a8f0-0000-7000-8000-00000000000b"
 	for _, spelling := range []string{"urn:uuid:" + key, "{" + strings.ToUpper(key) + "}", ""} {
-		require.NoError(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", RequestID: spelling, IdempotencyKey: spelling, Status: 201}), spelling)
+		require.NoError(t, store.Write(t.Context(), &livewire.AuditEntry{Mutation: "createPart", RequestID: spelling, IdempotencyKey: spelling, Status: 201}), spelling)
 	}
 	rows, err := database.pool.Query(t.Context(), "SELECT coalesce(idempotency_key::text, 'none') FROM livewire_audit ORDER BY request_id")
 	require.NoError(t, err)
 	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	require.NoError(t, err)
 	require.Equal(t, []string{"none", key, key}, keys)
-	require.Error(t, store.Write(t.Context(), &postgresadapter.AuditEntry{Mutation: "createPart", IdempotencyKey: "nope"}))
+	require.Error(t, store.Write(t.Context(), &livewire.AuditEntry{Mutation: "createPart", IdempotencyKey: "nope"}))
 }
 
 func TestTriggerSQLKeepsNamesThatHoldItsDollarQuote(t *testing.T) {
