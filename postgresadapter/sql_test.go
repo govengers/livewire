@@ -667,10 +667,54 @@ func TestHistoryPageScopesTheIDBelowTheWindow(t *testing.T) {
 			"no subquery runs per version: %s", statement.text)
 		window := planFind(root, func(node map[string]any) bool { return node["Node Type"] == "WindowAgg" })
 		require.NotNil(t, window, "the current life is a window: %s", statement.text)
-		require.True(t, planHas(window, func(node map[string]any) bool {
-			condition := fmt.Sprint(node["Index Cond"]) + fmt.Sprint(node["Filter"])
-			return node["Relation Name"] == "parts_history" && strings.Contains(condition, "id = ")
-		}), "the item's id restricts the scan below the window, so a read costs its versions once: %v", window)
+		require.True(t, planHas(window, restrictsHistoryByID),
+			"the item's id restricts the scan below the window, so a read costs its versions once: %v", window)
+	}
+}
+
+// restrictsHistoryByID reports whether a plan node scans parts_history restricted by id: in
+// its Index Cond, Filter or Recheck Cond (an index or sequential scan, a bitmap heap scan),
+// or in the Index Cond of an index node below it that names no relation (the bitmap index
+// scan of a bitmap heap scan).
+func restrictsHistoryByID(node map[string]any) bool {
+	if node["Relation Name"] != "parts_history" {
+		return false
+	}
+	byID := func(node map[string]any) bool {
+		condition := fmt.Sprint(node["Index Cond"]) + fmt.Sprint(node["Filter"]) + fmt.Sprint(node["Recheck Cond"])
+		return strings.Contains(condition, "id = ")
+	}
+	if byID(node) {
+		return true
+	}
+	children, _ := node["Plans"].([]any)
+	for _, child := range children {
+		if index := child.(map[string]any); index["Relation Name"] == nil && byID(index) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRestrictsHistoryByIDReadsEveryScanShape(t *testing.T) {
+	t.Parallel()
+	shapes := map[string]struct {
+		plan       string
+		restricted bool
+	}{
+		"index scan":      {`{"Node Type":"Index Scan","Relation Name":"parts_history","Index Cond":"(id = $1)"}`, true},
+		"sequential scan": {`{"Node Type":"Seq Scan","Relation Name":"parts_history","Filter":"(id = $1)"}`, true},
+		"bitmap heap scan": {`{"Node Type":"Bitmap Heap Scan","Relation Name":"parts_history","Recheck Cond":"(id = $1)",
+			"Plans":[{"Node Type":"Bitmap Index Scan","Index Name":"parts_history_pkey","Index Cond":"(id = $1)"}]}`, true},
+		"bitmap index scan only": {`{"Node Type":"Bitmap Heap Scan","Relation Name":"parts_history",
+			"Plans":[{"Node Type":"Bitmap Index Scan","Index Name":"parts_history_pkey","Index Cond":"(id = $1)"}]}`, true},
+		"unrestricted scan": {`{"Node Type":"Seq Scan","Relation Name":"parts_history"}`, false},
+		"another relation":  {`{"Node Type":"Index Scan","Relation Name":"parts","Index Cond":"(id = $1)"}`, false},
+	}
+	for name, shape := range shapes {
+		var node map[string]any
+		require.NoError(t, json.Unmarshal([]byte(shape.plan), &node), name)
+		require.Equal(t, shape.restricted, restrictsHistoryByID(node), name)
 	}
 }
 
