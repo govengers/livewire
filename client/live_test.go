@@ -354,7 +354,7 @@ func TestBrokenPushesEndTheSubscription(t *testing.T) {
 		{"a snapshot without ids", livewire.PushSnapshot, `{"limit":1,"offset":0,"total":1,"items":[{"name":"x"}]}`, "has no id"},
 		{"a snapshot with a repeated id", livewire.PushSnapshot, `{"limit":1,"offset":0,"total":2,"items":[{"id":1},{"id":"1"}]}`, "repeats the id"},
 		{"a snapshot that is no list", livewire.PushSnapshot, `[]`, "no list response"},
-		{"an id of another kind", livewire.PushSnapshot, `{"limit":1,"offset":0,"total":1,"items":[{"id":true}]}`, "no string or number"},
+		{"an id of another kind", livewire.PushSnapshot, `{"limit":1,"offset":0,"total":1,"items":[{"id":true}]}`, "neither a string nor a number"},
 		{"an item that does not decode", livewire.PushSnapshot, `{"limit":1,"offset":0,"total":1,"items":[{"id":1}]}`, "does not decode"},
 	}
 	for _, testCase := range testCases {

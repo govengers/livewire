@@ -30,7 +30,7 @@ func NewListState(rawItems json.RawMessage, total int) (*ListState, error) {
 	}
 	state := &ListState{order: make([]string, 0, len(items)), items: make(map[string]json.RawMessage, len(items)), total: total}
 	for _, item := range items {
-		id, err := itemID(item)
+		id, err := ItemID(item)
 		if err != nil {
 			return nil, err
 		}
@@ -85,11 +85,12 @@ func (s *ListState) ChangesSince(previous *ListState) *ListChange {
 	return changes
 }
 
-// itemID is the item's id as the key of the list, read from the member spelled exactly "id"
+// ItemID is the key a list keys an item by (ListState, and every client applying a
+// ListChange the same way), read from the member spelled exactly "id"
 // (no case-insensitive alias): a JSON string as it is, a JSON number as JavaScript's Number
 // toString writes it (1, 1.0 and 1e0 are one id; 1234567 stays plain; 1e21 and 1e-7 take
 // exponent form; -0 is 0), so the server and the browser key the same.
-func itemID(item json.RawMessage) (string, error) {
+func ItemID(item json.RawMessage) (string, error) {
 	var members map[string]json.RawMessage
 	err := json.Unmarshal(item, &members)
 	rawID, present := members[keyFieldJSON]

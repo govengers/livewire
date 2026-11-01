@@ -177,7 +177,9 @@ func (l *live) run(ctx context.Context) {
 		case status == http.StatusUnauthorized:
 			l.end(http.StatusUnauthorized)
 			return
-		case err == nil:
+		case err != nil:
+			l.connectFailed(fmt.Errorf("livewire: connecting to %s: %w", l.client.options.SocketURL, err))
+		default:
 			attempt = 0
 			code = l.serve(ctx, connection)
 			if code == livewire.CloseIdentityGone {
@@ -190,6 +192,16 @@ func (l *live) run(ctx context.Context) {
 		}
 		attempt++
 	}
+}
+
+// connectFailed reports a failed connect to Options.ConnectFailed, under recovery: a
+// panicking callback costs nothing but its report.
+func (l *live) connectFailed(err error) {
+	if l.client.options.ConnectFailed == nil {
+		return
+	}
+	defer func() { _ = recover() }() // a callback that panics loses its report, nothing else
+	l.client.options.ConnectFailed(err)
 }
 
 // dial opens the socket with the API key; a refused handshake answers its status.
@@ -212,7 +224,10 @@ func (l *live) delay(attempt int, code int) time.Duration {
 	if code == websocket.CloseGoingAway {
 		return time.Duration(rand.Int64N(int64(initial) + 1)) //nolint:gosec // G404: jitter, not a secret
 	}
-	exponential := min(l.client.options.MaximumReconnectDelay, initial<<min(attempt, 30))
+	exponential := l.client.options.MaximumReconnectDelay
+	if attempt < 62 && initial <= exponential>>attempt {
+		exponential = initial << attempt // compared before shifting: no overflow, whatever the options
+	}
 	return exponential/2 + time.Duration(rand.Int64N(int64(exponential/2)+1)) //nolint:gosec // G404: jitter, not a secret
 }
 

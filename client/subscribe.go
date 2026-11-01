@@ -1,9 +1,9 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -54,7 +54,14 @@ func Subscribe[Data any](ctx context.Context, client *Client, target string, par
 func deliver[Data any](ctx context.Context, owner *live, subscription *subscription, pushes chan<- Push[Data]) {
 	defer close(pushes)
 	defer owner.remove(subscription)
-	defer func() { _ = recover() }() // a panic here is a bug; the channel still closes and the subscription ends
+	defer func() {
+		if recovered := recover(); recovered != nil { // a bug: the consumer still gets a last push with its reason
+			select {
+			case pushes <- Push[Data]{Kind: livewire.PushError, Err: fmt.Errorf("livewire: the delivery failed: %v", recovered)}:
+			case <-ctx.Done():
+			}
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -156,7 +163,7 @@ func newListState(payload json.RawMessage) (*listState, error) {
 	}
 	state := &listState{limit: page.Limit, offset: page.Offset, total: page.Total, next: page.Next, items: map[string]json.RawMessage{}}
 	for _, item := range page.Items {
-		id, err := itemID(item)
+		id, err := livewire.ItemID(item)
 		if err != nil {
 			return nil, err
 		}
@@ -175,19 +182,19 @@ func (s *listState) apply(change *livewire.ListChange) error {
 	items := maps.Clone(s.items)
 	var added []string
 	for _, item := range change.Upserts {
-		id, err := itemID(item)
+		id, err := livewire.ItemID(item)
 		if err != nil {
 			return err
 		}
 		if _, known := items[id]; !known {
 			added = append(added, id)
 		}
-		items[id] = item
+		items[id] = bytes.Clone(item) // the delivered change is the consumer's: the state owns its own bytes
 	}
 	for _, id := range change.Removes {
 		delete(items, id)
 	}
-	order := change.Order
+	order := slices.Clone(change.Order)
 	if order == nil {
 		for _, id := range slices.Concat(s.order, added) {
 			if _, present := items[id]; present {
@@ -211,23 +218,4 @@ func (s *listState) payload() (json.RawMessage, error) {
 		}
 	}
 	return json.Marshal(page)
-}
-
-// itemID is the id an item is diffed by: a string, or a number as its text.
-func itemID(item json.RawMessage) (string, error) {
-	var keyed struct {
-		ID json.RawMessage `json:"id"`
-	}
-	if err := json.Unmarshal(item, &keyed); err != nil || len(keyed.ID) == 0 {
-		return "", errors.New("livewire: a list item has no id")
-	}
-	var text string
-	if json.Unmarshal(keyed.ID, &text) == nil {
-		return text, nil
-	}
-	var number json.Number
-	if json.Unmarshal(keyed.ID, &number) == nil {
-		return number.String(), nil
-	}
-	return "", errors.New("livewire: a list item's id is no string or number")
 }

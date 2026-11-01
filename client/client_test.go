@@ -26,7 +26,12 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-const apiKey = "key-1"
+const (
+	apiKey    = "key-1"
+	fixedKey  = "0190a7a4-3e5f-7c3b-9b1e-2f6d1c2a3b01"
+	uploadKey = "0190a7a4-3e5f-7c3b-9b1e-2f6d1c2a3b02"
+	batchKey  = "0190a7a4-3e5f-7c3b-9b1e-2f6d1c2a3b03"
+)
 
 // recorded is one request the fake REST server saw.
 type recorded struct {
@@ -185,8 +190,8 @@ func TestCallsCarryTheirIdempotencyKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uuid.Version(7), key.Version())
 
-	require.NoError(t, created.Call(t.Context(), &client.Call{Method: http.MethodDelete, Path: "/parts/{id}", Parameters: client.Parameters{"id": "a"}, IdempotencyKey: "fixed"}, nil))
-	require.Equal(t, recorded{method: http.MethodDelete, path: "/api/parts/a", authorization: "Bearer " + apiKey, key: "fixed"}, server.last())
+	require.NoError(t, created.Call(t.Context(), &client.Call{Method: http.MethodDelete, Path: "/parts/{id}", Parameters: client.Parameters{"id": "a"}, IdempotencyKey: fixedKey}, nil))
+	require.Equal(t, recorded{method: http.MethodDelete, path: "/api/parts/a", authorization: "Bearer " + apiKey, key: fixedKey}, server.last())
 	require.ErrorContains(t, created.Call(t.Context(), &client.Call{Method: http.MethodPost, Path: "/parts", Body: func() {}}, nil), "the body of POST /parts")
 	require.ErrorContains(t, created.Call(t.Context(), &client.Call{Method: "BAD METHOD", Path: "/parts"}, nil), "BAD METHOD")
 }
@@ -195,9 +200,9 @@ func TestUploadsSendARawBodyWithItsLength(t *testing.T) {
 	created, server := newRESTClient(t, answer(http.StatusCreated, `{"size":5}`))
 	file := livewire.File{Body: strings.NewReader("hello"), Size: 5, ContentType: "image/png"}
 	var response map[string]int
-	require.NoError(t, created.Upload(t.Context(), &client.Upload{Path: "/parts/{id}/attachments", Parameters: client.Parameters{"id": "a"}, File: file, IdempotencyKey: "upload-1"}, &response))
+	require.NoError(t, created.Upload(t.Context(), &client.Upload{Path: "/parts/{id}/attachments", Parameters: client.Parameters{"id": "a"}, File: file, IdempotencyKey: uploadKey}, &response))
 	require.Equal(t, 5, response["size"])
-	require.Equal(t, recorded{method: http.MethodPost, path: "/api/parts/a/attachments", authorization: "Bearer " + apiKey, key: "upload-1", contentType: "image/png", length: 5, body: "hello"}, server.last())
+	require.Equal(t, recorded{method: http.MethodPost, path: "/api/parts/a/attachments", authorization: "Bearer " + apiKey, key: uploadKey, contentType: "image/png", length: 5, body: "hello"}, server.last())
 	require.ErrorContains(t, created.Upload(t.Context(), &client.Upload{Path: "/x"}, nil), "needs a body")
 }
 
@@ -214,10 +219,10 @@ func TestBatchAndStoredFilters(t *testing.T) {
 			writer.WriteHeader(http.StatusNoContent)
 		}
 	})
-	results, err := created.Batch(t.Context(), []livewire.BatchCall{{Target: "createPart", Body: json.RawMessage(`{}`)}}, &client.CallOptions{IdempotencyKey: "batch-1"})
+	results, err := created.Batch(t.Context(), []livewire.BatchCall{{Target: "createPart", Body: json.RawMessage(`{}`)}}, &client.CallOptions{IdempotencyKey: batchKey})
 	require.NoError(t, err)
 	require.Equal(t, []livewire.BatchResult{{Status: 201, Payload: json.RawMessage(`{"id":"a"}`)}}, results)
-	require.Equal(t, "batch-1", server.last().key)
+	require.Equal(t, batchKey, server.last().key)
 	require.Equal(t, `[{"target":"createPart","body":{}}]`, server.last().body)
 
 	stored, err := created.SaveFilter(t.Context(), &livewire.FilterRequest{Resource: "parts", Filter: json.RawMessage(`{}`)})

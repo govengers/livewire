@@ -43,7 +43,9 @@ const (
 // with the ws scheme and "/socket" appended). RequestTimeout bounds the answer of a
 // subscribe and the socket's handshake (default 30 s); ReconnectDelay is the first wait
 // before a reconnect (default 1 s), doubling with jitter up to MaximumReconnectDelay
-// (default 30 s). No duration may be negative.
+// (default 30 s). No duration may be negative. ConnectFailed, when set, is told every
+// failed connect of the socket (the loop keeps reconnecting), from the loop's goroutine; it
+// must return quickly. A library logs nothing, so this is how a program reports it.
 type Options struct {
 	BaseURL               string
 	APIKey                string
@@ -52,6 +54,7 @@ type Options struct {
 	RequestTimeout        time.Duration
 	ReconnectDelay        time.Duration
 	MaximumReconnectDelay time.Duration
+	ConnectFailed         func(err error)
 }
 
 // Client talks to one livewire API as the identity of one API key: REST requests and one
@@ -115,8 +118,9 @@ func resolveOptions(options *Options) error {
 }
 
 // CallOptions are the options of one mutation, upload or batch. IdempotencyKey is the key
-// the server records the call under (D16); empty, the call gets a fresh one. Send the same
-// key on every retry of one call, so a call that ran answers its recorded response.
+// the server records the call under (D16), a UUID (the server refuses another text, so the
+// client does before sending); empty, the call gets a fresh one. Send the same key on every
+// retry of one call, so a call that ran answers its recorded response.
 type CallOptions struct {
 	IdempotencyKey string
 }
@@ -142,6 +146,14 @@ func keyOf(options *CallOptions) string {
 		return NewIdempotencyKey()
 	}
 	return options.IdempotencyKey
+}
+
+// checkKey refuses an Idempotency-Key that is no UUID, which the server would refuse.
+func checkKey(key string) error {
+	if _, err := uuid.Parse(key); err != nil {
+		return fmt.Errorf("livewire: the Idempotency-Key %q is no UUID", key)
+	}
+	return nil
 }
 
 // Read sends GET path with parameters and decodes the answer into data (a pointer). A 404
@@ -305,6 +317,11 @@ func (c *Client) do(ctx context.Context, outgoing *request) (*http.Response, err
 	if err != nil {
 		return nil, err
 	}
+	if outgoing.key != "" {
+		if err := checkKey(outgoing.key); err != nil {
+			return nil, err
+		}
+	}
 	httpRequest, err := http.NewRequestWithContext(ctx, outgoing.method, c.options.BaseURL+target, outgoing.body)
 	if err != nil {
 		return nil, fmt.Errorf("livewire: %s %s: %w", outgoing.method, outgoing.path, err)
@@ -366,7 +383,7 @@ func (m *filterMemory) forget(id string) {
 func (m *filterMemory) inline(parameters Parameters, err error) (Parameters, bool) {
 	var refusal *Error
 	filterID, sent := parameters[livewire.ParameterFilterID]
-	if !sent || !errors.As(err, &refusal) || refusal.Code != livewire.CodeNotFound {
+	if !sent || !errors.As(err, &refusal) || refusal.Status != http.StatusNotFound || refusal.Code != livewire.CodeNotFound {
 		return nil, false
 	}
 	m.mutex.Lock()
