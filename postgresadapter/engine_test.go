@@ -74,12 +74,8 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 				{Name: "name", Type: query.TypeText, SQL: "parts.name", Filter: true, Sort: true},
 			},
 			DefaultSort: []query.SortTerm{{Field: "name"}},
-			List: func(ctx context.Context, listQuery *query.ListQuery) ([]livePart, int, error) {
-				page, err := postgresadapter.ListPage(ctx, database.pool, livePartSQL, listQuery, hydrateLiveParts)
-				if err != nil {
-					return nil, 0, err
-				}
-				return page.Items, page.Total, nil
+			List: func(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[livePart], error) {
+				return postgresadapter.ListPage(ctx, database.pool, livePartSQL, listQuery, hydrateLiveParts)
 			},
 		}),
 		livewire.NewMutation("createPart", http.MethodPost, "/parts", &livewire.MutationOptions[livewire.NoParameters, createPartBody, livePart]{

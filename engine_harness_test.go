@@ -138,7 +138,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets()))
 	return registry
 }
 
@@ -158,12 +158,12 @@ func (b *testbed) gadgets() *livewire.Resource {
 		Read:   authorization.HasRole(roleReader),
 		Fields: gadgetFields(),
 		Item:   &livewire.ItemKey{Parameter: "id", Field: "id"},
-		List: func(ctx context.Context, _ *query.ListQuery) ([]gadget, int, error) {
+		List: func(ctx context.Context, _ *query.ListQuery) (*livewire.Page[gadget], error) {
 			if err := b.world.load(ctx); err != nil {
-				return nil, 0, err
+				return nil, err
 			}
 			items := b.world.sorted("")
-			return items, len(items), nil
+			return &livewire.Page[gadget]{Items: items, Total: len(items)}, nil
 		},
 		Get: b.getGadget,
 		Distinct: func(ctx context.Context, field string, _ *query.ListQuery) ([]livewire.DistinctValue, error) {
@@ -330,9 +330,37 @@ func (b *testbed) openGadgets() *livewire.Resource {
 		Tables: []string{"gadgets"},
 		Read:   authorization.HasRole(roleReader),
 		Fields: fields,
-		List: func(context.Context, *query.ListQuery) ([]gadget, int, error) {
+		List: func(_ context.Context, listQuery *query.ListQuery) (*livewire.Page[gadget], error) {
 			items := b.world.sorted("")
-			return items, len(items), nil
+			next := listQuery.NextCursor(nil, firstKey) // an offset resource ignores it
+			return &livewire.Page[gadget]{Items: items, Total: len(items), Next: next}, nil
+		},
+	})
+}
+
+type pagedGadget struct {
+	ID string `json:"id"`
+}
+
+// pagedGadgets pages by cursor (D38) over two rows: a page of one row after the first one's
+// cursor is the second, the last.
+func (b *testbed) pagedGadgets() *livewire.Resource {
+	return livewire.NewResource("pagedGadgets", "/paged-gadgets", &livewire.ResourceOptions[pagedGadget]{
+		Read:   authorization.HasRole(roleReader),
+		Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "paged.id", Filter: true, Sort: true}},
+		Cursor: true,
+		List: func(_ context.Context, listQuery *query.ListQuery) (*livewire.Page[pagedGadget], error) {
+			rows := []pagedGadget{{ID: firstKey}, {ID: secondKey}}
+			start := 0
+			if listQuery.Cursor != nil && listQuery.Cursor.ID == firstKey {
+				start = 1
+			}
+			items := rows[start:min(start+listQuery.Limit, len(rows))]
+			page := &livewire.Page[pagedGadget]{Items: items, Total: len(rows)}
+			if start+len(items) < len(rows) {
+				page.Next = listQuery.NextCursor(nil, items[len(items)-1].ID)
+			}
+			return page, nil
 		},
 	})
 }

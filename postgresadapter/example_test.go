@@ -70,12 +70,8 @@ func ExampleListPage() {
 		return parts, result.Err()
 	}
 	var pool *pgxpool.Pool // the repository's pool
-	listParts := func(ctx context.Context, listQuery *query.ListQuery) ([]Part, int, error) {
-		page, err := postgresadapter.ListPage(ctx, pool, partSQL, listQuery, hydrate)
-		if err != nil {
-			return nil, 0, err
-		}
-		return page.Items, page.Total, nil
+	listParts := func(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[Part], error) {
+		return postgresadapter.ListPage(ctx, pool, partSQL, listQuery, hydrate) // ResourceOptions.List
 	}
 	_ = listParts
 }

@@ -323,7 +323,7 @@ func loadDeclaration(ctx context.Context, resolved *resolvedRead) (*readResult, 
 			return nil, err
 		}
 		count := reflect.ValueOf(items).Len() // the loaders of a List return a slice
-		return pageResult(ctx, declaration.Fields(), items, query.Page{Limit: count}, count)
+		return pageResult(ctx, declaration.Fields(), listAnswer{items: items, limit: count, total: count})
 	case *Object:
 		item, err := declaration.Load(ctx, resolved.parameters)
 		if err != nil {
@@ -368,11 +368,30 @@ func loadPage(ctx context.Context, resource *Resource, parameters *ReadParameter
 	if err != nil {
 		return nil, err
 	}
-	items, total, err := resource.LoadList(ctx, listQuery)
+	page, err := resource.list(ctx, listQuery)
 	if err != nil {
 		return nil, err
 	}
-	return pageResult(ctx, resource.Fields(), items, query.Page{Limit: listQuery.Limit, Offset: listQuery.Offset}, total)
+	items, total, next := page.parts()
+	answer := listAnswer{items: items, limit: listQuery.Limit, offset: listQuery.Offset, total: total}
+	if resource.Cursor() && next != nil {
+		encoded, err := next.Encode()
+		if err != nil {
+			return nil, fmt.Errorf("livewire: encode the next cursor of %q: %w", resource.Name(), err)
+		}
+		answer.next = &encoded
+	}
+	return pageResult(ctx, resource.Fields(), answer)
+}
+
+// listAnswer is what a list read answers before its items are marshaled: the items, the page
+// that was applied, the total and, in cursor mode, the encoded cursor of the next page.
+type listAnswer struct {
+	items  any
+	limit  int
+	offset int
+	total  int
+	next   *string
 }
 
 // listBody is ListResponse with the items already marshaled and redacted.
@@ -381,10 +400,11 @@ type listBody struct {
 	Offset int             `json:"offset"`
 	Total  int             `json:"total"`
 	Items  json.RawMessage `json:"items"`
+	Next   *string         `json:"next,omitempty"`
 }
 
-func pageResult(ctx context.Context, fields query.Fields, items any, page query.Page, total int) (*readResult, error) {
-	raw, err := json.Marshal(items)
+func pageResult(ctx context.Context, fields query.Fields, answer listAnswer) (*readResult, error) {
+	raw, err := json.Marshal(answer.items)
 	if err != nil {
 		return nil, fmt.Errorf("livewire: marshal the items: %w", err)
 	}
@@ -392,11 +412,11 @@ func pageResult(ctx context.Context, fields query.Fields, items any, page query.
 	if err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(listBody{Limit: page.Limit, Offset: page.Offset, Total: total, Items: redacted})
+	payload, err := json.Marshal(listBody{Limit: answer.limit, Offset: answer.offset, Total: answer.total, Items: redacted, Next: answer.next})
 	if err != nil {
 		return nil, fmt.Errorf("livewire: marshal the list: %w", err)
 	}
-	return &readResult{payload: payload, items: redacted, total: total}, nil
+	return &readResult{payload: payload, items: redacted, total: answer.total}, nil
 }
 
 func itemResult(ctx context.Context, fields query.Fields, item any) (*readResult, error) {
@@ -430,7 +450,7 @@ func (e *Engine) loadPresence(ctx context.Context, resolved *resolvedRead) (*rea
 		}
 		items = append(items, PresenceItem{ID: presence.Socket, Display: presence.Display, State: state})
 	}
-	return pageResult(ctx, nil, items, query.Page{Limit: len(items)}, len(items))
+	return pageResult(ctx, nil, listAnswer{items: items, limit: len(items), total: len(items)})
 }
 
 // parseTarget splits a socket target at its first dot: the declaration's name before it, the

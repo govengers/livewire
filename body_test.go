@@ -287,7 +287,9 @@ func TestDeclarationsRefusePointerLoops(t *testing.T) {
 		declarations["resource item"] = livewire.NewResource("loops", "/loops", &livewire.ResourceOptions[pointerLoop]{
 			Read:   authorization.IsUser(),
 			Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "loops.id", Filter: true}},
-			List:   func(context.Context, *query.ListQuery) ([]pointerLoop, int, error) { return nil, 0, nil },
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[pointerLoop], error) {
+				return &livewire.Page[pointerLoop]{}, nil
+			},
 		})
 		declarations["list item field"] = livewire.NewList("loopList", "/loop-list", &livewire.ListOptions[looped, livewire.NoParameters]{
 			Read: authorization.IsUser(),

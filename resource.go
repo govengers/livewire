@@ -74,6 +74,27 @@ type ItemKey struct {
 	Field     string
 }
 
+// Page is one page a filterable resource's List loader returns (D14, D38, D55): the items in
+// page order, the total under scope and filter (at most CountCap + 1 under a cap) and, when
+// the page is full, the cursor after its last row (nil otherwise), unencoded. The engine
+// answers Next encoded as ListResponse.next for a resource in cursor mode and ignores it
+// otherwise, so a sort value without a cursor form fails only the reads that need the
+// cursor. postgresadapter.ListPage returns one.
+type Page[Item any] struct {
+	Items []Item
+	Total int
+	Next  *query.Cursor
+}
+
+func (p *Page[Item]) parts() (items any, total int, next *query.Cursor) {
+	return p.Items, p.Total, p.Next
+}
+
+// loadedPage is a *Page of any item type, as the engine reads it.
+type loadedPage interface {
+	parts() (items any, total int, next *query.Cursor)
+}
+
 // Default limits of a filterable resource.
 const (
 	DefaultMaximumLimit    = 100
@@ -86,7 +107,7 @@ const (
 // without it. Scope narrows every read and re-run before filter and count; nil is no scope.
 // MaximumLimit clamps the page (default 100), CountCap caps the total (0 counts every row),
 // DistinctMaximum caps a distinct read (default 1000). Cursor allows keyset pagination with
-// the `after` parameter (D38). Versioned marks the item as carrying `version` and the
+// the `after` parameter and answers the Next of List's Page as ListResponse.next (D38, D55). Versioned marks the item as carrying `version` and the
 // history read (D34). ExportColumns names the fields an export writes; empty means all.
 // Partition names a subscription's partition (D25); nil means the tenant.
 type ResourceOptions[Item any] struct {
@@ -103,7 +124,7 @@ type ResourceOptions[Item any] struct {
 	Versioned       bool
 	ExportColumns   []string
 	Cursor          bool
-	List            func(ctx context.Context, listQuery *query.ListQuery) ([]Item, int, error)
+	List            func(ctx context.Context, listQuery *query.ListQuery) (*Page[Item], error)
 	Get             func(ctx context.Context, listQuery *query.ListQuery) (*Item, error)
 	Distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
 }
@@ -125,7 +146,7 @@ type Resource struct {
 	versioned       bool
 	exportColumns   []string
 	cursor          bool
-	list            func(ctx context.Context, listQuery *query.ListQuery) (any, int, error)
+	list            func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error)
 	get             func(ctx context.Context, listQuery *query.ListQuery) (any, error)
 	distinct        func(ctx context.Context, field string, listQuery *query.ListQuery) ([]DistinctValue, error)
 }
@@ -156,12 +177,19 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 		resource.item = &ItemKey{Parameter: options.Item.Parameter, Field: options.Item.Field}
 	}
 	if list := options.List; list != nil {
-		resource.list = func(ctx context.Context, listQuery *query.ListQuery) (any, int, error) {
-			items, total, err := list(ctx, listQuery)
-			if items == nil {
-				items = []Item{}
+		resource.list = func(ctx context.Context, listQuery *query.ListQuery) (loadedPage, error) {
+			page, err := list(ctx, listQuery)
+			switch {
+			case err != nil:
+				return nil, err
+			case page == nil:
+				return nil, fmt.Errorf("livewire: the List loader of %q returned no page and no error", name)
 			}
-			return items, total, err
+			answered := *page
+			if answered.Items == nil {
+				answered.Items = []Item{}
+			}
+			return &answered, nil
 		}
 	}
 	if get := options.Get; get != nil {
@@ -289,8 +317,9 @@ func (r *Resource) ItemQuery(ctx context.Context, source ParameterSource) (*quer
 	return r.compile(ctx, parsed)
 }
 
-// LoadList runs the List loader; the items are a []Item, never nil.
-func (r *Resource) LoadList(ctx context.Context, listQuery *query.ListQuery) (items any, total int, err error) {
+// LoadList runs the List loader; the page is the loader's *Page[Item], a copy whose Items are
+// never nil. A loader that returns no page and no error fails.
+func (r *Resource) LoadList(ctx context.Context, listQuery *query.ListQuery) (any, error) {
 	return r.list(ctx, listQuery)
 }
 
