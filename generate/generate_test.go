@@ -145,6 +145,7 @@ func TestMappingFollowsEncodingJSON(t *testing.T) {
 	require.True(t, found)
 	part, _, _ = strings.Cut(part, "\n}\n")
 	for _, line := range []string{
+		// snippet:begin mapping
 		"createdAt: string",                       // an embedded struct is flattened; time.Time is a string
 		"updatedAt: string | null",                // a pointer is nullable
 		"ownerId?: string",                        // promoted through an embedded pointer: absent while it is nil
@@ -177,6 +178,7 @@ func TestMappingFollowsEncodingJSON(t *testing.T) {
 		`"content-type": string`,                  // a key that is no identifier
 		`"-": string`,                             // json:"-,"
 		"inline: { A: number }",                   // an anonymous struct
+		// snippet:end mapping
 	} {
 		require.Contains(t, part, "\n  "+line+"\n", line)
 	}

@@ -10,14 +10,16 @@ Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `auth
 
 ## Packages
 
-| Import `github.com/govengers/livewire/...` | Use it for | Page |
-|---|---|---|
-| (root) `livewire` | the registry, declarations, errors, the engine | [Declarations](Declarations.md), [Reads-and-Filters](Reads-and-Filters.md), [Live-Engine](Live-Engine.md) |
-| `query` | fields, filter documents, SQL compilation | [Reads-and-Filters](Reads-and-Filters.md) |
-| `postgresadapter` | migrations, change feed, transactor, stores, list and export helpers | [Postgres](Postgres.md) |
-| `ginadapter`, `prometheusadapter` | REST routes and the socket on gin, wide events, metrics | [REST-and-Metrics](REST-and-Metrics.md) |
-| `generate`, `client` | the generated clients and the Go client's runtime | [Generated-Clients](Generated-Clients.md) |
-| `livewiretest` | the contract gates | [Testing](Testing.md) |
+| Import `github.com/govengers/livewire/...` | Use it for | Imports besides the standard library | Page |
+|---|---|---|---|
+| (root) `livewire` | the registry, declarations, errors, the engine on `net/http`, the adapter contracts | `query`, govengers/auth, gorilla/websocket, go-playground/validator, google/uuid | [Declarations](Declarations.md), [Reads-and-Filters](Reads-and-Filters.md), [Live-Engine](Live-Engine.md) |
+| `query` | fields, filter documents, SQL compilation | none | [Reads-and-Filters](Reads-and-Filters.md) |
+| `postgresadapter` | migrations, change feed, transactor, stores, list, history and export helpers | the root, `query`, pgx/v5, google/uuid | [Postgres](Postgres.md) |
+| `ginadapter` | the REST routes and the socket on gin, wide events | the root, gin, wide-event-logger | [REST-and-Metrics](REST-and-Metrics.md) |
+| `prometheusadapter` | the engine's metrics | the root, client_golang | [REST-and-Metrics](REST-and-Metrics.md) |
+| `generate` | the TypeScript, OpenAPI, Go client and CLI generators | the root, `query`, google/uuid | [Generated-Clients](Generated-Clients.md) |
+| `client` | the runtime of the generated Go client and CLI | the root, `query`, gorilla/websocket, google/uuid | [Generated-Clients](Generated-Clients.md) |
+| `livewiretest` | the contract gates | the root, `query`, `generate`, gorilla/websocket | [Testing](Testing.md) |
 
 ## Wiring order in main
 
@@ -27,7 +29,7 @@ Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `auth
 2. Build the repositories: sqlc on the engine's transaction, the pool outside one.
 3. Build livewire's Postgres adapters: `Transactor`, `Listener` and the stores the features need.
 4. Build the services, then the registry with its `Tenant` function and its `Observer` (`prometheusadapter.Metrics.Observe` and one wide event per socket outcome).
-5. `livewire.NewEngine` with the registry, the adapters, the `IdentitySource` (`session.Guard`) and the allowed origins.
+5. `livewire.NewEngine` with the registry, the adapters, the `IdentitySource` (`session.Guard` for sessions, or one that also resolves API keys, as the todo app's `authentication` package does) and the allowed origins.
 6. The govengers/jobs worker with the maintenance schedules of the stores.
 7. The gin router: the authentication middleware, `ginadapter.RegisterRoutes`, `ginadapter.SocketHandler` behind the same middleware.
 8. Run `engine.Run`, the worker and the servers in one errgroup; on SIGTERM withdraw readiness, shut the server down, then `engine.Close(ctx)` ends every socket with 1001.

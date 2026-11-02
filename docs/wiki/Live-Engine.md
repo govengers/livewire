@@ -83,7 +83,7 @@ func (a *application) revalidateUser(userID uuid.UUID) {
 
 With a `PresenceStore` the engine serves presence (D37): who is on a record, with a state the client chooses (the field being edited, a cursor). `join` names a declaration (a resource with an item read, or an object), carries the record's `key` in its parameters and the state as its body; `leave` ends it. The record's own read runs first under the caller, so only who may read the record may join it or see who is there.
 
-- The presences of a record are the live read `todos.presence` with the `key` parameter, and `GET /todos/presence?key=...` on REST: `[{id, display, state}]`, the display name from the identity's `Name` or `Username`.
+- The presences of a record are the live read `todos.presence` with the `key` parameter, and `GET /todos/presence?key=...` on REST: a `ListResponse` of `{id, display, state}` (`{"limit": 1, "offset": 0, "total": 1, "items": [...]}`), the display name from the identity's `Name` or `Username`.
 - The engine refreshes a socket's presences every `PresenceHeartbeat` (30 s) and sweeps those older than `PresenceExpiry` (90 s), so a vanished replica's presences go too.
 - Presence lives in the `livewire_presence` table, so it crosses replicas through the change feed.
 - In TypeScript, `useLivePresence` joins and reads ([Generated-Clients](Generated-Clients.md#vue)).

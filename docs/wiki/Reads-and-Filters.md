@@ -72,7 +72,7 @@ The `FilterStore` keeps at most 1000 unnamed filters per owner and tenant, repla
 
 ## Cursor mode
 
-A resource with `Cursor: true` pages by keyset on request (D38): the client sends the `next` of a page as `after` and gets the page after it, with its own `next` (absent at the end). Offset paging stays the default; `after` on a resource without `Cursor` is 400. The cursor holds the sort it was taken under, so a different `sort` with it is `invalid_cursor`; `total` is still counted and capped. A field that can be NULL must be declared `Nullable`, or the walk skips rows ([Fields](Declarations.md#fields)).
+A resource with `Cursor: true` pages by keyset on request (D38): the client sends the `next` of a page as `after` and gets the page after it, with its own `next`. A page that is not full has no `next`; a full page always has one, even when no row follows, and the page after it is empty, which ends the walk. Offset paging stays the default; `after` on a resource without `Cursor` is 400. The cursor holds the sort it was taken under, so a different `sort` with it is `invalid_cursor`; `total` is still counted and capped. A field that can be NULL must be declared `Nullable`, or the walk skips rows ([Fields](Declarations.md#fields)).
 
 `useLiveList(live.todos, { mode: 'cursor' })` tiles live pages with `loadMore()`; each page is a subscription after the `next` of the page above, which the runtime follows when the page's rows change, so no row falls between two pages (D64).
 

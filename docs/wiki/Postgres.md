@@ -47,7 +47,7 @@ func livewireSchema(ctx context.Context, transaction *sql.Tx) error {
 
 ### Deploy order of a changed SQL
 
-A livewire release that changes the SQL of a store says how to move (D72 is the one so far): first deploy the code that reads and writes both forms to every replica, then run the migration, then roll the replicas. `IdempotencySQL` of the development line before v1.0.0 stored the response as `jsonb`; v1.0.0 stores `bytea`, so a replay answers the first answer's exact bytes. An application that ran the earlier SQL deploys v1.0.0 everywhere first, whose store handles both columns, then migrates with a migration of its own, from [postgresadapter/idempotency_test.go](../../postgresadapter/idempotency_test.go):
+A livewire release that changes the SQL of a store says how to move (D72 is the one so far): first deploy the code that reads and writes both forms to every replica, then run the migration, then restart every replica. `IdempotencySQL` of the development line before v1.0.0 stored the response as `jsonb`; v1.0.0 stores `bytea`, so a replay answers the first answer's exact bytes. An application that ran the earlier SQL deploys v1.0.0 everywhere first, whose store handles both columns, then migrates with a migration of its own, from [postgresadapter/idempotency_test.go](../../postgresadapter/idempotency_test.go):
 
 <!-- snippet: postgresadapter/idempotency_test.go#idempotency-upgrade -->
 ```go
@@ -58,7 +58,7 @@ ALTER TABLE livewire_idempotency ALTER COLUMN response TYPE bytea USING convert_
 ```
 
 - The `ALTER` rewrites the table under an ACCESS EXCLUSIVE lock, so mutations wait for it; the table holds one `Window` of records (default 24 h), and the lock timeout keeps a busy table from stalling the deploy.
-- It changes the result type of the store's prepared statements: every pooled connection that ran them fails its next idempotent call once with SQLSTATE 0A000 (`cached plan must not change result type`), and pgx prepares the statement again after it (D74). Roll the replicas after the migration, or accept one 500 per connection, which a retry with the same key repairs.
+- It changes the types the store's statements were prepared with. Every pooled connection that prepared them before fails two idempotent calls after it: the reservation's read with SQLSTATE 0A000 (`cached plan must not change result type`), then the record's UPDATE, whose parameter was prepared as jsonb, with 42804. pgx prepares each statement again after its failure, so a retry on the same connection can fail too (D74). **Restart every replica after the migration**; the restart is required.
 
 ## The transactor
 
@@ -218,6 +218,6 @@ const tenantPolicySQL = `ALTER TABLE gadgets ENABLE ROW LEVEL SECURITY;
 CREATE POLICY gadgets_tenant ON gadgets USING (tenant_id = current_setting('livewire.tenant', true));`
 ```
 
-- A policy binds the application's role only when that role neither owns the table nor is a superuser (or the table has `FORCE ROW LEVEL SECURITY`).
-- Outside an engine transaction no tenant is set, so a job or a migration under the policy's role sees no rows; give it its own role or set the tenant itself.
+- Superusers and roles with `BYPASSRLS` bypass every policy, `FORCE ROW LEVEL SECURITY` or not. The table's owner bypasses it too, unless the table has `FORCE ROW LEVEL SECURITY`; FORCE binds the owner and no one else. Connect the application as a dedicated role that is no superuser, has no `BYPASSRLS` and does not own the tables (the test's role is one), and run the migrations as another.
+- Outside an engine transaction `livewire.tenant` is NULL on a fresh connection and `''` on a pooled one that ran an engine transaction. A policy on text then matches no row, except rows whose tenant is `''`; a policy that casts it (`::uuid`) fails with SQLSTATE 22P02. A job or a migration under the policy's role gets its own role, or sets the tenant itself.
 - `livewiretest.TenantIsolation` checks the outcome through the API, policy or scope ([Testing](Testing.md#tenantisolation)).

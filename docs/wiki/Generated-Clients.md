@@ -29,7 +29,52 @@ func Options(root string) *generate.Options {
 - Every output is optional; `TypeScriptDirectory`, `OpenAPIFile`, `GoClient.Directory` or `CommandLine.Directory` turns one on.
 - `Enums` lists the values of named string types (`generate.EnumOf(api.Priorities()...)`), which reflection cannot enumerate; an `enum:"a,b"` tag on a field wins.
 - `Presence` says the engine has a `PresenceStore`; only then are the presence reads, routes and joins generated, as only then does the REST adapter mount them.
-- The mapping of Go types is encoding/json's (D63): a pointer, a nil-able slice or map is `| null`, `omitempty` and `omitzero` make a field optional, `time.Time` and `uuid.UUID` are strings, a guarded field is optional. `Write` refuses what it cannot describe: a type encoding/json cannot marshal, identifiers that collide, a Go client type it cannot import.
+- The mapping of Go types is encoding/json's (D63), and so is when a field is absent and when it is null; [Type mapping](#type-mapping) has the rules. `Write` refuses what it cannot describe: a type encoding/json cannot marshal, identifiers that collide, a Go client type it cannot import.
+
+### Type mapping
+
+Two questions decide a field's type, as encoding/json answers them:
+
+- **May it be absent (`?`)?** When encoding/json may leave it out: `omitempty` on a kind it can omit (a string, number, bool, pointer, slice, map or interface; never a struct, so `time.Time` with `omitempty` stays required, nor a fixed array), `omitzero` on any type, a field promoted through an embedded pointer, and a guarded field (D39).
+- **May it be null?** When encoding/json writes `null` for it and does not omit it then: a pointer, a slice (`[]byte` is a base64 string) and a map are `| null`, a fixed array never is, and pointer elements are `(T | null)[]`. An optional field (`omitempty`, `omitzero`) is never `| null`: encoding/json leaves out the nil it would write as null.
+
+Named types are declarations of their own; `time.Time` and `uuid.UUID` are strings, a `json.Marshaler` is `unknown`, an `encoding.TextMarshaler` a string. Each line below is a field of the generator's fixture and its TypeScript, pinned by `TestMappingFollowsEncodingJSON`:
+
+<!-- snippet: generate/generate_test.go#mapping -->
+```go
+"createdAt: string",                       // an embedded struct is flattened; time.Time is a string
+"updatedAt: string | null",                // a pointer is nullable
+"ownerId?: string",                        // promoted through an embedded pointer: absent while it is nil
+"promoted: string",                        // promoted through an unexported embedding
+"dimensions: Dimensions",                  // an embedding with a JSON name is one field
+"id: string",                              // uuid.UUID is a string
+"kind: Kind",                              // a listed named string type
+"color: Color",                            // an unlisted named string type, an alias of string
+"secret?: string",                         // guarded (D39)
+"notes?: string",                          // omitempty
+"previous?: Kind",                         // omitempty on a pointer: present, not null
+"tags: Tags | null",                       // a named slice is nullable
+"labels?: string[]",                       // omitempty on a slice: present, not null
+"sizes: ('s' | 'm' | 'l')[] | null",       // an enum tag on a slice
+"grade: 'a' | 'b'",                        // an enum tag
+"counts: Record<string, number> | null",   // a map is nullable
+"names?: Record<string, string>",          // omitzero; integer keys are strings
+"children: (FixturePart | null)[] | null", // pointer elements are nullable
+"matrix: number[]",                        // an array is never null
+"checksum: string | null",                 // []byte is base64
+"total: Cents",                            // a named number
+"large: string",                           // the string option
+"flag: string | null",                     // the string option behind a pointer
+"expires?: string",                        // omitzero on a struct
+"started: string",                         // omitempty never omits a struct
+"extra: unknown",                          // json.RawMessage
+"anything: unknown",                       // an interface
+"payload: unknown",                        // a json.Marshaler
+"code: string",                            // an encoding.TextMarshaler
+`"content-type": string`,                  // a key that is no identifier
+`"-": string`,                             // json:"-,"
+"inline: { A: number }",                   // an anonymous struct
+```
 
 ## TypeScript
 
@@ -74,25 +119,29 @@ async function changeSessionNow(change: () => Promise<Response>): Promise<void> 
 }
 ```
 
-The status of a connection is `idle`, `connecting`, `open`, `reconnecting` or `ended`. A retried mutation keeps its body's id and its key: `prepareCall` fills both once, and a `NetworkError` that is not an `EndedError` may be retried with them:
+The status of a connection is `idle`, `connecting`, `open`, `reconnecting` or `ended`. A retried mutation keeps its body's id and its key: `prepareCall` fills both once, and a `NetworkError` that is not an `EndedError` may be retried with them. The `optimistic` item is what an `Upserts` effect shows before the answer; without it the lists change only when the answer arrives:
 
 <!-- snippet: examples/todo/web/src/live.ts#optimistic-create -->
 ```ts
 /**
- * Creates a todo on the socket with an optimistic effect (D36): the list shows it at once,
- * pending, under the id the client chose (D18), and the same id and Idempotency-Key go out on a
- * retry, so a retried create runs once (D16). Only a lost answer is retried: a refusal (an
- * ApiError, `conflict` when the id exists) answers the same again, and an ended pair serves no
- * one any more.
+ * Creates a todo on the socket with an optimistic effect (D36): the live lists show the
+ * `optimistic` item at once, pending, under the id the client chose (D18), until the answer and
+ * the next push replace it; without `optimistic` they show the answer, pending until that push.
+ * The same id and Idempotency-Key go out on a retry, so a retried create runs once (D16). Only a
+ * lost answer is retried: a refusal (an ApiError, `conflict` when the id exists) answers the same
+ * again, and an ended pair serves no one any more.
  */
 export async function createTodo(title: string): Promise<TodoItem> {
   const connection = pair.value.connection
   const prepared = prepareCall(calls.createTodo, { title, priority: 'high' })
+  const now = new Date().toISOString()
+  const optimistic: TodoItem = { id: prepared.body.id ?? '', title, priority: 'high', done: false, dueAt: null, createdAt: now, updatedAt: now, version: 1 }
+  const options = { idempotencyKey: prepared.idempotencyKey, optimistic }
   try {
-    return await connection.call(calls.createTodo, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })
+    return await connection.call(calls.createTodo, {}, prepared.body, options)
   } catch (error) {
     if (error instanceof NetworkError && !(error instanceof EndedError)) {
-      return connection.call(calls.createTodo, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })
+      return connection.call(calls.createTodo, {}, prepared.body, options)
     }
     throw error
   }
