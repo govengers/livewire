@@ -119,8 +119,8 @@ The triggers keep their names: `TriggerFunctionSQL` replaces v0.2's `livewire_no
 
 The move is a cut-over, not a rolling deploy. A v0.2 replica runs `InstallTriggers` on every start, which puts back v0.2's `livewire_notify()`. v0.2's function reads its first trigger argument as the channel, so its body breaks v1's triggers two ways until the trigger migration runs again, which a goose migration does once:
 
-- Writes fail with SQLSTATE 22023 (`channel name cannot be empty`): every write to a v1 table the v0.2 replica does not list, whose `TriggerSQL` passes no argument, and every TRUNCATE (`livewire_notify_truncate('')`).
-- Everywhere else live updates stop without an error: the tables the v0.2 replica lists notify `"op":"INSERT"`, which the v1 `Listener` drops as malformed, and the `PartitionedTriggerSQL` tables and `livewire_presence` notify on a channel named after their partition column, which nobody listens on.
+- Writes fail with SQLSTATE 22023 (`channel name cannot be empty`) on the tables installed with `TriggerSQL`, which pass no channel argument: every write to such a table the v0.2 replica does not list, and every TRUNCATE of any such table (`livewire_notify_truncate('')`).
+- Everywhere else live updates stop without an error: the tables the v0.2 replica lists notify `"op":"INSERT"`, which the v1 `Listener` drops as malformed; the `PartitionedTriggerSQL` tables and `livewire_presence` pass their partition column as the argument, so their writes and TRUNCATEs notify on a channel named after that column, which nobody listens on.
 
 Stop every v0.2 replica (or deploy a v0.2 build without `InstallTriggers`) before the v1 migration runs. After a rollback to v0.2 and forward again, run the trigger SQL again.
 
