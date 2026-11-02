@@ -42,7 +42,7 @@ func declare(todos *todoRepository) (*livewire.Registry, error) {
         }),
         livewire.NewMutation("createTodo", http.MethodPost, "/todos", &livewire.MutationOptions[livewire.NoParameters, createTodo, todo]{
             Check: authorization.IsUser(), Status: http.StatusCreated,
-            ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"), // a socket call shows it in the lists at once
+            ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"), // with `optimistic`, a socket call shows it at once
             Handle: todos.Create,
         }),
     )

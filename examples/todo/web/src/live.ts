@@ -121,8 +121,9 @@ export function useTodoPresence(id: string, editing: () => string) {
 
 /**
  * Creates a todo on the socket with an optimistic effect (D36): the live lists show the
- * `optimistic` item at once, pending, under the id the client chose (D18), until the answer and
- * the next push replace it; without `optimistic` they show the answer, pending until that push.
+ * `optimistic` item at once, pending until the server answers, under the id the client chose
+ * (D18); without `optimistic` they show nothing before the answer. The answer then stays shown
+ * until the next push or the reconcile window, and the push wins (D65).
  * The same id and Idempotency-Key go out on a retry, so a retried create runs once (D16). Only a
  * lost answer is retried: a refusal (an ApiError, `conflict` when the id exists) answers the same
  * again, and an ended pair serves no one any more.

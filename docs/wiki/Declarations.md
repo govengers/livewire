@@ -189,7 +189,7 @@ type TodoParameters struct {
 
 ### Optimistic effects
 
-`Effect: livewire.Upserts("todos")` lets a client that runs the mutation over the socket (`connection.call`) change the live lists of `todos` before their next push (D36, D65). An item shows before the server answers only when the caller passes it as `optimistic` (`{ optimistic: item }`, with the item's `id`); without it the lists show the answer as soon as it arrives. Either way the item is pending until the next push reconciles it, and an error takes the change back. `livewire.Removes("todos")` removes the item named by the `id` path parameter at once. `Upserts` needs a response with a JSON field `id`, `Removes` a `path:"id"` parameter. The TypeScript client shows how ([Generated-Clients](Generated-Clients.md#one-pair-per-identity)).
+`Effect: livewire.Upserts("todos")` lets a client that runs the mutation over the socket (`connection.call`) change the live lists of `todos` before their next push (D36, D65). An item shows before the server answers only when the caller passes it as `optimistic` (`{ optimistic: item }`, with the item's `id`); without it the lists show the answer as soon as it arrives. Either way the item is pending until the server answers; the answer then stays shown until the list's next push or the `reconcileWindow` (default 1 s) and the push wins; an error takes the change back. `livewire.Removes("todos")` removes the item named by the `id` path parameter at once. `Upserts` needs a response with a JSON field `id`, `Removes` a `path:"id"` parameter. The TypeScript client shows how ([Generated-Clients](Generated-Clients.md#one-pair-per-identity)).
 
 ## Uploads
 

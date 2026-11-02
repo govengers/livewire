@@ -81,7 +81,7 @@ The triggers keep their names: `TriggerFunctionSQL` replaces v0.2's `livewire_no
 | ops `subscribe`, `unsubscribe`, `ping` | also `query`, `call`, `batch`, `join`, `leave` (D2) |
 | response `{id, ok, subscription, error}` | `{id, ok, status, payload, error, subscription, filterId}` |
 | push `{sub, seq, kind, payload}`, kinds `snapshot`, `diff`, `replace`, `error` | unchanged; **breaking:** a list snapshot is a `ListResponse`, a diff `{upserts, removes, order, total}` carries the total |
-| `ClientFrame{ID, Op, Target, Params, Subscription}` | `RequestFrame{ID, Operation, Target, Parameters, Body, IdempotencyKey}` |
+| `ClientFrame{ID, Op, Target, Params, Subscription}` | `RequestFrame{ID, Operation, Target, Parameters, Body, IdempotencyKey}`; **breaking:** an `unsubscribe` names the subscription in `target`, not in `subscription` |
 | `ResponseFrame{ID, OK, Subscription, Error}` | `ResponseFrame{ID, OK, Status, Payload, Error, Subscription, FilterID}` |
 | `PushFrame{Sub, Seq, Kind, Payload}` | `PushFrame{Subscription, Sequence, Kind, Payload}`, the same JSON |
 | `Diff{Upserts, Removes, Order}` | `ListChange{Upserts, Removes, Order, Total}` |
@@ -110,12 +110,19 @@ The triggers keep their names: `TriggerFunctionSQL` replaces v0.2's `livewire_no
 | `useLive(live.todos, params, { cache })` returning `{ data, error, stale, retry }` | the same call, under the plugin's pair; the cache is kept per identity, and it also returns `loading`, `pending` and `filterId` |
 | `useLiveStatus()`: `connecting`, `live`, `offline` | **breaking:** `idle`, `connecting`, `open`, `reconnecting`, `ended` |
 | `ApiError`, `NetworkError` | also `EndedError` (an ended client or connection); `ApiError.code` is from the closed set |
+| `new ApiError(status, code, message, fields?, body?)` | **breaking:** `new ApiError(status, body)`, which reads `code`, `message` and `fields` from the body |
+| `connection.subscribe(target, params, onPush, onError)` returning a function that unsubscribes | **breaking:** `connection.subscribe(target, parameters, listener)` with a `LiveListener`, returning a `LiveSubscription` `{ unsubscribe(), retry() }` |
 | `config.onError(error, { method, path })` | gone: catch at the call; `LiveOptions.onError` gets what an application callback threw |
 | (none) | `useLiveList`, `useLivePresence`, `prepareCall`, optimistic effects, the Go client, the CLI, `livewiretest` |
 
 ## Order of the move
 
-The move is a cut-over, not a rolling deploy. A v0.2 replica runs `InstallTriggers` on every start, which puts back v0.2's `livewire_notify()`. Its notifications carry `"op":"INSERT"`, which the v1 `Listener` drops as malformed, so live updates stop without an error until the trigger migration runs again, and a goose migration runs once. Stop every v0.2 replica (or deploy a v0.2 build without `InstallTriggers`) before the v1 migration runs. After a rollback to v0.2 and forward again, run the trigger SQL again.
+The move is a cut-over, not a rolling deploy. A v0.2 replica runs `InstallTriggers` on every start, which puts back v0.2's `livewire_notify()`. v0.2's function reads its first trigger argument as the channel, so its body breaks v1's triggers two ways until the trigger migration runs again, which a goose migration does once:
+
+- Writes fail with SQLSTATE 22023 (`channel name cannot be empty`): every write to a v1 table the v0.2 replica does not list, whose `TriggerSQL` passes no argument, and every TRUNCATE (`livewire_notify_truncate('')`).
+- Everywhere else live updates stop without an error: the tables the v0.2 replica lists notify `"op":"INSERT"`, which the v1 `Listener` drops as malformed, and the `PartitionedTriggerSQL` tables and `livewire_presence` notify on a channel named after their partition column, which nobody listens on.
+
+Stop every v0.2 replica (or deploy a v0.2 build without `InstallTriggers`) before the v1 migration runs. After a rollback to v0.2 and forward again, run the trigger SQL again.
 
 1. Change the module path and the imports; replace `gen` with `generate`.
 2. Turn the registry and every declaration into options structs; move the `Context` hook's tenant into `RegistryOptions.Tenant` and its other checks into the loaders.
