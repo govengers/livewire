@@ -117,4 +117,4 @@ A job a mutation enqueued runs in a test with `jobstest.Drain(t, worker)` (goven
 
 ## Breaking changes of the API
 
-`just openapi-breaking` runs `oasdiff breaking` (pinned, through `go run`) on the example's `openapi.yaml` against the one of the latest release tag (`v1` or later) before `HEAD`, or of a ref it is given (`just openapi-breaking v1.0.0`), and fails on an error-level change (D23). An application copies the recipe for its own document. Until a v1 tag exists there is nothing to compare with, so it is not part of `just check` or CI yet; once v1.0.0 is tagged, CI can run it.
+`just openapi-breaking` runs `oasdiff breaking` (pinned, through `go run`) on the example's `openapi.yaml` against the one of the latest release tag (`v1` or later) before `HEAD`, or of a ref it is given (`just openapi-breaking v1.0.0`), and fails on an error-level change (D23). An application copies the recipe for its own document. `just lint` runs it last, so `just check` and CI do; in CI's shallow checkout it fetches the history and the tags first.
