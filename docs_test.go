@@ -45,7 +45,7 @@ func TestDocumentSnippetsMatchTheirSources(t *testing.T) {
 	for _, document := range documents(t) {
 		content, err := fs.ReadFile(module, document)
 		require.NoError(t, err)
-		require.NotContains(t, string(content), "—", "%s: no em-dash", document)
+		require.NotContains(t, string(content), "\u2014", "%s: no em-dash", document)
 		lines := strings.Split(string(content), "\n")
 		for index := 0; index < len(lines); index++ {
 			opening := fence.FindStringSubmatch(lines[index])
