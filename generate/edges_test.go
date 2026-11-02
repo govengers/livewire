@@ -31,10 +31,14 @@ type objectMarshaler struct{}
 
 func (objectMarshaler) MarshalJSON() ([]byte, error) { return []byte(`{"a":1}`), nil }
 
+// snippet:begin kept-nil
+
 // keptNil calls a nil value non-zero, so omitzero writes it as null.
 type keptNil []string
 
 func (keptNil) IsZero() bool { return false }
+
+// snippet:end kept-nil
 
 type (
 	enumStrings []string
@@ -127,9 +131,11 @@ func TestEdgeRegistryMapping(t *testing.T) {
 	item += "\n"
 	for _, line := range []string{
 		"texts: Record<string, PointerText> | null", // a map value is not addressable: no pointer-receiver MarshalText
-		"text: string",                             // a field is: its pointer-receiver MarshalText writes it
-		"quoted: unknown",                          // the string option does not quote a marshaler
-		"kept?: KeptNil | null",                    // omitzero with an IsZero that keeps nil
+		"text: string",    // a field is: its pointer-receiver MarshalText writes it
+		"quoted: unknown", // the string option does not quote a marshaler
+		// snippet:begin kept-nil-mapping
+		"kept?: KeptNil | null", // omitzero with an IsZero that keeps nil
+		// snippet:end kept-nil-mapping
 		"values: ('a' | 'b')[] | null",             // the enum tag through a named slice
 		"pair: ('a' | 'b')[]",                      // through a named array
 		"labels: Record<string, 'a' | 'b'> | null", // through a named map

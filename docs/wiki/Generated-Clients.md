@@ -36,7 +36,7 @@ func Options(root string) *generate.Options {
 Two questions decide a field's type, as encoding/json answers them:
 
 - **May it be absent (`?`)?** When encoding/json may leave it out: `omitempty` on a kind it can omit (a string, number, bool, pointer, slice, map or interface; never a struct, so `time.Time` with `omitempty` stays required, nor a fixed array), `omitzero` on any type, a field promoted through an embedded pointer, and a guarded field (D39).
-- **May it be null?** When encoding/json writes `null` for it and does not omit it then: a pointer, a slice (`[]byte` is a base64 string) and a map are `| null`, a fixed array never is, and pointer elements are `(T | null)[]`. An optional field (`omitempty`, `omitzero`) is never `| null`: encoding/json leaves out the nil it would write as null.
+- **May it be null?** When encoding/json writes `null` for it and does not omit it then: a pointer, a slice (`[]byte` is a base64 string) and a map are `| null`, a fixed array never is, and pointer elements are `(T | null)[]`. An optional field (`omitempty`, `omitzero`) is not `| null`: encoding/json leaves out the nil it would write as null. The exception is `omitzero` on a type whose own `IsZero` calls nil non-zero: encoding/json writes that nil as `null`, so the field is optional and `| null`.
 
 Named types are declarations of their own; `time.Time` and `uuid.UUID` are strings, a `json.Marshaler` is `unknown`, an `encoding.TextMarshaler` a string. Each line below is a field of the generator's fixture and its TypeScript, pinned by `TestMappingFollowsEncodingJSON`:
 
@@ -74,6 +74,21 @@ Named types are declarations of their own; `time.Time` and `uuid.UUID` are strin
 `"content-type": string`,                  // a key that is no identifier
 `"-": string`,                             // json:"-,"
 "inline: { A: number }",                   // an anonymous struct
+```
+
+The `IsZero` exception, from `TestEdgeRegistryMapping` (the field is `Kept keptNil` with `json:"kept,omitzero"`):
+
+<!-- snippet: generate/edges_test.go#kept-nil -->
+```go
+// keptNil calls a nil value non-zero, so omitzero writes it as null.
+type keptNil []string
+
+func (keptNil) IsZero() bool { return false }
+```
+
+<!-- snippet: generate/edges_test.go#kept-nil-mapping -->
+```go
+"kept?: KeptNil | null", // omitzero with an IsZero that keeps nil
 ```
 
 ## TypeScript
@@ -119,14 +134,15 @@ async function changeSessionNow(change: () => Promise<Response>): Promise<void> 
 }
 ```
 
-The status of a connection is `idle`, `connecting`, `open`, `reconnecting` or `ended`. A retried mutation keeps its body's id and its key: `prepareCall` fills both once, and a `NetworkError` that is not an `EndedError` may be retried with them. The `optimistic` item is what an `Upserts` effect shows before the answer; without it the lists change only when the answer arrives:
+The status of a connection is `idle`, `connecting`, `open`, `reconnecting` or `ended`. A retried mutation keeps its body's id and its key: `prepareCall` fills both once, and a `NetworkError` that is not an `EndedError` may be retried with them. The `optimistic` item is what an `Upserts` effect shows, pending, before the answer; without it the lists change only when the answer arrives. The answer then stays shown, no longer pending, until the next push or the reconcile window:
 
 <!-- snippet: examples/todo/web/src/live.ts#optimistic-create -->
 ```ts
 /**
  * Creates a todo on the socket with an optimistic effect (D36): the live lists show the
- * `optimistic` item at once, pending, under the id the client chose (D18), until the answer and
- * the next push replace it; without `optimistic` they show the answer, pending until that push.
+ * `optimistic` item at once, pending until the server answers, under the id the client chose
+ * (D18); without `optimistic` they show nothing before the answer. The answer then stays shown
+ * until the next push or the reconcile window, and the push wins (D65).
  * The same id and Idempotency-Key go out on a retry, so a retried create runs once (D16). Only a
  * lost answer is retried: a refusal (an ApiError, `conflict` when the id exists) answers the same
  * again, and an ended pair serves no one any more.
