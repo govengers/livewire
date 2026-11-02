@@ -34,6 +34,8 @@ type TodoItem struct {
 	Version   int        `json:"version"`
 }
 
+// snippet:begin requests
+
 // CreateTodoRequest creates a todo; ID is a UUID v7 the client may choose (D18), so an
 // optimistic item and its retry carry the same id.
 type CreateTodoRequest struct {
@@ -57,6 +59,8 @@ type TodoParameters struct {
 	ID uuid.UUID `path:"id"`
 }
 
+// snippet:end requests
+
 // SummaryItem counts the workspace's todos and attachments.
 type SummaryItem struct {
 	Open        int `json:"open"`
@@ -72,10 +76,14 @@ type ActivityItem struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+// snippet:begin activity-parameters
+
 // ActivityParameters narrow the activity to one todo.
 type ActivityParameters struct {
 	TodoID *uuid.UUID `query:"todoId"`
 }
+
+// snippet:end activity-parameters
 
 // AttachmentItem is a file stored with a todo.
 type AttachmentItem struct {

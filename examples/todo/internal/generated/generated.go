@@ -14,6 +14,8 @@ import (
 // modulePath is the import path of the example's module.
 const modulePath = "github.com/govengers/livewire/examples/todo"
 
+// snippet:begin options
+
 // Options are the generator's options with every path below root, the module's directory.
 func Options(root string) *generate.Options {
 	return &generate.Options{
@@ -34,3 +36,5 @@ func Options(root string) *generate.Options {
 		Presence:    true,
 	}
 }
+
+// snippet:end options

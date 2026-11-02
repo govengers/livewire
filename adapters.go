@@ -74,7 +74,9 @@ type ChangeFeed interface {
 }
 
 // IdentitySource re-validates who a socket acts as (D6): the engine calls Identify with the
-// upgrade request on every subscribe, call, re-run and tick. The identity is gone, and the
+// upgrade request on every subscribe, query, call, batch, join and leave, on a re-run whose
+// cached identity is older than RevalidateInterval, and on that tick (D51; ping and
+// unsubscribe are exempt). The identity is gone, and the
 // socket closes with CloseIdentityGone, when the source returns an error matching
 // auth.ErrUnauthenticated (no session, expired, revoked: what session.Guard.Identify
 // returns) or auth.ErrForbidden (a refused refresh), or a nil identity with a nil error. Any

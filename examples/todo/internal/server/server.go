@@ -73,6 +73,7 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 	authginadapter.RegisterRoutes(router, options.Authentication.Routes())
 	authenticated := authginadapter.Middleware(options.Authentication.Middleware)
 	router.GET("/auth/me", authenticated, gin.WrapH(auth.IdentityHandler())) // who the session is, for the frontend's pair (D66)
+	// snippet:begin routes
 	api := router.Group("", authenticated)
 	if err := ginadapter.RegisterRoutes(api, &ginadapter.Options{Engine: engine}); err != nil {
 		return nil, err
@@ -84,8 +85,11 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 		ginContext.Request = ginContext.Request.WithContext(wideevent.NewContext(ginContext.Request.Context(), nil))
 		socket(ginContext)
 	})
+	// snippet:end routes
 	return router, nil
 }
+
+// snippet:begin recovery
 
 // recovery answers a panic with the 500 error body and prints nothing, so no header, cookie or
 // API key reaches a log (LOG-009); the wide-event middleware inside it recorded the panic. A
@@ -109,6 +113,8 @@ func recovery() gin.HandlerFunc {
 		ginContext.Next()
 	}
 }
+
+// snippet:end recovery
 
 // writeError answers the one error body (API-001).
 func writeError(ginContext *gin.Context, err error) {
@@ -186,6 +192,8 @@ func recordIdentifiers(we *wideevent.Event, parameters any) {
 	}
 }
 
+// snippet:begin observer
+
 // NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome
 // without a request's wide event (a socket frame, a re-run, the feed, a heartbeat: the socket
 // route takes the upgrade's event out of their context) is a unit of work of its own and gets
@@ -217,3 +225,5 @@ func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) 
 		we.Emit()
 	}
 }
+
+// snippet:end observer

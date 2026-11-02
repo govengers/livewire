@@ -36,8 +36,12 @@ func Member(ctx context.Context) (model.Member, error) {
 	return model.Member{UserID: identity.UserID, Username: identity.Username, Workspace: workspace}, nil
 }
 
+// snippet:begin tenant
+
 // Workspace is the workspace ctx acts in, the registry's tenant (D42).
 func Workspace(ctx context.Context, _ any) (string, error) {
 	member, err := Member(ctx)
 	return member.Workspace, err
 }
+
+// snippet:end tenant

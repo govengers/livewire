@@ -3,6 +3,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 gotestsum := "go run gotest.tools/gotestsum@v1.13.0"
 govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 sqlc := "go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1"
+oasdiff := "go run github.com/oasdiff/oasdiff@v1.35.0"
 coverage_threshold := "80"
 excluded := "/examples/|/test/|/generate/internal/fixture/"
 # CI (GitHub sets CI) has bun: the TypeScript parts of the e2e suite fail there instead of skipping
@@ -51,6 +52,12 @@ db-check-example:
 # Regenerate the example's sqlc queries and its clients (TypeScript, OpenAPI, Go client, CLI)
 generate-example:
     cd examples/todo && {{sqlc}} generate && go run ./cmd/generate
+
+# The breaking changes of the example's OpenAPI document (D23) against ref's, by default the latest v1 tag before HEAD; not in `check` until a v1 tag exists
+openapi-breaking ref="":
+    mkdir -p sandbox
+    base="{{ref}}"; if [ -z "$base" ]; then base="$(git describe --tags --abbrev=0 --match 'v[1-9]*' HEAD^ 2>/dev/null)" || { echo "no v1 tag before HEAD to compare with: just openapi-breaking <ref>"; exit 1; }; fi; git show "$base:examples/todo/openapi.yaml" > sandbox/openapi-base.yaml
+    {{oasdiff}} breaking --fail-on ERR sandbox/openapi-base.yaml examples/todo/openapi.yaml
 
 # Scan for known vulnerabilities in reachable code, the example module's included
 vulncheck:

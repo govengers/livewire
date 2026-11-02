@@ -15,7 +15,6 @@ import (
 	wideevent "github.com/govengers/wide-event-logger"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/livewire"
@@ -123,7 +122,11 @@ func TestTheRequestMetricsKeepTheirLabelsBounded(t *testing.T) {
 	families, err := metrics.Gather()
 	require.NoError(t, err)
 	var series []string
+	inFlight := -1.0
 	for _, family := range families {
+		if family.GetName() == "todo_http_requests_in_flight" {
+			inFlight = family.GetMetric()[0].GetGauge().GetValue()
+		}
 		if family.GetName() != "todo_http_requests_total" {
 			continue
 		}
@@ -136,7 +139,5 @@ func TestTheRequestMetricsKeepTheirLabelsBounded(t *testing.T) {
 		}
 	}
 	require.ElementsMatch(t, []string{"unmatched other 4xx", "/readyz GET 5xx"}, series)
-	inFlight, err := testutil.GatherAndCount(metrics, "todo_http_requests_in_flight")
-	require.NoError(t, err)
-	require.Equal(t, 1, inFlight)
+	require.Zero(t, inFlight, "every request in flight ended, the panicking one included")
 }

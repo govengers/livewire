@@ -10,9 +10,13 @@ import (
 	"github.com/govengers/livewire/examples/todo/client/todocommand"
 )
 
+// snippet:begin cli-main
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	code := todocommand.Run(ctx, os.Args, os.Stdin, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
+
+// snippet:end cli-main
