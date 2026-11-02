@@ -415,6 +415,22 @@ describe('useLiveList', () => {
   })
 })
 
+describe('descriptors in reactive state (D80)', () => {
+  test('a list and a mutation held in a deep reactive object work as given', async () => {
+    const { connection, current } = connect()
+    const page = reactive({ target: parts, remove: deletePart })
+    const live = effectScope().run(() => useLiveList(page.target, { connection }))!
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }]) })
+    const call = connection.call(page.remove, { id: 'a' }, undefined)
+    expect([live.items.value.map((item) => item.id), live.pending.value]).toEqual([['b'], ['a']])
+    current().answer('call', { status: 204 })
+    await call
+    expect(live.pending.value).toEqual([])
+  })
+})
+
 describe('useLivePresence', () => {
   test('joins with the state, joins again on a change, moves records and leaves with its scope (D37)', async () => {
     const { connection, current } = connect()
