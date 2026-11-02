@@ -1,7 +1,7 @@
 // Calls the generated client of the fixture registry the way an application does; tsc checks
 // it under the strictest settings, and every @ts-expect-error line must stay an error.
 
-import { effectScope, shallowRef } from 'vue'
+import { computed, effectScope, ref, shallowRef } from 'vue'
 import {
   calls,
   createPart,
@@ -218,3 +218,22 @@ export function generics(): void {
   const wrong: ListQuery<PartsFilter, PartsSortTerm> = { sort: ['tags'] }
   console.log(wrong)
 }
+
+// snippet:begin cursor-pager
+/** A pager over a cursor resource with one live page (D81): next pushes the page's cursor, previous pops it. */
+export function useCursorPager(query: PartsListQuery) {
+  const cursors = ref<string[]>([])
+  const page = useLive(live.parts, () => {
+    const after = cursors.value.at(-1)
+    return after === undefined ? query : { ...query, after }
+  })
+  const next = (): void => {
+    const cursor = page.data.value?.next
+    if (cursor !== undefined && cursor !== cursors.value.at(-1)) cursors.value = [...cursors.value, cursor]
+  }
+  const previous = (): void => {
+    cursors.value = cursors.value.slice(0, -1)
+  }
+  return { page, next, previous, hasPrevious: computed(() => cursors.value.length > 0), hasNext: computed(() => page.data.value?.next !== undefined) }
+}
+// snippet:end cursor-pager

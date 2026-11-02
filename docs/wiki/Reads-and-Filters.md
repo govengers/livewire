@@ -76,6 +76,28 @@ A resource with `Cursor: true` pages by keyset on request (D38): the client send
 
 `useLiveList(live.todos, { mode: 'cursor' })` tiles live pages with `loadMore()`; each page is a subscription after the `next` of the page above, which the runtime follows when the page's rows change, so no row falls between two pages (D64).
 
+The tiles only grow (D81): there is no current page and no `previous()`, and every tile is a subscription, at most 64 per socket (D10) beside the page's other reads. A pager over a cursor resource either steps through the loaded `items` in slices of its page size and calls `loadMore()` when it needs the slice after them, or keeps one page live with a stack of cursors, one subscription at any depth. Page numbers are offset mode's.
+
+<!-- snippet: generate/testdata/typescript/usage.ts#cursor-pager -->
+```ts
+/** A pager over a cursor resource with one live page (D81): next pushes the page's cursor, previous pops it. */
+export function useCursorPager(query: PartsListQuery) {
+  const cursors = ref<string[]>([])
+  const page = useLive(live.parts, () => {
+    const after = cursors.value.at(-1)
+    return after === undefined ? query : { ...query, after }
+  })
+  const next = (): void => {
+    const cursor = page.data.value?.next
+    if (cursor !== undefined && cursor !== cursors.value.at(-1)) cursors.value = [...cursors.value, cursor]
+  }
+  const previous = (): void => {
+    cursors.value = cursors.value.slice(0, -1)
+  }
+  return { page, next, previous, hasPrevious: computed(() => cursors.value.length > 0), hasNext: computed(() => page.data.value?.next !== undefined) }
+}
+```
+
 ## History
 
 A resource with `Versioned: true`, an `Item` on its uuid field `id` and a `History` loader serves `GET /todos/{id}/history` and the live target `todos.history` (D34, D56). Each item of the answer is a `Version{id, operation, validFrom, validTo, actor, realActor, mutation, requestId, data}`: `id` is the version number, `data` the item as that version left it, passing the column checks. The history table and its trigger come from `postgresadapter.HistorySQL(table)`, the loader from `postgresadapter.HistoryPage`:
