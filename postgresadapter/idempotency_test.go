@@ -134,7 +134,9 @@ ALTER TABLE livewire_idempotency ALTER COLUMN response TYPE bytea USING convert_
 // TestTheEarlierJSONBRecordsReplayBeforeAndAfterTheUpgrade pins D72's deploy order and D74:
 // the store records and replays on the earlier jsonb column, its records replay after the
 // upgrade migration, and a connection that prepared the store's statements before it fails
-// its next reservation once with SQLSTATE 0A000, after which pgx prepares them again.
+// two calls, the reservation's read with SQLSTATE 0A000 and the record's UPDATE, whose
+// parameter was prepared as jsonb, with 42804; pgx prepares each statement again after its
+// failure, so the calls after them succeed.
 func TestTheEarlierJSONBRecordsReplayBeforeAndAfterTheUpgrade(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
@@ -175,10 +177,35 @@ func TestTheEarlierJSONBRecordsReplayBeforeAndAfterTheUpgrade(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, upgrade.Commit(t.Context()))
 	_, err = reserve(idempotencyKey)
-	var postgresError *pgconn.PgError
-	require.ErrorAs(t, err, &postgresError, "the statement prepared before the upgrade (D74)")
-	require.Equal(t, "0A000", postgresError.Code)
+	requireSQLState(t, err, "0A000", "the read prepared before the upgrade (D74)")
 	require.JSONEq(t, `{"id":"7","title":"bolt"}`, string(replay(idempotencyKey)), "a record of the jsonb column replays after the upgrade")
+
+	answered := json.RawMessage(`{"title":"nut", "id":"8"}`)
+	record = func() *livewire.IdempotencyRecord { // the call a retry on the same connection makes
+		ctx, transaction := inTransaction(t, transactor)
+		fresh, _, err := store.Reserve(ctx, alice, freshKey, "createPart")
+		require.NoError(t, err)
+		fresh.Status, fresh.Response = http.StatusCreated, answered
+		requireSQLState(t, store.Record(ctx, fresh), "42804", "the UPDATE prepared with a jsonb parameter (D74)")
+		require.NoError(t, transaction.Rollback(t.Context()))
+		return fresh
+	}()
+	ctx, transaction = inTransaction(t, transactor)
+	_, _, err = store.Reserve(ctx, alice, freshKey, "createPart")
+	require.NoError(t, err)
+	require.NoError(t, store.Record(ctx, record))
+	require.NoError(t, transaction.Commit(t.Context()))
+	require.Equal(t, string(answered), string(replay(freshKey)), "after both failures the connection records the answer's bytes")
+}
+
+// freshKey is a key no record carries before the upgrade.
+const freshKey = "0193a8f0-0000-7000-8000-00000000000b"
+
+func requireSQLState(t *testing.T, err error, code, message string) {
+	t.Helper()
+	var postgresError *pgconn.PgError
+	require.ErrorAs(t, err, &postgresError, message)
+	require.Equal(t, code, postgresError.Code, message)
 }
 
 func TestIdempotencyKeyIsFreeAfterARollback(t *testing.T) {
