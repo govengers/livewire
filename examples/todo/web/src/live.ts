@@ -120,20 +120,24 @@ export function useTodoPresence(id: string, editing: () => string) {
 // snippet:begin optimistic-create
 
 /**
- * Creates a todo on the socket with an optimistic effect (D36): the list shows it at once,
- * pending, under the id the client chose (D18), and the same id and Idempotency-Key go out on a
- * retry, so a retried create runs once (D16). Only a lost answer is retried: a refusal (an
- * ApiError, `conflict` when the id exists) answers the same again, and an ended pair serves no
- * one any more.
+ * Creates a todo on the socket with an optimistic effect (D36): the live lists show the
+ * `optimistic` item at once, pending, under the id the client chose (D18), until the answer and
+ * the next push replace it; without `optimistic` they show the answer, pending until that push.
+ * The same id and Idempotency-Key go out on a retry, so a retried create runs once (D16). Only a
+ * lost answer is retried: a refusal (an ApiError, `conflict` when the id exists) answers the same
+ * again, and an ended pair serves no one any more.
  */
 export async function createTodo(title: string): Promise<TodoItem> {
   const connection = pair.value.connection
   const prepared = prepareCall(calls.createTodo, { title, priority: 'high' })
+  const now = new Date().toISOString()
+  const optimistic: TodoItem = { id: prepared.body.id ?? '', title, priority: 'high', done: false, dueAt: null, createdAt: now, updatedAt: now, version: 1 }
+  const options = { idempotencyKey: prepared.idempotencyKey, optimistic }
   try {
-    return await connection.call(calls.createTodo, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })
+    return await connection.call(calls.createTodo, {}, prepared.body, options)
   } catch (error) {
     if (error instanceof NetworkError && !(error instanceof EndedError)) {
-      return connection.call(calls.createTodo, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })
+      return connection.call(calls.createTodo, {}, prepared.body, options)
     }
     throw error
   }

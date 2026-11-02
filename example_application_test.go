@@ -2,8 +2,10 @@ package livewire_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -87,7 +89,7 @@ func declare(todos *todoRepository) (*livewire.Registry, error) {
 		}),
 		livewire.NewMutation("createTodo", http.MethodPost, "/todos", &livewire.MutationOptions[livewire.NoParameters, createTodo, todo]{
 			Check: authorization.IsUser(), Status: http.StatusCreated,
-			ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"), // the client shows it at once
+			ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"), // a socket call shows it in the lists at once
 			Handle: todos.Create,
 		}),
 	)
@@ -95,7 +97,6 @@ func declare(todos *todoRepository) (*livewire.Registry, error) {
 
 // snippet:end declare
 
-// snippet:begin serve
 func serve(ctx context.Context, pool *pgxpool.Pool, databaseURL string, guard *session.Guard, router gin.IRouter) error {
 	registry, err := declare(&todoRepository{pool: pool})
 	if err != nil {
@@ -109,10 +110,12 @@ func serve(ctx context.Context, pool *pgxpool.Pool, databaseURL string, guard *s
 	if err != nil {
 		return err
 	}
+	// snippet:begin serve
 	engine, err := livewire.NewEngine(&livewire.EngineOptions{
 		Registry: registry, ChangeFeed: listener, Transactor: transactor,
 		IdentitySource: guard, // re-validates the session of every socket (D6)
 		AllowedOrigins: []string{"https://todo.example.com"},
+		// IdempotencyStore, AuditStore, FilterStore, PresenceStore: each feature is off without its store
 	})
 	if err != nil {
 		return err
@@ -122,10 +125,12 @@ func serve(ctx context.Context, pool *pgxpool.Pool, databaseURL string, guard *s
 		return err
 	}
 	api.GET("/api/v1/socket", ginadapter.SocketHandler(engine))
-	return engine.Run(ctx) // the change feed and the ticks; on shutdown engine.Close(ctx) ends every socket
+	err = engine.Run(ctx) // the change feed and the ticks, until ctx ends
+	closing, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return errors.Join(err, engine.Close(closing)) // every socket ends with 1001
+	// snippet:end serve
 }
-
-// snippet:end serve
 
 // Example_application declares the README's API and renders its TypeScript client and
 // OpenAPI document; serve wires it on gin and PostgreSQL.
