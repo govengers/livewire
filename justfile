@@ -12,8 +12,9 @@ require_typescript := if env_var_or_default("CI", "") != "" { "LIVEWIRE_REQUIRE_
 default:
     @just --list
 
-# Vet and lint with the govengers baseline (.golangci.yml, copied from govengers/standards), the example module included
-lint:
+# Vet and lint with the govengers baseline (.golangci.yml, copied from govengers/standards), the example module included,
+# then the API's breaking changes against the latest release (in lint because CI runs lint, not check)
+lint: && openapi-breaking
     go vet ./...
     go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
@@ -53,9 +54,11 @@ db-check-example:
 generate-example:
     cd examples/todo && {{sqlc}} generate && go run ./cmd/generate
 
-# The breaking changes of the example's OpenAPI document (D23) against ref's, by default the latest v1 tag before HEAD; not in `check` until a v1 tag exists
+# The breaking changes of the example's OpenAPI document (D23) against ref's, by default the latest v1 tag before HEAD
 openapi-breaking ref="":
     mkdir -p sandbox
+    # CI checks out one commit without tags, and git describe needs the history and the tags
+    if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --quiet --unshallow --tags origin; fi
     base="{{ref}}"; if [ -z "$base" ]; then base="$(git describe --tags --abbrev=0 --match 'v[1-9]*' HEAD^ 2>/dev/null)" || { echo "no v1 tag before HEAD to compare with: just openapi-breaking <ref>"; exit 1; }; fi; git show "$base:examples/todo/openapi.yaml" > sandbox/openapi-base.yaml
     {{oasdiff}} breaking --fail-on ERR sandbox/openapi-base.yaml examples/todo/openapi.yaml
 
