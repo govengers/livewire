@@ -653,6 +653,26 @@ describe('LiveConnection', () => {
     expect(ids()).toEqual(['a'])
   })
 
+  test('a descriptor behind a Proxy (a deep reactive object) works as itself: its strings identify it, never the object (D80)', async () => {
+    const { connection, current, ids } = subscribedList([{ id: 'a', name: 'A' }])
+    const proxied = new Proxy(createPart, {})
+    const prepared = prepareCall(proxied, { name: 'b' })
+    expect(prepared.body.id).toMatch(uuidPattern(7))
+    const created = connection.call(proxied, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey, optimistic: { id: prepared.body.id ?? '', name: 'b' } })
+    expect(ids()).toEqual(['a', prepared.body.id ?? ''])
+    expect(current().last('call')).toMatchObject({ target: 'createPart', idempotencyKey: prepared.idempotencyKey })
+    current().answer('call', { payload: { id: prepared.body.id, name: 'b' } })
+    await created
+
+    const received = listener<ListResponse<Part>>()
+    connection.subscribe(new Proxy(parts, {}), {}, received)
+    current().answer('subscribe', { subscription: 's2' })
+    current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }]) })
+    void connection.call(deletePart, { id: 'a' }, undefined)
+    expect([received.last()?.data.items, received.last()?.pending]).toEqual([[], ['a']])
+    expect(batchCall(new Proxy(deletePart, {}), { id: 'a' }, undefined)).toEqual({ target: 'deletePart', params: { id: 'a' } })
+  })
+
   test('a prepared socket call retries with the same client id and key', async () => {
     const { connection, current } = connect()
     const prepared = prepareCall(createPart, { name: 'a' })
