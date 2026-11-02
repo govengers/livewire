@@ -351,7 +351,7 @@ export interface LiveList<Query extends ListQuery, Item> {
   filter: Ref<Query['filter']>
   sort: Ref<Query['sort']>
   limit: Ref<number | undefined>
-  /** The page in offset mode, from 1; a filter or sort change goes back to 1. */
+  /** The page in offset mode, from 1; a filter or sort change goes back to 1, a new limit to the page holding the first row shown (D77). */
   page: Ref<number>
   /** The pages in offset mode, undefined before the first push or without a limit. */
   pages: ComputedRef<number | undefined>
@@ -520,12 +520,13 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     stopTiles()
     tiles.value = [startTile(undefined, 0)]
   }
-  watch(limit, () => {
-    appliedLimit.value = undefined
-  })
-  // A new connection starts over too.
-  watch(() => [connection.value, JSON.stringify([toValue(options.parameters), filter.value, sort.value, limit.value])], () => {
-    if (page.value !== 1 && !cursor) page.value = 1 // the page watcher restarts
+  // A filter, sort, parameters or connection change goes back to page 1; a new page size goes to
+  // the page that holds the first row shown now (D77).
+  watch([connection, () => JSON.stringify([toValue(options.parameters), filter.value, sort.value]), limit], ([live, query, size], [liveBefore, queryBefore, sizeBefore]) => {
+    const shownSize = appliedLimit.value ?? sizeBefore
+    if (size !== sizeBefore) appliedLimit.value = undefined
+    const target = cursor || live !== liveBefore || query !== queryBefore ? 1 : pageHolding(page.value, shownSize, size)
+    if (page.value !== target) page.value = target // the page watcher restarts
     else restart()
   })
   watch(page, restart, { immediate: true })
@@ -572,6 +573,12 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
       })
     },
   }
+}
+
+/** The page of `size` rows that holds the first row of `page` at `before` rows a page (D77); page 1 without both sizes. */
+function pageHolding(page: number, before: number | undefined, size: number | undefined): number {
+  if (before === undefined || size === undefined || size <= 0) return 1
+  return Math.floor(((page - 1) * before) / size) + 1
 }
 
 /** Whether a page's boundary moved: its rows changed, or its last row (whose sort values the next cursor holds) did. */

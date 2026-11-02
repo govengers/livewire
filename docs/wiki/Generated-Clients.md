@@ -166,7 +166,7 @@ export async function createTodo(title: string): Promise<TodoItem> {
 
 ### Vue
 
-`app.use(livePlugin(pair))` provides the pair's reference; every composable follows it, dropping the old pair's data and subscribing on the new. `useLive(target, parameters)` is one live read (`data`, `error`, `stale`, `loading`, `pending`, `retry()`); `useLiveList` keeps filter, sort and page state (`items`, `total`, `filter`, `sort`, `limit`, `page`, `pages`; in cursor mode `loadMore()` and `hasMore`), and while a changed query loads it keeps the rows and total before, `stale`, so only the first load is `loading` (D76); `useLiveStatus` is the connection's status; `useLivePresence` joins a record with a state and lists who else is there:
+`app.use(livePlugin(pair))` provides the pair's reference; every composable follows it, dropping the old pair's data and subscribing on the new. `useLive(target, parameters)` is one live read (`data`, `error`, `stale`, `loading`, `pending`, `retry()`); `useLiveList` keeps filter, sort and page state (`items`, `total`, `filter`, `sort`, `limit`, `page`, `pages`; in cursor mode `loadMore()` and `hasMore`), and while a changed query loads it keeps the rows and total before, `stale`, so only the first load is `loading` (D76); a filter or sort change goes back to page 1, a new `limit` to the page that holds the first row shown (D77); `useLiveStatus` is the connection's status; `useLivePresence` joins a record with a state and lists who else is there:
 
 <!-- snippet: examples/todo/web/src/live.ts#views -->
 ```ts
