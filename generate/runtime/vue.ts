@@ -22,6 +22,7 @@ import {
   itemID,
   wireParameters,
   type ApiError,
+  type ListQuery,
   type ListResponse,
   type LiveConnection,
   type LivePair,
@@ -308,15 +309,6 @@ function liveRead<Parameters extends object, Data>(
   }
 }
 
-/** The reserved parameters of a filterable list read the list state drives. */
-interface ListQuery {
-  filter?: unknown
-  sort?: readonly string[]
-  limit?: number
-  offset?: number
-  after?: string
-}
-
 export interface UseLiveListOptions<Query extends ListQuery> {
   /** The connection to use, or a ref or getter the list follows; the provided pair's by default. */
   connection?: MaybeRefOrGetter<LiveConnection>
@@ -329,7 +321,7 @@ export interface UseLiveListOptions<Query extends ListQuery> {
   /** offset (default): one page at a time, `page` moves it; cursor: pages tiled with loadMore() (D38). */
   mode?: 'offset' | 'cursor'
   /** The read's other parameters, if any. */
-  parameters?: MaybeRefOrGetter<Omit<Query, keyof ListQuery | 'filterId'>>
+  parameters?: MaybeRefOrGetter<Omit<Query, keyof ListQuery>>
 }
 
 export interface LiveList<Query extends ListQuery, Item> {
