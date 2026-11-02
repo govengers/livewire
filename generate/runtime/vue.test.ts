@@ -254,6 +254,39 @@ describe('useLiveList', () => {
     typeOnly.stop()
   })
 
+  test('a changed query keeps the rows and total before, stale, until its first page arrives (D76)', async () => {
+    const { connection, current } = connect()
+    const followed = shallowRef(connection)
+    const live = effectScope().run(() => useLiveList(parts, { connection: followed, limit: 2 }))!
+    const shown = () => [live.items.value.map((item) => item.id), live.total.value, live.pages.value, live.stale.value, live.loading.value]
+    expect(shown()).toEqual([[], undefined, undefined, true, true])
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], { total: 5 }) })
+    live.page.value = 2
+    await nextTick()
+    expect(shown()).toEqual([['a', 'b'], 5, 3, true, false])
+    live.filter.value = { search: 'x' }
+    await nextTick()
+    await nextTick()
+    expect([live.page.value, ...shown()]).toEqual([1, ['a', 'b'], 5, 3, true, false])
+    current().answer('subscribe', { subscription: 's3' })
+    current().receive({ sub: 's3', seq: 1, kind: 'snapshot', payload: list([{ id: 'c', name: 'C' }], { total: 1 }) })
+    expect(shown()).toEqual([['c'], 1, 1, false, false])
+
+    // A refused query keeps the rows before beside its error, as useLive keeps its data.
+    live.sort.value = ['secret']
+    await nextTick()
+    current().answer('subscribe', { subscription: 's4' })
+    current().receive({ sub: 's4', seq: 1, kind: 'error', payload: { code: 'forbidden_field', message: 'no' } })
+    expect([live.error.value?.message, ...shown()]).toEqual(['no', ['c'], 1, 1, true, false])
+
+    // Another connection shows nothing of the one before (D66).
+    followed.value = connect('password:bob').connection
+    await nextTick()
+    expect(shown()).toEqual([[], undefined, undefined, true, true])
+  })
+
   test('an error of a page is the list\'s, and retry subscribes again', () => {
     const { connection, current } = connect()
     const live = effectScope().run(() => useLiveList(parts, { connection, parameters: { board: 'x' } }))!

@@ -333,12 +333,19 @@ export interface UseLiveListOptions<Query extends ListQuery> {
 }
 
 export interface LiveList<Query extends ListQuery, Item> {
+  /**
+   * The rows, in cursor mode every loaded page's. While a changed query (filter, sort, limit,
+   * page, parameters) loads, the rows of the query before stay, stale, until its first page
+   * arrives (D76); a new connection drops them.
+   */
   items: ComputedRef<Item[]>
-  /** The total under scope and filter (at most CountCap + 1 under a cap, D14). */
+  /** The total under scope and filter (at most CountCap + 1 under a cap, D14); the one before while a changed query loads (D76). */
   total: ComputedRef<number | undefined>
   /** The refusal that ended a page, or the failed read of a page's next cursor (D64); retry() starts both again. */
   error: ComputedRef<ApiError | NetworkError | undefined>
+  /** The rows are not the current query's yet: a page still loads (the rows before shown meanwhile, D76), or the socket is not open. */
   stale: ComputedRef<boolean>
+  /** No rows yet and no error: the first load and the first after a new connection; the one condition a skeleton should show for. */
   loading: ComputedRef<boolean>
   pending: ComputedRef<readonly string[]>
   filter: Ref<Query['filter']>
@@ -376,8 +383,9 @@ interface Tile<Item> {
  * snapshot of a tile carries its `next`, which is taken and outdates any read of the page on its
  * way; when a diff changes its rows or its last row (a sort value moved), the page is read again
  * for its current `next`, the newest read wins, and the tile below follows it, so no row falls
- * between two tiles. A new connection (a new pair) starts over; the connection's end drops the
- * pages.
+ * between two tiles. A changed query keeps the rows and total before, stale, until its first
+ * page arrives, as useLive keeps its data (D76). A new connection (a new pair) starts over with
+ * nothing shown; the connection's end drops the pages.
  */
 export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Query, ListResponse<Item>>, options: UseLiveListOptions<Query> = {}): LiveList<Query, Item> {
   const connection = useLiveConnection(options.connection)
@@ -386,6 +394,7 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
   const limit = ref(options.limit)
   const page = ref(1)
   const tiles = shallowRef<Tile<Item>[]>([])
+  const held = shallowRef<{ items: Item[]; total: number | undefined }>()
   const open = ref(false)
   const cursor = options.mode === 'cursor'
   let disposed = false
@@ -418,6 +427,7 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
         if (disposed || tiles.value[position] !== tile) return
         const before = tile.data.value
         tile.data.value = state.data
+        if (position === 0) held.value = undefined
         tile.pending.value = state.pending
         tile.error.value = undefined
         tile.received.value = true
@@ -437,6 +447,7 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
         tile.error.value = refusal
       },
       end: () => {
+        held.value = undefined
         tile.data.value = undefined
         tile.pending.value = []
         tile.next.value = undefined
@@ -476,12 +487,36 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     )
   }
 
+  const first = computed(() => tiles.value[0])
+  const items = computed(() => {
+    if (first.value?.data.value === undefined && held.value !== undefined) return held.value.items
+    const seen = new Set<string>()
+    const merged: Item[] = []
+    for (const tile of tiles.value) {
+      for (const item of tile.data.value?.items ?? []) {
+        const id = itemID(item)
+        if (!seen.has(id)) {
+          seen.add(id)
+          merged.push(item)
+        }
+      }
+    }
+    return merged
+  })
+  const total = computed(() => first.value?.data.value?.total ?? held.value?.total)
+
   const stopTiles = (): void => {
     const stopped = tiles.value
     tiles.value = []
     for (const tile of stopped) tile.subscription?.unsubscribe()
   }
+  // A changed query keeps what the list shows until its first page arrives (D76); a new
+  // connection shows nothing of the one before (D66), and an ended one dropped it already.
+  let startedOn: LiveConnection | undefined
   const restart = (): void => {
+    const shown = first.value?.data.value !== undefined || held.value !== undefined
+    held.value = shown && startedOn === connection.value ? { items: items.value, total: total.value } : undefined
+    startedOn = connection.value
     stopTiles()
     tiles.value = [startTile(undefined, 0)]
   }
@@ -503,21 +538,6 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     stopStatus()
   })
 
-  const items = computed(() => {
-    const seen = new Set<string>()
-    const merged: Item[] = []
-    for (const tile of tiles.value) {
-      for (const item of tile.data.value?.items ?? []) {
-        const id = itemID(item)
-        if (!seen.has(id)) {
-          seen.add(id)
-          merged.push(item)
-        }
-      }
-    }
-    return merged
-  })
-  const first = computed(() => tiles.value[0])
   const error = computed(() => {
     for (const tile of tiles.value) {
       const failure = tile.error.value ?? tile.refreshError.value
@@ -526,10 +546,9 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     return undefined
   })
   const stale = computed(() => !open.value || tiles.value.some((tile) => !tile.received.value))
-  const total = computed(() => first.value?.data.value?.total)
   return {
     items, total, error, stale, filter, sort, limit, page,
-    loading: computed(() => error.value === undefined && first.value?.data.value === undefined),
+    loading: computed(() => error.value === undefined && first.value?.data.value === undefined && held.value === undefined),
     pending: computed(() => tiles.value.flatMap((tile) => tile.pending.value)),
     pages: computed(() => {
       const size = pageSize()
