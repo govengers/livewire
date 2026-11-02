@@ -330,10 +330,18 @@ func TestAConsumerThatFallsBehindGetsTheCurrentState(t *testing.T) {
 	socket := server.accept(t)
 	socket.subscribed(socket.next(), "s1", "")
 	socket.push("s1", 1, livewire.PushSnapshot, `{"limit":500,"offset":0,"total":0,"items":[]}`)
+	// A second subscription is the fence: a push on it with a gap makes the client unsubscribe
+	// it, and the client reads its socket in order, so once the server sees that unsubscribe
+	// every push before it is applied, while the consumer has received nothing yet.
+	_, err = client.Subscribe[item](t.Context(), created, "fence", nil)
+	require.NoError(t, err)
+	socket.subscribed(socket.nextOf(livewire.OperationSubscribe), "s2", "")
 	const changes = 200
 	for sequence := 2; sequence < changes+2; sequence++ {
 		socket.push("s1", int64(sequence), livewire.PushListChange, `{"upserts":[{"id":"`+strconv.Itoa(sequence)+`","name":"x"}],"removes":[]}`)
 	}
+	socket.push("s2", 7, livewire.PushReplace, `{"id":"f"}`)
+	require.Equal(t, "s2", socket.nextOf(livewire.OperationUnsubscribe).Target)
 	var last client.Push[livewire.ListResponse[item]]
 	received := 0
 	for len(last.Data.Items) < changes {
@@ -341,6 +349,7 @@ func TestAConsumerThatFallsBehindGetsTheCurrentState(t *testing.T) {
 		received++
 	}
 	require.Less(t, received, changes, "the queue collapsed")
+	require.LessOrEqual(t, received, 1+64, "at most the push in hand and a queue of 64")
 }
 
 func TestBrokenPushesEndTheSubscription(t *testing.T) {
