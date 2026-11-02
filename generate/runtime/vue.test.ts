@@ -532,7 +532,38 @@ describe('useLiveList limits and cursors', () => {
     expect(current().last('subscribe').params).toEqual({ limit: '500', offset: '100' })
     live.limit.value = 50
     await nextTick()
-    expect(live.page.value).toBe(1)
+    await nextTick()
+    expect([live.page.value, current().last('subscribe').params]).toEqual([3, { limit: '50', offset: '100' }])
+  })
+
+  test('a new page size goes to the page holding the first row shown; a filter change to page 1 (D77)', async () => {
+    const { connection, current } = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection, limit: 10 }))!
+    current().open()
+    const answer = (limit: number) => {
+      const subscription = `s${subscribes(current().sent)}`
+      current().answer('subscribe', { subscription })
+      current().receive({ sub: subscription, seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }], { limit, total: 100 }) })
+    }
+    const moved = async (change: () => void) => {
+      change()
+      await nextTick()
+      await nextTick()
+      return [live.page.value, current().last('subscribe').params]
+    }
+    answer(10)
+    expect(await moved(() => (live.page.value = 3))).toEqual([3, { limit: '10', offset: '20' }])
+    answer(10)
+    expect(await moved(() => (live.limit.value = 25))).toEqual([1, { limit: '25' }])
+    answer(25)
+    expect(await moved(() => (live.page.value = 3))).toEqual([3, { limit: '25', offset: '50' }])
+    answer(25)
+    expect(await moved(() => (live.limit.value = 10))).toEqual([6, { limit: '10', offset: '50' }])
+    expect(await moved(() => (live.filter.value = { search: 'x' }))).toEqual([1, { filter: '{"search":"x"}', limit: '10' }])
+    const sent = subscribes(current().sent)
+    live.filter.value = { search: 'x' } // an equal document is no change
+    await nextTick()
+    expect(subscribes(current().sent)).toBe(sent)
   })
 
   test('a read of a tile\'s next started before a snapshot cannot override the snapshot\'s next (D64)', async () => {
