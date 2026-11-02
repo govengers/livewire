@@ -106,6 +106,44 @@ export interface RelativeTime {
   relative: string
 }
 
+/** A node of a filter document (D12): a condition, or and, or or not over nodes. */
+export type FilterNode<Condition> =
+  | Condition
+  | { and: readonly FilterNode<Condition>[] }
+  | { or: readonly FilterNode<Condition>[] }
+  | { not: FilterNode<Condition> }
+
+/** A filter document: its conditions under where; the empty document matches every row. */
+export interface FilterDocument<Condition> {
+  where?: FilterNode<Condition>
+}
+
+/** A filter document of a resource with a searchable field: the search rides in the document, there is no search parameter. */
+export interface SearchableFilterDocument<Condition> extends FilterDocument<Condition> {
+  search?: string
+}
+
+/** One sort term: the field, or "-field" for descending. */
+export type SortTerm<Field extends string> = Field | `-${Field}`
+
+/** A time in a condition: RFC 3339, or relative to the database clock of the read. */
+export type TimeValue = string | RelativeTime
+
+/**
+ * The reserved parameters of a filterable list read (D11, D13, D38). Every generated
+ * `<Resource>ListQuery` is assignable to it, so a generic component types its query (and, with
+ * FilterDocument, its filter) without the generated files.
+ */
+export interface ListQuery<Filter = unknown, Sort extends string = string> {
+  filter?: Filter
+  filterId?: string
+  sort?: readonly Sort[]
+  limit?: number
+  offset?: number
+  /** The `next` of the page before, in cursor mode (D38). */
+  after?: string
+}
+
 /** The parameters of a declaration without any. */
 export type NoParameters = Record<string, never>
 

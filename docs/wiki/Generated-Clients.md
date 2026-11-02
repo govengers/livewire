@@ -99,6 +99,7 @@ The directory gets `types.ts` (the DTOs and the library's wire types), `filters.
 - `LiveConnection` is the socket: `connection.subscribe(live.todos, parameters, listener)`, `connection.query(...)`, `connection.call(calls.createTodo, parameters, body)`, `connection.batch(...)`, `connection.join(...)`. It reconnects with backoff and subscribes everything again, every subscription starting with a snapshot; every request settles within `requestTimeout` (30 s) or on its `AbortSignal`.
 - A refusal is an `ApiError` (`status`, `code`, `fields`, `body`), a failure to reach the server a `NetworkError`, a request of an ended client or connection an `EndedError` whose `sent` says whether it went out.
 - Both re-send an evicted unnamed filter inline once on a 404 (D54).
+- `runtime.ts` exports the generic list and filter types: `ListQuery<Filter, Sort>`, `FilterDocument<Condition>`, `FilterNode<Condition>`, `SearchableFilterDocument<Condition>`, `SortTerm<Field>`, `TimeValue`. `filters.ts` re-exports them, and every generated list query is assignable to `ListQuery`, so a generic component types its query and filter without the generated files (D78).
 
 ### One pair per identity
 
