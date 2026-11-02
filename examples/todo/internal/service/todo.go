@@ -128,6 +128,7 @@ func (s *TodoService) Update(ctx context.Context, id uuid.UUID, change model.Tod
 	if err != nil {
 		return nil, err
 	}
+	// snippet:begin completion-job
 	if change.Completes(*current) {
 		completed := model.TodoCompletedKind.New(model.TodoCompletedPayload{
 			TodoID: saved.ID, Workspace: member.Workspace, Title: saved.Title, Username: member.Username,
@@ -137,6 +138,7 @@ func (s *TodoService) Update(ctx context.Context, id uuid.UUID, change model.Tod
 		}
 		wideevent.FromContext(ctx).Bool("todo.completed", true)
 	}
+	// snippet:end completion-job
 	return saved, nil
 }
 

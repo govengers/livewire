@@ -99,7 +99,9 @@ CREATE INDEX livewire_filters_unused ON livewire_filters (last_used_at) WHERE na
 // (IdempotencyStore). Status is 0 while a call is in flight; response is the answered body
 // as bytes (D72), so a replay answers the very bytes of the first answer. A table the earlier
 // jsonb column created is upgraded after every replica runs this store, which reads and writes
-// both, by an ALTER in the application's migration that takes an ACCESS EXCLUSIVE lock (D72).
+// both, by an ALTER in the application's migration that takes an ACCESS EXCLUSIVE lock (D72);
+// every connection that prepared the store's statements before fails two calls after it
+// (SQLSTATE 0A000, then 42804), so the replicas must restart after the migration (D74).
 const IdempotencySQL = `CREATE TABLE livewire_idempotency (
 	owner text NOT NULL CHECK (owner <> ''),
 	tenant text NOT NULL DEFAULT '',

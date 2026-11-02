@@ -164,3 +164,49 @@ func TestWritesAreReadCommittedWhateverTheDefault(t *testing.T) {
 		"a write sees the record a concurrent call committed (D16)")
 	require.NoError(t, write.Rollback(t.Context()))
 }
+
+// snippet:begin tenant-policy
+// tenantPolicySQL is a migration's Row Level Security policy on the tenant every engine
+// transaction sets (D42): a role the policy applies to reads and writes its tenant's rows only,
+// and outside an engine transaction, with no tenant set, none.
+const tenantPolicySQL = `ALTER TABLE gadgets ENABLE ROW LEVEL SECURITY;
+CREATE POLICY gadgets_tenant ON gadgets USING (tenant_id = current_setting('livewire.tenant', true));`
+
+// snippet:end tenant-policy
+
+func TestARowLevelSecurityPolicyReadsTheTenantOfTheTransaction(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	role := "tenant_reader_" + database.name // roles are the cluster's, so one per test database
+	_, err := database.pool.Exec(t.Context(), "CREATE ROLE "+role+" NOLOGIN; GRANT SELECT ON gadgets TO "+role+";\n"+tenantPolicySQL)
+	require.NoError(t, err)
+	_, err = database.pool.Exec(t.Context(), "INSERT INTO gadgets (tenant_id, name) VALUES ('north', 'compass'), ('south', 'sextant')")
+	require.NoError(t, err)
+	configuration, err := pgxpool.ParseConfig(database.dsn())
+	require.NoError(t, err)
+	configuration.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
+		_, err := connection.Exec(ctx, "SET ROLE "+role) // the superuser of the tests bypasses every policy
+		return err
+	}
+	application, err := pgxpool.NewWithConfig(t.Context(), configuration)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		application.Close()
+		_, err := database.pool.Exec(context.Background(), "DROP OWNED BY "+role+"; DROP ROLE "+role)
+		require.NoError(t, err)
+	})
+	names := func(database postgresadapter.DBTX) []string {
+		rows, err := database.Query(t.Context(), "SELECT name FROM gadgets ORDER BY name")
+		require.NoError(t, err)
+		found, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		return found
+	}
+
+	read, err := newTransactor(t, application).Begin(t.Context(), livewire.TransactionDetails{Tenant: "north", ReadOnly: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = read.Rollback(context.Background()) }) // a failed assertion must not leave it holding a connection; ErrTxClosed once ended
+	require.Equal(t, []string{"compass"}, names(read.Handle().(postgresadapter.DBTX)))
+	require.NoError(t, read.Rollback(t.Context()))
+	require.Empty(t, names(application), "without an engine transaction no tenant is set")
+}

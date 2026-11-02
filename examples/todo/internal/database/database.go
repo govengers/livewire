@@ -84,6 +84,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// snippet:begin schema
+
 // livewireSchema is livewire's SQL: the trigger function, the triggers that notify the change
 // feed, partitioned by the workspace, the tenant (D25, D42), the history of todos (D34) and
 // the tables of the stored filters, the idempotency records, the audit and the presences.
@@ -104,6 +106,8 @@ func livewireSchema(ctx context.Context, transaction *sql.Tx) error {
 		livewirepostgres.PresenceSQL,
 	)(ctx, transaction)
 }
+
+// snippet:end schema
 
 // execute is a migration that runs the statements in order.
 func execute(statements ...string) func(ctx context.Context, transaction *sql.Tx) error {

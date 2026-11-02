@@ -27,6 +27,8 @@ import (
 	"github.com/govengers/livewire/examples/todo/internal/repository/internal/sqlc"
 )
 
+// snippet:begin fields
+
 // todoSQL is what the filterable reads of todos read from (D11).
 var todoSQL = &query.ResourceSQL{From: "todos", IDColumn: "todos.id"}
 
@@ -44,6 +46,10 @@ func TodoFields() query.Fields {
 	}
 }
 
+// snippet:end fields
+
+// snippet:begin scope
+
 // WorkspaceScope narrows the todos to the workspace of the request, livewire's tenant (D42),
 // which the engine resolved before it calls the scope (DAT-017).
 func WorkspaceScope(ctx context.Context) (query.Predicate, error) {
@@ -55,6 +61,8 @@ func WorkspaceScope(ctx context.Context) (query.Predicate, error) {
 		builder.WriteString("todos.workspace = ").Argument(workspace)
 	}, nil
 }
+
+// snippet:end scope
 
 // errNoWorkspace is a read outside a workspace, which the registry's tenant never lets through.
 var errNoWorkspace = errors.New("repository: a todo read without a workspace")
@@ -79,6 +87,8 @@ func NewTodoRepository(options *TodoRepositoryOptions) (*TodoRepository, error) 
 	return &TodoRepository{pool: options.Pool, jobStore: options.JobStore}, nil
 }
 
+// snippet:begin transaction
+
 // database is the engine's transaction in ctx, or the pool outside an engine unit of work.
 func (r *TodoRepository) database(ctx context.Context) postgresadapter.DBTX {
 	if transaction := postgresadapter.TransactionFrom(ctx); transaction != nil {
@@ -86,6 +96,10 @@ func (r *TodoRepository) database(ctx context.Context) postgresadapter.DBTX {
 	}
 	return r.pool
 }
+
+// snippet:end transaction
+
+// snippet:begin list
 
 // List reads one page of todos under the query's scope, filter, sort and page.
 func (r *TodoRepository) List(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[model.Todo], error) {
@@ -95,6 +109,8 @@ func (r *TodoRepository) List(ctx context.Context, listQuery *query.ListQuery) (
 	}
 	return page, nil
 }
+
+// snippet:end list
 
 // Get reads the one todo the query names, or model.ErrNotFound.
 func (r *TodoRepository) Get(ctx context.Context, listQuery *query.ListQuery) (*model.Todo, error) {
@@ -107,6 +123,8 @@ func (r *TodoRepository) Get(ctx context.Context, listQuery *query.ListQuery) (*
 	}
 	return &page.Items[0], nil
 }
+
+// snippet:begin distinct
 
 // Distinct counts the values of one field under the query.
 func (r *TodoRepository) Distinct(ctx context.Context, field string, listQuery *query.ListQuery) ([]livewire.DistinctValue, error) {
@@ -121,6 +139,10 @@ func (r *TodoRepository) Distinct(ctx context.Context, field string, listQuery *
 	return values, nil
 }
 
+// snippet:end distinct
+
+// snippet:begin history
+
 // History reads one page of a todo's versions (D34, D56).
 func (r *TodoRepository) History(ctx context.Context, listQuery *query.ListQuery) (*livewire.Page[livewire.Version[model.Todo]], error) {
 	page, err := postgresadapter.HistoryPage(ctx, r.pool, "todos", listQuery, decodeTodoRow)
@@ -130,6 +152,10 @@ func (r *TodoRepository) History(ctx context.Context, listQuery *query.ListQuery
 	return page, nil
 }
 
+// snippet:end history
+
+// snippet:begin export
+
 // Export writes every todo under the query as CSV (D35).
 func (r *TodoRepository) Export(ctx context.Context, listQuery *query.ListQuery, columns query.Fields, writer io.Writer) (int, error) {
 	rows, err := postgresadapter.WriteCSV(ctx, r.pool, &postgresadapter.Export{Specification: todoSQL, Query: listQuery, Columns: columns}, writer)
@@ -138,6 +164,8 @@ func (r *TodoRepository) Export(ctx context.Context, listQuery *query.ListQuery,
 	}
 	return rows, nil
 }
+
+// snippet:end export
 
 // Create inserts a todo of the member's workspace.
 func (r *TodoRepository) Create(ctx context.Context, member model.Member, todo model.NewTodo) (*model.Todo, error) {
@@ -183,6 +211,8 @@ func (r *TodoRepository) Delete(ctx context.Context, workspace string, id uuid.U
 	}
 }
 
+// snippet:begin enqueue
+
 // Enqueue enqueues jobs in the transaction of ctx, so they commit with the change (JOB-007).
 func (r *TodoRepository) Enqueue(ctx context.Context, preparedJobs ...*jobs.PreparedJob) error {
 	if _, err := r.jobStore.Enqueue(ctx, r.database(ctx), preparedJobs...); err != nil {
@@ -190,6 +220,8 @@ func (r *TodoRepository) Enqueue(ctx context.Context, preparedJobs ...*jobs.Prep
 	}
 	return nil
 }
+
+// snippet:end enqueue
 
 // Summary counts the workspace's open and done todos and its attachments.
 func (r *TodoRepository) Summary(ctx context.Context, workspace string) (*model.Summary, error) {
@@ -239,6 +271,8 @@ func (r *TodoRepository) ListActivity(ctx context.Context, workspace string, tod
 	return activities, nil
 }
 
+// snippet:begin hydrate
+
 // hydrateTodos reads a page's todos by id (postgresadapter.Hydrate).
 func hydrateTodos(ctx context.Context, database postgresadapter.DBTX, rows []postgresadapter.PageRow) (map[uuid.UUID]model.Todo, error) {
 	found, err := sqlc.New(database).ListTodosByIDs(ctx, postgresadapter.PageIDs(rows))
@@ -251,6 +285,8 @@ func hydrateTodos(ctx context.Context, database postgresadapter.DBTX, rows []pos
 	}
 	return todos, nil
 }
+
+// snippet:end hydrate
 
 // todoRow is a todos row as todos_history stores it, as jsonb of its columns (D34).
 type todoRow struct {

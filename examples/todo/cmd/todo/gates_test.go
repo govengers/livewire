@@ -21,6 +21,8 @@ import (
 
 // The contract gates of D23 on the application as main wires it.
 
+// snippet:begin generated-current
+
 func TestGeneratedClientsAreCurrent(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)
@@ -29,6 +31,8 @@ func TestGeneratedClientsAreCurrent(t *testing.T) {
 	require.NoError(t, err)
 	livewiretest.GeneratedIsCurrentStrict(t, contract, generated.Options("../..")) // what cmd/generate writes from
 }
+
+// snippet:end generated-current
 
 // fixtureTodo creates a todo through the API and answers it.
 func fixtureTodo(t *testing.T, todos *todoclient.Client, title string) *api.TodoItem {
@@ -80,6 +84,8 @@ func (a *testApplication) gateApplication() livewiretest.Application {
 	return livewiretest.Application{Engine: a.engine, Handler: a.router, SocketPath: server.SocketPath}
 }
 
+// snippet:begin parity
+
 func TestRESTAndSocketAnswerTheSameBytes(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)
@@ -90,6 +96,10 @@ func TestRESTAndSocketAnswerTheSameBytes(t *testing.T) {
 		Reads:        reads(todo),
 	})
 }
+
+// snippet:end parity
+
+// snippet:begin stale
 
 func TestEveryWriteReachesTheSubscriptionsOfItsTables(t *testing.T) {
 	t.Parallel()
@@ -123,6 +133,10 @@ func TestEveryWriteReachesTheSubscriptionsOfItsTables(t *testing.T) {
 	})
 }
 
+// snippet:end stale
+
+// snippet:begin tenant-isolation
+
 func TestWorkspacesNeverSeeEachOthersTodos(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)
@@ -136,6 +150,8 @@ func TestWorkspacesNeverSeeEachOthersTodos(t *testing.T) {
 		},
 	})
 }
+
+// snippet:end tenant-isolation
 
 // textFile is a text attachment.
 func textFile(content string) livewire.File {

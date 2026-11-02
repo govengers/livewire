@@ -1,12 +1,43 @@
 # govengers/livewire
 
-> Declare an API once in Go; serve it as REST, as a WebSocket with reads, subscriptions and writes fed by PostgreSQL LISTEN/NOTIFY, and as generated TypeScript, Go and CLI clients plus OpenAPI 3.0.3. Authorization is govengers/auth; filterable resources carry a filter document model with stored filters; mutations run in an engine-owned transaction with audit and idempotency.
+> Declare an API once in Go and serve it as REST routes, as a WebSocket with reads, live subscriptions and writes fed by PostgreSQL LISTEN/NOTIFY, as generated TypeScript (with Vue composables), Go and command-line clients, and as an OpenAPI 3.0.3 document. The registry of declarations is the single source of truth; govengers/auth decides who may do what on both transports; filterable resources carry filter documents, stored filters, distinct values, cursor pages, item history and CSV export; every mutation runs in a transaction the engine owns, with an audit row and an idempotency record when the engine has the `AuditStore` and the `IdempotencyStore`.
 
-- Module: `github.com/govengers/livewire` (v1, in development on `feat/v1`), Go 1.26, MIT.
-- Packages: `livewire` (root), `query`, `ginadapter`, `postgresadapter`, `prometheusadapter`, `generate`, `livewiretest`.
-- Standards: govengers/standards, `library` profile.
+- Module: `github.com/govengers/livewire` (v1), Go 1.26, PostgreSQL 18, Apache 2.0. Successor of `github.com/mxcd/livewire` v0.2.x.
+- Packages and entry points:
+  - `livewire` (root): `NewRegistry`, `Registry.Add`, `NewResource`, `NewList`, `NewObject`, `NewMutation`, `NewUpload`, `NewEngine` (`Handler`, `Run`, `Close`, `RevalidateOwner`), the errors `NotFound`, `Conflict`, `Invalid`, `ForbiddenField`, `ResponseFor`.
+  - `query`: `Field`, `Fields`, the field types, `Predicate`, `Builder`, `ResourceSQL`, `ListQuery`.
+  - `postgresadapter`: the SQL constants and functions for migrations, `NewListener`, `NewTransactor`, `NewFilterStore`, `NewIdempotencyStore`, `NewAuditStore`, `NewPresenceStore`, `TransactionFrom`, `ListPage`, `HistoryPage`, `Distinct`, `WriteCSV`.
+  - `ginadapter`: `RegisterRoutes`, `SocketHandler`. `prometheusadapter`: `New`, `Metrics.Observe`.
+  - `generate`: `Write`, `Render`, `Options`. `client`: the Go client runtime. `livewiretest`: `GeneratedIsCurrent`, `GeneratedIsCurrentStrict`, `Parity`, `Stale`, `TenantIsolation`.
+- Constructors are `New...(options *...Options) (*X, error)` and validate at startup; declaration constructors return the declaration and `Registry.Add` reports their mistakes. Nothing logs: outcomes go to the registry's `Observer`.
+- Standards: govengers/standards, `library` profile (`.govengers.yml`).
+
+## Rules for coding agents using livewire
+
+- Declarations are values. `NewResource`, `NewList`, `NewObject`, `NewMutation` and `NewUpload` never panic; `registry.Add(...)` returns the first mistake of any of them and adds nothing then. Build the registry in main, check the error, fail fast.
+- `Check` (and a resource's `Read`) is static: roles and permissions only. It runs before the parameters are resolved against the database and before a body is read. Data-dependent authorization (ownership, membership, the row's tenant) belongs in the loader, the handler or the resource's `Scope`; answer a row the identity may not learn of with `livewire.NotFound()`.
+- List in `Tables` every table a live declaration's loader reads, or its subscriptions go stale on writes to the others; every listed table needs a NOTIFY trigger.
+- Repositories take the engine's transaction from `postgresadapter.TransactionFrom(ctx)` and fall back to their pool when it is nil, then build sqlc queries on it (`sqlc.New(database)`); they never begin a transaction of their own inside a handler. Enqueue follow-up work (mail, external calls) as a govengers/jobs job on the same handle instead of calling out inside the transaction.
+- The schema comes from exported SQL that the application's goose migrations run: `TriggerFunctionSQL` first, then `TriggerSQL` or `PartitionedTriggerSQL` per live table, `HistorySQL` per versioned resource, and `FiltersSQL`, `IdempotencySQL`, `AuditSQL`, `PresenceSQL` for the stores the engine gets. Nothing runs DDL at startup.
+- The engine runs no maintenance: schedule `FilterStore.Sweep`, `IdempotencyStore.Sweep` and `AuditStore.Maintain` (a govengers/jobs schedule), so one replica runs them.
+- Identity is fixed per client instance. In TypeScript the application makes one `Client` and `LiveConnection` pair per identity (`createLivePair`), ends it before the request that changes the session cookie (login, logout, switch), makes the next pair afterwards and puts it into the ref given to `livePlugin`. Never reuse a pair across identities. A Go `client.Client` serves one API key.
+- Give the engine an `IdempotencyStore` and send no mutation without an `Idempotency-Key` (a UUID); without the store or without an identity a key is not checked and a retry runs again. The generated clients send one; a retry of the same call sends the same key and the same client-generated id (`prepareCall` in TypeScript, `CallOptions.IdempotencyKey` and `Prepare<Name>` in Go, `--idempotency-key` on the CLI).
+- Mutation bodies are decoded strictly: unknown JSON members are refused, validation is the `validate` tag (go-playground/validator), not gin's `binding`.
+- Errors: return livewire's refusals or an `*auth.Error`; map domain errors to them in one place. Any other error answers 500 without its text.
+- Mount the socket (`ginadapter.SocketHandler`) behind the same authentication as the REST routes; `EngineOptions.IdentitySource` is required: an interface that answers who a socket is, which `session.Guard` implements for sessions (an application with API-key sockets gives one that also resolves its keys); so are `AllowedOrigins` unless `SameHostOnly`.
+- Generated files are committed and never edited by hand. The application's tests run the contract gates: `livewiretest.GeneratedIsCurrent` (or `GeneratedIsCurrentStrict`), `Parity`, `Stale` with a write per declared table, and `TenantIsolation` for a multi-tenant registry.
 
 ## Docs
 
-- [docs/design.md](docs/design.md): the binding design, decisions D1-D41, packages, wire protocol, work packages, migration from mxcd/livewire v0.2.
-- [docs/wiki/Home.md](docs/wiki/Home.md): model and package map (written per work package).
+- [docs/wiki/Home.md](docs/wiki/Home.md): model, package map, wiring order in main.
+- [docs/wiki/Declarations.md](docs/wiki/Declarations.md): resources, lists, objects, mutations, uploads, fields, column checks, client ids, optimistic effects, tenant.
+- [docs/wiki/Reads-and-Filters.md](docs/wiki/Reads-and-Filters.md): filter documents, stored filters, distinct, cursor mode, history, export.
+- [docs/wiki/Live-Engine.md](docs/wiki/Live-Engine.md): subscriptions, re-runs, identity re-validation, presence, limits, the Observer.
+- [docs/wiki/Postgres.md](docs/wiki/Postgres.md): migrations and their deploy order, the transactor, stores and sweeps, `ListPage`, `HistoryPage`, `Distinct`, `WriteCSV`, Row Level Security.
+- [docs/wiki/REST-and-Metrics.md](docs/wiki/REST-and-Metrics.md): the routes, uploads, the export trailer, wide events, Prometheus.
+- [docs/wiki/Generated-Clients.md](docs/wiki/Generated-Clients.md): `generate.Write`, the TypeScript runtime and Vue composables, OpenAPI, the Go client, the CLI.
+- [docs/wiki/Testing.md](docs/wiki/Testing.md): the four gates, what each catches and cannot, the end-to-end pattern.
+- [docs/wiki/Migration.md](docs/wiki/Migration.md): every v0.2.x concept and its v1 counterpart, the breaking changes.
+- [docs/design.md](docs/design.md): the binding design, decisions D1 onwards.
+- [examples/todo](examples/todo): the tested reference application.
+- [README.md](README.md): overview, install, example.

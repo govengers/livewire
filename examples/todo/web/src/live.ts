@@ -9,6 +9,8 @@ import { EndedError, NetworkError, createLivePair, prepareCall, type LivePair } 
 import type { ActivityItem, SummaryItem, TodoItem } from './api/types'
 import { livePlugin, useLive, useLiveList, useLivePresence, useLiveStatus } from './api/vue'
 
+// snippet:begin pair
+
 /** The pair of one identity, "provider:subject" as the server's session answers it, "" for nobody. */
 const pairOf = (identity: string): LivePair => createLivePair({
   identity: () => identity,
@@ -19,6 +21,8 @@ const pairOf = (identity: string): LivePair => createLivePair({
 /** The pair every composable follows: app.use(plugin), then await resume(); a login or logout replaces it. */
 export const pair = shallowRef(pairOf(''))
 export const plugin = livePlugin(pair)
+
+// snippet:end pair
 
 interface IdentityResponse {
   provider: string
@@ -62,6 +66,8 @@ function changeSession(change: () => Promise<Response>): Promise<void> {
 /** The session changes in flight, one after the other. */
 let transitions: Promise<void> = Promise.resolve()
 
+// snippet:begin change-session
+
 async function changeSessionNow(change: () => Promise<Response>): Promise<void> {
   pair.value.end()
   let failure: unknown
@@ -75,6 +81,8 @@ async function changeSessionNow(change: () => Promise<Response>): Promise<void> 
   if (failure !== undefined) throw failure
 }
 
+// snippet:end change-session
+
 /** Logs in with govengers/auth's password route. */
 export function login(identifier: string, password: string): Promise<void> {
   return changeSession(() => fetch('/auth/password/login', {
@@ -86,6 +94,8 @@ export function login(identifier: string, password: string): Promise<void> {
 export function logout(): Promise<void> {
   return changeSession(() => fetch('/auth/password/logout', { method: 'POST' }))
 }
+
+// snippet:begin views
 
 /** The todo list view: the filterable, paged live list with the summary and the activity. */
 export function useTodoList() {
@@ -100,30 +110,40 @@ export function useTodoList() {
   return { todos, summary, activity, status, first, open, latest }
 }
 
+// snippet:end views
+
 /** Who else looks at a todo, with the part of it the user edits. */
 export function useTodoPresence(id: string, editing: () => string) {
   return useLivePresence(live['todos.presence'], { key: id }, () => ({ editing: editing() }))
 }
 
+// snippet:begin optimistic-create
+
 /**
- * Creates a todo on the socket with an optimistic effect (D36): the list shows it at once,
- * pending, under the id the client chose (D18), and the same id and Idempotency-Key go out on a
- * retry, so a retried create runs once (D16). Only a lost answer is retried: a refusal (an
- * ApiError, `conflict` when the id exists) answers the same again, and an ended pair serves no
- * one any more.
+ * Creates a todo on the socket with an optimistic effect (D36): the live lists show the
+ * `optimistic` item at once, pending, under the id the client chose (D18), until the answer and
+ * the next push replace it; without `optimistic` they show the answer, pending until that push.
+ * The same id and Idempotency-Key go out on a retry, so a retried create runs once (D16). Only a
+ * lost answer is retried: a refusal (an ApiError, `conflict` when the id exists) answers the same
+ * again, and an ended pair serves no one any more.
  */
 export async function createTodo(title: string): Promise<TodoItem> {
   const connection = pair.value.connection
   const prepared = prepareCall(calls.createTodo, { title, priority: 'high' })
+  const now = new Date().toISOString()
+  const optimistic: TodoItem = { id: prepared.body.id ?? '', title, priority: 'high', done: false, dueAt: null, createdAt: now, updatedAt: now, version: 1 }
+  const options = { idempotencyKey: prepared.idempotencyKey, optimistic }
   try {
-    return await connection.call(calls.createTodo, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })
+    return await connection.call(calls.createTodo, {}, prepared.body, options)
   } catch (error) {
     if (error instanceof NetworkError && !(error instanceof EndedError)) {
-      return connection.call(calls.createTodo, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey })
+      return connection.call(calls.createTodo, {}, prepared.body, options)
     }
     throw error
   }
 }
+
+// snippet:end optimistic-create
 
 /** Completes a todo; the server enqueues the completion job, whose activity line arrives live. */
 export function completeTodo(id: string): Promise<TodoItem> {

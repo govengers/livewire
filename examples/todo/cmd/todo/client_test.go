@@ -98,12 +98,14 @@ func TestTheGoClientBatchesFiltersAndReplays(t *testing.T) {
 		require.Equal(t, string(result.Payload), string(replayed[index].Payload), "a replay answers the recorded results byte for byte (D16, D72)")
 	}
 
+	// snippet:begin go-client-filter
 	filter := todoclient.TodosFilter{Where: new(todoclient.TodosPriorityEqual(todoclient.TodosPriorityLow))}
 	document, err := json.Marshal(filter)
 	require.NoError(t, err)
 	stored, err := alice.SaveFilter(ctx, &livewire.FilterRequest{Resource: "todos", Name: "low", Filter: document})
 	require.NoError(t, err)
 	low, err := alice.GetTodos(ctx, todoclient.TodosListQuery{FilterID: stored.ID})
+	// snippet:end go-client-filter
 	require.NoError(t, err)
 	require.Len(t, low.Items, 1)
 	require.Equal(t, "second", low.Items[0].Title)
@@ -123,6 +125,7 @@ func TestTheGoClientSubscriptionSeesAnotherClientsWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	// snippet:begin go-client-subscribe
 	pushes, err := alice.SubscribeTodos(ctx, todoclient.TodosListQuery{})
 	require.NoError(t, err)
 	snapshot := nextPush(t, pushes)
@@ -135,6 +138,7 @@ func TestTheGoClientSubscriptionSeesAnotherClientsWrite(t *testing.T) {
 	require.Equal(t, livewire.PushListChange, change.Kind)
 	require.Len(t, change.Data.Items, 1)
 	require.Equal(t, created.ID, change.Data.Items[0].ID, "the same workspace, another user, over the change feed")
+	// snippet:end go-client-subscribe
 	cancel()
 	for range pushes { // the channel closes with the subscription
 	}

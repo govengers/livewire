@@ -2,6 +2,7 @@ package livewire_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -102,7 +103,83 @@ func ExampleNewEngine() {
 		fmt.Println(err)
 		return
 	}
-	http.Handle("/api/v1/live", authenticate(engine.Handler()))
+	http.Handle("/api/v1/socket", authenticate(engine.Handler())) // the Go client's default socket URL
 	go func() { _ = engine.Run(ctx) }()
 	defer func() { _ = engine.Close(ctx) }()
+}
+
+type employee struct {
+	ID     uuid.UUID `json:"id"`
+	Name   string    `json:"name"`
+	Salary int       `json:"salary"`
+}
+
+type employeeParameters struct {
+	ID uuid.UUID `path:"id"`
+}
+
+type updateEmployee struct {
+	Salary *int    `json:"salary,omitempty"`
+	Note   *string `json:"note,omitempty"`
+}
+
+func listEmployees(context.Context, *query.ListQuery) (*livewire.Page[employee], error) {
+	return &livewire.Page[employee]{}, nil // postgresadapter.ListPage, which also takes the cursor
+}
+
+func listPayroll(context.Context, *livewire.NoParameters) ([]employee, error) {
+	return nil, nil
+}
+
+func saveEmployee(context.Context, *employeeParameters, *updateEmployee) (*employee, error) {
+	return nil, livewire.NotFound()
+}
+
+// ExampleNewResource_columnChecks guards a column (D39): an identity without the staff role
+// reads every employee without the salary, may not filter, sort or search by it, and may not
+// write it.
+func ExampleNewResource_columnChecks() {
+	// snippet:begin column-checks
+	staff := authorization.HasRole("staff")
+	employees := livewire.NewResource("employees", "/employees", &livewire.ResourceOptions[employee]{
+		Tables: []string{"employees"},
+		Read:   authorization.IsUser(),
+		Fields: query.Fields{
+			{Name: "id", Type: query.TypeUUID, SQL: "employees.id", Filter: true, Sort: true},
+			{Name: "name", Type: query.TypeText, SQL: "employees.name", Filter: true, Sort: true, Search: true},
+			{Name: "salary", Type: query.TypeInteger, SQL: "employees.salary", Filter: true, Sort: true, Read: staff},
+		},
+		DefaultSort: []query.SortTerm{{Field: "name"}},
+		Cursor:      true, // keyset pages: the `after` parameter and ListResponse.next (D38)
+		List:        listEmployees,
+	})
+	payroll := livewire.NewList("payroll", "/payroll", &livewire.ListOptions[employee, livewire.NoParameters]{
+		Read:    authorization.IsUser(),
+		Guarded: []livewire.GuardedField{{Name: "salary", Read: staff}}, // the same for a typed read
+		Load:    listPayroll,
+	})
+	update := livewire.NewMutation("updateEmployee", http.MethodPatch, "/employees/{id}", &livewire.MutationOptions[employeeParameters, updateEmployee, employee]{
+		Check:       authorization.IsUser(),
+		Resource:    "employees", // "salary" in the body needs the field's Write check, its Read by default
+		FieldChecks: map[string]authorization.Check{"note": authorization.HasRole("manager")},
+		Handle:      saveEmployee,
+	})
+	// snippet:end column-checks
+	registry, err := livewire.NewRegistry(nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := registry.Add(employees, payroll, update); err != nil {
+		fmt.Println(err)
+		return
+	}
+	ada := auth.WithIdentity(context.Background(), &auth.Identity{Provider: "example", Subject: "ada", Active: true})
+	visible, err := livewire.RedactItems(ada, employees.Fields(), json.RawMessage(`[{"id":"0190e3c8-0000-7000-8000-000000000001","name":"Grace","salary":100}]`))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(string(visible))
+	// Output: [{"id":"0190e3c8-0000-7000-8000-000000000001","name":"Grace"}]
 }
