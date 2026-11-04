@@ -95,10 +95,15 @@ func (keptNil) IsZero() bool { return false }
 
 The directory gets `types.ts` (the DTOs and the library's wire types), `filters.ts` (a filter document type per resource), `api.ts` (one REST function per read, mutation, upload and export, and the descriptors `reads`, `live`, `calls`, `uploads`, `downloads`), and copies of `runtime.ts` and `vue.ts`. It type-checks under `strict`, `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess`. There is no global state: every function takes the `Client` or `LiveConnection` it runs on.
 
-- `Client` is REST: `getTodos(client, { filter, sort, limit })`, `createTodo(client, body)`, `uploadAttachment(client, { id }, file)`, `downloadTodosExport(client, query)`. Every mutation gets an `Idempotency-Key` (a UUID v7) and a ClientID create an `id` when its body has none.
+- `Client` is REST: `getTodos(client, { filter, sort, limit })`, `createTodo(client, body)`, `uploadAttachment(client, { id }, file)`, `downloadTodosExport(client, query)`. Every mutation gets an `Idempotency-Key` (a UUID v7) and a ClientID create an `id` when its body has none. In a browser `baseURL` may be below the page's origin (`/api/v1`); where there is no `location` (bun test, Node) it must be absolute (`http://localhost/api/v1`), or every request fails with a `NetworkError` whose cause is the invalid URL.
 - `LiveConnection` is the socket: `connection.subscribe(live.todos, parameters, listener)`, `connection.query(...)`, `connection.call(calls.createTodo, parameters, body)`, `connection.batch(...)`, `connection.join(...)`. It reconnects with backoff and subscribes everything again, every subscription starting with a snapshot; every request settles within `requestTimeout` (30 s) or on its `AbortSignal`.
+- An upload sends the raw file with its content type, or with `multipart: true` a form whose part `file` carries the `filename`; only a multipart body carries a file name. `onProgress(loaded, total)` reports the bytes sent: it switches the request to XMLHttpRequest where the browser has one and no `ClientOptions.fetch` was given; otherwise the upload runs through fetch without progress (D79).
 - A refusal is an `ApiError` (`status`, `code`, `fields`, `body`), a failure to reach the server a `NetworkError`, a request of an ended client or connection an `EndedError` whose `sent` says whether it went out.
 - Both re-send an evicted unnamed filter inline once on a 404 (D54).
+- `runtime.ts` exports the generic list and filter types: `ListQuery<Filter, Sort>`, `FilterDocument<Condition>`, `FilterNode<Condition>`, `SearchableFilterDocument<Condition>`, `SortTerm<Field>`, `TimeValue`. `filters.ts` re-exports them, and every generated list query is assignable to `ListQuery`, so a generic component types its query and filter without the generated files (D78).
+- Search rides in the filter document, `{ where, search }` of a resource with a searchable field (`SearchableFilterDocument`), never in a parameter of its own (D12).
+- Besides the types, a generic component (one that takes a descriptor as a prop) usually needs two runtime values: `ApiError`, to tell a refusal by `instanceof` and read its `code` and `fields`, and `prepareCall`, for one id and Idempotency-Key on every attempt of a call. The client and the connection come from the pair (`useLivePair`, `useLiveConnection`).
+- A descriptor may sit in deep reactive state (`reactive()`, `ref()`): the runtime knows a descriptor by its target and name, never by the object, so the Proxy around it changes nothing (D80). An application that compares descriptors itself compares the names too.
 
 ### One pair per identity
 
@@ -166,7 +171,7 @@ export async function createTodo(title: string): Promise<TodoItem> {
 
 ### Vue
 
-`app.use(livePlugin(pair))` provides the pair's reference; every composable follows it, dropping the old pair's data and subscribing on the new. `useLive(target, parameters)` is one live read (`data`, `error`, `stale`, `loading`, `pending`, `retry()`); `useLiveList` keeps filter, sort and page state (`items`, `total`, `filter`, `sort`, `limit`, `page`, `pages`; in cursor mode `loadMore()` and `hasMore`); `useLiveStatus` is the connection's status; `useLivePresence` joins a record with a state and lists who else is there:
+`app.use(livePlugin(pair))` provides the pair's reference; every composable follows it, dropping the old pair's data and subscribing on the new. `useLive(target, parameters)` is one live read (`data`, `error`, `stale`, `loading`, `pending`, `retry()`); `useLiveList` keeps filter, sort and page state (`items`, `total`, `filter`, `sort`, `limit`, `page`, `pages`; in cursor mode `loadMore()` and `hasMore`), and while a changed query loads it keeps the rows and total before, `stale`, so only the first load is `loading` (D76); a filter or sort change goes back to page 1, a new `limit` to the page that holds the first row shown (D77); `useLiveStatus` is the connection's status; `useLivePresence` joins a record with a state and lists who else is there:
 
 <!-- snippet: examples/todo/web/src/live.ts#views -->
 ```ts

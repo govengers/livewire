@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { FakeClock, fakeFetch, fakeSockets, json, settle } from './fakes'
+import { FakeClock, fakeFetch, fakeSockets, fakeXMLHttpRequests, json, settle } from './fakes'
 import {
   ApiError,
   Client,
@@ -276,6 +276,81 @@ describe('Client', () => {
     const form = calls[1]?.request.body as FormData
     expect((form.get('file') as File).name).toBe('a.png')
     expect((calls[1]?.request.headers as Record<string, string>)['Content-Type']).toBeUndefined()
+  })
+
+  test('an upload with onProgress goes through XMLHttpRequest and reports the bytes sent (D79)', async () => {
+    const transfers = fakeXMLHttpRequests()
+    try {
+      const progress: [number, number | null][] = []
+      const onProgress = (loaded: number, total: number | null) => void progress.push([loaded, total])
+      const client = new Client({ baseURL: base, headers: () => ({ Authorization: 'Bearer key' }) })
+      const file = new Blob(['xy'], { type: 'image/png' })
+      const raw = client.upload(attach, { id: 'p' }, file, { idempotencyKey: 'key', onProgress })
+      await settle()
+      const sent = transfers.current()
+      expect([sent.method, sent.url, sent.body, sent.withCredentials]).toEqual(['POST', `${base}/parts/p/files`, file, false])
+      expect(sent.headers).toEqual({ Authorization: 'Bearer key', 'Idempotency-Key': 'key', 'Content-Type': 'image/png' })
+      sent.progress(1, 2)
+      sent.progress(2, 2)
+      sent.progress(2)
+      sent.respond(201, '{"size":2}')
+      expect(await raw).toEqual({ size: 2 })
+      expect(progress).toEqual([[1, 2], [2, 2], [2, null]])
+
+      const multipart = client.upload(attach, { id: 'p' }, file, { multipart: true, filename: 'a.png', onProgress })
+      await settle()
+      expect(((transfers.current().body as FormData).get('file') as File).name).toBe('a.png')
+      expect(transfers.current().headers['Content-Type']).toBeUndefined()
+      expect(transfers.current().headers['Idempotency-Key']).toMatch(uuidPattern(7))
+      transfers.current().respond(413, JSON.stringify({ code: 'invalid_request', message: 'too large' }))
+      await expect(multipart).rejects.toMatchObject({ code: 'invalid_request', status: 413, message: 'too large' })
+
+      const empty = client.upload(attach, { id: 'p' }, file, { onProgress })
+      await settle()
+      transfers.current().respond(204)
+      expect(await empty).toBeUndefined()
+
+      // No answer is a NetworkError as with fetch, an abort aborts the transfer, the end is an EndedError.
+      const offline = client.upload(attach, { id: 'p' }, file, { onProgress })
+      await settle()
+      transfers.current().fail()
+      await expect(offline).rejects.toBeInstanceOf(NetworkError)
+      const controller = new AbortController()
+      const aborted = client.upload(attach, { id: 'p' }, file, { signal: controller.signal, onProgress })
+      await settle()
+      controller.abort()
+      await expect(aborted).rejects.toBeInstanceOf(NetworkError)
+      expect(transfers.current().aborted).toBe(true)
+      const ended = client.upload(attach, { id: 'p' }, file, { onProgress })
+      await settle()
+      client.end()
+      await expect(ended).rejects.toMatchObject({ name: 'EndedError', sent: true })
+      expect([transfers.current().aborted, transfers.requests.length]).toEqual([true, 6])
+    } finally {
+      transfers.restore()
+    }
+  })
+
+  test('without XMLHttpRequest, and through the application\'s fetch, an upload goes through fetch without progress (D79)', async () => {
+    const progress: number[] = []
+    const onProgress = (loaded: number) => void progress.push(loaded)
+    const file = new Blob(['x'], { type: 'image/png' })
+    const { fetch, calls } = fakeFetch(json({ size: 1 }, 201), json({ size: 1 }, 201))
+    expect(typeof XMLHttpRequest).toBe('undefined')
+    const platformFetch = globalThis.fetch
+    globalThis.fetch = fetch
+    try {
+      expect(await new Client({ baseURL: base }).upload(attach, { id: 'p' }, file, { onProgress })).toEqual({ size: 1 })
+    } finally {
+      globalThis.fetch = platformFetch
+    }
+    const transfers = fakeXMLHttpRequests()
+    try {
+      expect(await new Client({ baseURL: base, fetch }).upload(attach, { id: 'p' }, file, { onProgress })).toEqual({ size: 1 })
+      expect([calls.length, transfers.requests.length, progress]).toEqual([2, 0, []])
+    } finally {
+      transfers.restore()
+    }
   })
 
   test('the library routes: batch, stored filters, export', async () => {
@@ -576,6 +651,26 @@ describe('LiveConnection', () => {
     current().end(1006)
     await expect(failing).rejects.toBeInstanceOf(NetworkError)
     expect(ids()).toEqual(['a'])
+  })
+
+  test('a descriptor behind a Proxy (a deep reactive object) works as itself: its strings identify it, never the object (D80)', async () => {
+    const { connection, current, ids } = subscribedList([{ id: 'a', name: 'A' }])
+    const proxied = new Proxy(createPart, {})
+    const prepared = prepareCall(proxied, { name: 'b' })
+    expect(prepared.body.id).toMatch(uuidPattern(7))
+    const created = connection.call(proxied, {}, prepared.body, { idempotencyKey: prepared.idempotencyKey, optimistic: { id: prepared.body.id ?? '', name: 'b' } })
+    expect(ids()).toEqual(['a', prepared.body.id ?? ''])
+    expect(current().last('call')).toMatchObject({ target: 'createPart', idempotencyKey: prepared.idempotencyKey })
+    current().answer('call', { payload: { id: prepared.body.id, name: 'b' } })
+    await created
+
+    const received = listener<ListResponse<Part>>()
+    connection.subscribe(new Proxy(parts, {}), {}, received)
+    current().answer('subscribe', { subscription: 's2' })
+    current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }]) })
+    void connection.call(deletePart, { id: 'a' }, undefined)
+    expect([received.last()?.data.items, received.last()?.pending]).toEqual([[], ['a']])
+    expect(batchCall(new Proxy(deletePart, {}), { id: 'a' }, undefined)).toEqual({ target: 'deletePart', params: { id: 'a' } })
   })
 
   test('a prepared socket call retries with the same client id and key', async () => {

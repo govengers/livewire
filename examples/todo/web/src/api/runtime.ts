@@ -108,6 +108,44 @@ export interface RelativeTime {
   relative: string
 }
 
+/** A node of a filter document (D12): a condition, or and, or or not over nodes. */
+export type FilterNode<Condition> =
+  | Condition
+  | { and: readonly FilterNode<Condition>[] }
+  | { or: readonly FilterNode<Condition>[] }
+  | { not: FilterNode<Condition> }
+
+/** A filter document: its conditions under where; the empty document matches every row. */
+export interface FilterDocument<Condition> {
+  where?: FilterNode<Condition>
+}
+
+/** A filter document of a resource with a searchable field: the search rides in the document, there is no search parameter. */
+export interface SearchableFilterDocument<Condition> extends FilterDocument<Condition> {
+  search?: string
+}
+
+/** One sort term: the field, or "-field" for descending. */
+export type SortTerm<Field extends string> = Field | `-${Field}`
+
+/** A time in a condition: RFC 3339, or relative to the database clock of the read. */
+export type TimeValue = string | RelativeTime
+
+/**
+ * The reserved parameters of a filterable list read (D11, D13, D38). Every generated
+ * `<Resource>ListQuery` is assignable to it, so a generic component types its query (and, with
+ * FilterDocument, its filter) without the generated files.
+ */
+export interface ListQuery<Filter = unknown, Sort extends string = string> {
+  filter?: Filter
+  filterId?: string
+  sort?: readonly Sort[]
+  limit?: number
+  offset?: number
+  /** The `next` of the page before, in cursor mode (D38). */
+  after?: string
+}
+
 /** The parameters of a declaration without any. */
 export type NoParameters = Record<string, never>
 
@@ -499,10 +537,22 @@ export interface CallOptions extends RequestOptions {
 export interface UploadOptions<ContentType extends string> extends CallOptions {
   /** Default: the blob's own type. */
   contentType?: ContentType
-  /** Send a multipart/form-data body with the file as its part "file" instead of the raw body. */
+  /** Send a multipart/form-data body with the file as its part "file" instead of the raw body; only a multipart body carries the file name. */
   multipart?: boolean
+  /** The file name of the multipart part (default "file"); a raw body carries none. */
   filename?: string
+  /**
+   * Called as the body goes out: the bytes sent and the total, null when the platform cannot tell
+   * (D79). fetch reports no upload progress, so with it the upload goes through XMLHttpRequest
+   * where the platform has one (a browser); elsewhere (bun, Node) and through a
+   * ClientOptions.fetch, which is the application's transport, it goes through fetch and reports
+   * none.
+   */
+  onProgress?: UploadProgress
 }
+
+/** The bytes of an upload's body sent so far and its total, null when the platform cannot tell. */
+export type UploadProgress = (loaded: number, total: number | null) => void
 
 /** A finished export: the CSV, and the rows of the Livewire-Export-Rows trailer where the platform exposes trailers. */
 export interface ExportDownload {
@@ -608,6 +658,12 @@ export class Client {
     return (await this.request(target.method, path, options, outgoing)) as Response
   }
 
+  /**
+   * Uploads a file (D17): the raw body with its content type, or with `multipart` a
+   * multipart/form-data body with the part "file", the only body that carries a file name
+   * (`filename`). `onProgress` reports the bytes sent (D79). Like a call, it sends an
+   * Idempotency-Key, a fresh one unless given.
+   */
   async upload<Parameters extends object, Response, ContentType extends string>(
     target: UploadTarget<Parameters, Response, ContentType>,
     parameters: NoInfer<Parameters>,
@@ -688,7 +744,7 @@ export class Client {
     return new URL(this.options.baseURL.replace(/\/$/, '') + path, origin)
   }
 
-  private request(method: string, path: string, options: RequestOptions, outgoing: RequestInit = {}): Promise<unknown> {
+  private request(method: string, path: string, options: TransferOptions, outgoing: RequestInit = {}): Promise<unknown> {
     return this.untilEnd(method, path, async (progress) => {
       const response = await this.fetch(method, path, options, outgoing, progress)
       if (response.status === 204) return undefined
@@ -707,7 +763,7 @@ export class Client {
    * Nothing goes out once the client ended or the session's identity changed, not even a request
    * whose headers resolved after it (untilEnd settles the caller then).
    */
-  private async fetch(method: string, path: string, options: RequestOptions, outgoing: RequestInit, progress: { sent: boolean }): Promise<Response> {
+  private async fetch(method: string, path: string, options: TransferOptions, outgoing: RequestInit, progress: { sent: boolean }): Promise<Response> {
     const headers = { ...(await this.options.headers?.()), ...(outgoing.headers as Record<string, string> | undefined) }
     this.checkIdentity()
     if (this.ended) throw new EndedError(`livewire: ${method} ${path}: the client ended`)
@@ -716,7 +772,9 @@ export class Client {
     progress.sent = true
     let response: Response
     try {
-      response = await (this.options.fetch ?? fetch)(this.url(path), request)
+      // The one transport switch (D79): only XMLHttpRequest reports upload progress.
+      const onProgress = this.options.fetch === undefined && typeof XMLHttpRequest !== 'undefined' ? options.onProgress : undefined
+      response = await (onProgress === undefined ? (this.options.fetch ?? fetch)(this.url(path), request) : sendWithProgress(this.url(path), request, onProgress))
     } catch (cause) {
       throw new NetworkError(`livewire: ${method} ${path} got no answer`, { cause })
     }
@@ -732,6 +790,43 @@ export class Client {
     if (error.status === 401 && !this.ended) this.options.onUnauthorized?.(error)
     throw error
   }
+}
+
+/** What a request of the Client takes: its signal, and an upload's progress callback (D79). */
+type TransferOptions = RequestOptions & { onProgress?: UploadProgress | undefined }
+
+/**
+ * Sends a request through XMLHttpRequest, the browser API that reports upload progress, and
+ * settles as fetch does: a Response for every status the server answers, a rejection when no
+ * answer came (offline, or aborted by the signal).
+ */
+function sendWithProgress(url: URL, request: RequestInit, onProgress: UploadProgress): Promise<Response> {
+  return new Promise<Response>((resolve, reject) => {
+    const signal = request.signal ?? undefined
+    if (signal?.aborted === true) {
+      reject(signal.reason)
+      return
+    }
+    const transfer = new XMLHttpRequest()
+    const abort = (): void => transfer.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    const settle = (): void => signal?.removeEventListener('abort', abort)
+    transfer.open(request.method ?? 'GET', url)
+    for (const [name, value] of Object.entries(request.headers as Record<string, string>)) transfer.setRequestHeader(name, value)
+    // Same-origin requests carry the cookies anyway; a cross-origin one only under 'include', as with fetch.
+    transfer.withCredentials = request.credentials === 'include'
+    transfer.upload.onprogress = (event) => onProgress(event.loaded, event.lengthComputable ? event.total : null)
+    transfer.onload = () => {
+      settle()
+      const empty = transfer.status === 204 || transfer.status === 205 || transfer.status === 304
+      resolve(new Response(empty ? null : transfer.responseText, { status: transfer.status, statusText: transfer.statusText }))
+    }
+    transfer.onerror = transfer.onabort = () => {
+      settle()
+      reject(new TypeError('livewire: the upload got no answer'))
+    }
+    transfer.send(request.body as XMLHttpRequestBodyInit)
+  })
 }
 
 /** The state of the socket: idle without anything to serve, ended for good (D66). */

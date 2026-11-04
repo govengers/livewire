@@ -205,32 +205,13 @@ func goTypeName(named *namedType) string {
 func renderFilters(api *model) ([]byte, error) {
 	var builder strings.Builder
 	builder.WriteString(typescriptHeader)
-	builder.WriteString(`import type { RelativeTime } from './runtime'
+	// The generic filter types are the runtime's, so a component needs no generated file to type a
+	// filter (D78); filters.ts re-exports them for the applications that import them from here.
+	builder.WriteString(`import type { FilterDocument, FilterNode, SearchableFilterDocument, SortTerm, TimeValue } from './runtime'
 
-/** A node of a filter document (D12): a condition, or and, or or not over nodes. */
-export type FilterNode<Condition> =
-  | Condition
-  | { and: readonly FilterNode<Condition>[] }
-  | { or: readonly FilterNode<Condition>[] }
-  | { not: FilterNode<Condition> }
-
-/** A filter document: its conditions under where; the empty document matches every row. */
-export interface FilterDocument<Condition> {
-  where?: FilterNode<Condition>
-}
-
-/** A filter document of a resource with a searchable field. */
-export interface SearchableFilterDocument<Condition> extends FilterDocument<Condition> {
-  search?: string
-}
-
-/** One sort term: the field, or "-field" for descending. */
-export type SortTerm<Field extends string> = Field | ` + "`-${Field}`" + `
-
-/** A time in a condition: RFC 3339, or relative to the database clock of the read. */
-export type TimeValue = string | RelativeTime
+export type { FilterDocument, FilterNode, SearchableFilterDocument, SortTerm, TimeValue }
 `)
-	identifiers := newIdentifiers("FilterNode", "FilterDocument", "SearchableFilterDocument", "SortTerm", "TimeValue", "RelativeTime", "FilterDocuments")
+	identifiers := newIdentifiers("FilterNode", "FilterDocument", "SearchableFilterDocument", "SortTerm", "TimeValue", "FilterDocuments")
 	resources := slices.Clone(api.resources)
 	if api.history != nil {
 		resources = append(resources, api.history)

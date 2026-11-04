@@ -1,7 +1,7 @@
 // Calls the generated client of the fixture registry the way an application does; tsc checks
 // it under the strictest settings, and every @ts-expect-error line must stay an error.
 
-import { effectScope, shallowRef } from 'vue'
+import { computed, effectScope, ref, shallowRef } from 'vue'
 import {
   calls,
   createPart,
@@ -24,9 +24,16 @@ import {
   chargePart,
   listFilters,
   deleteFilter,
+  type NotesListQuery,
+  type PartsHistoryQuery,
+  type PartsListQuery,
 } from './api/api'
-import type { PartsFilter, HistoryFilter } from './api/filters'
-import { ApiError, EndedError, NetworkError, batchCall, createLivePair, prepareCall, uuidv7, type LivePair } from './api/runtime'
+import type * as filters from './api/filters'
+import type { PartsCondition, PartsFilter, PartsSortTerm, HistoryFilter } from './api/filters'
+import {
+  ApiError, EndedError, NetworkError, batchCall, createLivePair, prepareCall, uuidv7,
+  type FilterDocument, type FilterNode, type ListQuery, type LivePair, type SearchableFilterDocument, type SortTerm, type TimeValue,
+} from './api/runtime'
 import type { ErrorCode, FixturePart, Kind, ListResponse, PresenceItem, Stat, Version } from './api/types'
 import { livePlugin, useLive, useLiveConnection, useLiveList, useLivePresence, useLiveStatus } from './api/vue'
 
@@ -190,3 +197,43 @@ export function composables(): void {
     list.filter.value = { where: { field: 'unknown', op: 'eq', value: 1 } }
   })
 }
+
+/** A generic component types its query and filter with the runtime's generics, without api.ts and filters.ts (D78). */
+export function generics(): void {
+  const accept = <Query extends ListQuery>(query: Query): Query => query
+  accept<PartsListQuery>({ after: 'cursor' })
+  accept<NotesListQuery>({ offset: 10 })
+  accept<PartsHistoryQuery>({ id: 'part-1' })
+  const query: ListQuery<PartsFilter, PartsSortTerm> = { filter: { search: 'bolt' }, sort: ['-createdAt'], limit: 25 }
+  const facets: SearchableFilterDocument<{ field: string; op: 'in' | 'notIn'; value: readonly string[] }> = {
+    where: { and: [{ field: 'kind', op: 'in', value: ['bolt'] }, { not: { field: 'tags', op: 'notIn', value: ['red'] } }] },
+    search: 'bolt',
+  }
+  const node: FilterNode<PartsCondition> = { or: [{ field: 'kind', op: 'eq', value: 'nut' }] }
+  const document: filters.FilterDocument<PartsCondition> = { where: node } satisfies FilterDocument<PartsCondition>
+  const term: SortTerm<'name'> = '-name'
+  const time: TimeValue = { relative: '-7d' }
+  console.log(query, facets, document, term, time)
+  // @ts-expect-error a sort term of another field
+  const wrong: ListQuery<PartsFilter, PartsSortTerm> = { sort: ['tags'] }
+  console.log(wrong)
+}
+
+// snippet:begin cursor-pager
+/** A pager over a cursor resource with one live page (D81): next pushes the page's cursor, previous pops it. */
+export function useCursorPager(query: PartsListQuery) {
+  const cursors = ref<string[]>([])
+  const page = useLive(live.parts, () => {
+    const after = cursors.value.at(-1)
+    return after === undefined ? query : { ...query, after }
+  })
+  const next = (): void => {
+    const cursor = page.data.value?.next
+    if (cursor !== undefined && cursor !== cursors.value.at(-1)) cursors.value = [...cursors.value, cursor]
+  }
+  const previous = (): void => {
+    cursors.value = cursors.value.slice(0, -1)
+  }
+  return { page, next, previous, hasPrevious: computed(() => cursors.value.length > 0), hasNext: computed(() => page.data.value?.next !== undefined) }
+}
+// snippet:end cursor-pager
