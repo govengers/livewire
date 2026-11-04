@@ -85,7 +85,7 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 		return nil, err
 	}
 	router := gin.New()
-	router.Use(recovery(), spans, wideEvents, requestMetrics)
+	router.Use(spans, recovery(), wideEvents, requestMetrics) // the span outside the recovery, so it sees the 500 of a panic
 	router.NoRoute(func(ginContext *gin.Context) { writeError(ginContext, livewire.NotFound()) })
 	router.GET("/healthz", func(ginContext *gin.Context) { ginContext.Status(http.StatusNoContent) })
 	router.GET("/readyz", func(ginContext *gin.Context) {

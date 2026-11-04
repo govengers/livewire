@@ -74,12 +74,6 @@ type stores struct {
 	listener    *postgresadapter.Listener
 }
 
-// jobPropagators carry the acting user (JOB-011) and the trace (TRC-003) from the request that
-// enqueues a job into its handler; the store and the worker get the same.
-func jobPropagators() []jobs.Propagator {
-	return []jobs.Propagator{jobsauth.Identity(), jobsotel.NewPropagator()}
-}
-
 // newApplication wires repositories, stores, services, the registry and the engine, the job
 // worker and the router, in this order (LAY-002).
 func newApplication(options *applicationOptions) (*application, error) {
@@ -261,4 +255,10 @@ func newWorker(options *applicationOptions, jobStore *jobspostgres.Store, livewi
 		return nil, err
 	}
 	return worker, jobController.Register(worker)
+}
+
+// jobPropagators carry the acting user (JOB-011) and the trace (TRC-003) from the request that
+// enqueues a job into its handler; the store and the worker get the same.
+func jobPropagators() []jobs.Propagator {
+	return []jobs.Propagator{jobsauth.Identity(), jobsotel.NewPropagator()}
 }

@@ -45,7 +45,7 @@ var version = "dev"
 
 const (
 	shutdownBudget     = 20 * time.Second // the API's drain, within a 30 s termination grace period
-	traceFlushTimeout  = 5 * time.Second  // after the drain, still within the grace period
+	traceFlushTimeout  = 3 * time.Second  // after the readiness delay (5 s) and the drain (20 s), within the 30 s grace period
 	maximumConnections = 20
 )
 

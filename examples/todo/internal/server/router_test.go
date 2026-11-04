@@ -16,6 +16,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/govengers/livewire"
@@ -44,6 +48,11 @@ func (noTransactor) Begin(context.Context, livewire.TransactionDetails) (livewir
 // newTestRouter answers the router, its metrics and what it printed.
 func newTestRouter(t *testing.T, ready func(ctx context.Context) error) (*httptest.Server, *prometheus.Registry, *bytes.Buffer) {
 	t.Helper()
+	return newTestRouterWithTraces(t, ready, noop.NewTracerProvider())
+}
+
+func newTestRouterWithTraces(t *testing.T, ready func(ctx context.Context) error, traces trace.TracerProvider) (*httptest.Server, *prometheus.Registry, *bytes.Buffer) {
+	t.Helper()
 	printed := &bytes.Buffer{}
 	gin.DefaultErrorWriter = printed
 	t.Cleanup(func() { gin.DefaultErrorWriter = gin.DefaultWriter })
@@ -66,7 +75,7 @@ func newTestRouter(t *testing.T, ready func(ctx context.Context) error) (*httpte
 	require.NoError(t, err)
 	metrics := prometheus.NewRegistry()
 	router, err := NewRouter(&Options{
-		Engine: engine, Authentication: identities, Metrics: metrics, Traces: noop.NewTracerProvider(), Ready: ready,
+		Engine: engine, Authentication: identities, Metrics: metrics, Traces: traces, Ready: ready,
 		Emitter: wideevent.EmitterFunc(func(we *wideevent.Event) { fmt.Fprintln(printed, we.FieldsMap()) }),
 	})
 	require.NoError(t, err)
@@ -156,4 +165,25 @@ func TestARequestsEventCarriesTheCallersTrace(t *testing.T) {
 
 	require.Contains(t, printed.String(), "id:4bf92f3577b34da6a3ce929d0e0e4736")
 	require.Contains(t, printed.String(), "span_id:00f067aa0ba902b7")
+}
+
+// TestProbesMakeNoSpan pins TRC-007: a probe makes no span, a request a span named after its
+// route; a 404 is the client's error, not the span's.
+func TestProbesMakeNoSpan(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	server, _, _ := newTestRouterWithTraces(t, func(context.Context) error { return nil }, sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)))
+	for _, request := range []*http.Request{
+		withCredentials(t, http.MethodGet, server.URL+"/readyz"),
+		withCredentials(t, http.MethodGet, server.URL+"/healthz"),
+		withCredentials(t, http.MethodGet, server.URL+"/coffee"),
+	} {
+		response, err := server.Client().Do(request)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+	}
+
+	spans := recorder.Ended()
+	require.Len(t, spans, 1, "the probes make no span")
+	require.Equal(t, "GET", spans[0].Name(), "an unmatched path is no part of the name")
+	require.Equal(t, codes.Unset, spans[0].Status().Code)
 }
