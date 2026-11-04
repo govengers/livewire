@@ -31,6 +31,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/goleak"
 
 	"github.com/govengers/livewire"
@@ -134,7 +135,7 @@ func migrateTemplate() error {
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+templateDatabase); err != nil {
 		return err
 	}
-	pool, err := database.NewPool(ctx, databaseURL(templateDatabase), 4)
+	pool, err := database.NewPool(ctx, databaseURL(templateDatabase), 4, noop.NewTracerProvider())
 	if err != nil {
 		return err
 	}
@@ -153,7 +154,7 @@ func newPool(t *testing.T) *pgxpool.Pool {
 	postgres.mutex.Unlock()
 	require.NoError(t, admin.Close(t.Context()))
 	require.NoError(t, err)
-	pool, err := database.NewPool(t.Context(), databaseURL(name), maximumConnections)
+	pool, err := database.NewPool(t.Context(), databaseURL(name), maximumConnections, noop.NewTracerProvider())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		pool.Close()
@@ -184,7 +185,7 @@ func newTestApplication(t *testing.T) *testApplication {
 	users := password.NewMemoryStorage()
 	events := &recordedEvents{}
 	application, err := newApplication(&applicationOptions{
-		Pool: pool, Emitter: events, Metrics: prometheus.NewRegistry(), Users: users,
+		Pool: pool, Emitter: events, Metrics: prometheus.NewRegistry(), Traces: noop.NewTracerProvider(), Users: users,
 		SessionKey: sessionKey(t), InsecureCookie: true,
 	})
 	require.NoError(t, err)

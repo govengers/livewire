@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/govengers/livewire"
 
@@ -65,7 +66,7 @@ func newTestRouter(t *testing.T, ready func(ctx context.Context) error) (*httpte
 	require.NoError(t, err)
 	metrics := prometheus.NewRegistry()
 	router, err := NewRouter(&Options{
-		Engine: engine, Authentication: identities, Metrics: metrics, Ready: ready,
+		Engine: engine, Authentication: identities, Metrics: metrics, Traces: noop.NewTracerProvider(), Ready: ready,
 		Emitter: wideevent.EmitterFunc(func(we *wideevent.Event) { fmt.Fprintln(printed, we.FieldsMap()) }),
 	})
 	require.NoError(t, err)
@@ -138,6 +139,21 @@ func TestTheRequestMetricsKeepTheirLabelsBounded(t *testing.T) {
 			series = append(series, labels["route"]+" "+labels["method"]+" "+labels["status"])
 		}
 	}
-	require.ElementsMatch(t, []string{"unmatched other 4xx", "/readyz GET 5xx"}, series)
+	require.ElementsMatch(t, []string{"unmatched other 404", "/readyz GET 500"}, series)
 	require.Zero(t, inFlight, "every request in flight ended, the panicking one included")
+}
+
+// TestARequestsEventCarriesTheCallersTrace pins TRC-005: with the W3C propagator, an incoming
+// traceparent reaches the wide event even with a no-op provider (no collector).
+func TestARequestsEventCarriesTheCallersTrace(t *testing.T) {
+	server, _, printed := newTestRouter(t, func(context.Context) error { return nil })
+	request := withCredentials(t, http.MethodGet, server.URL+"/coffee")
+	request.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+
+	response, err := server.Client().Do(request)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+
+	require.Contains(t, printed.String(), "id:4bf92f3577b34da6a3ce929d0e0e4736")
+	require.Contains(t, printed.String(), "span_id:00f067aa0ba902b7")
 }

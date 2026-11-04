@@ -12,6 +12,7 @@ import (
 	"github.com/govengers/auth/password"
 	"github.com/govengers/jobs"
 	jobsauth "github.com/govengers/jobs/authadapter"
+	jobsotel "github.com/govengers/jobs/oteladapter"
 	jobspostgres "github.com/govengers/jobs/postgresadapter"
 	jobsprometheus "github.com/govengers/jobs/prometheusadapter"
 	"github.com/govengers/jobs/wideeventadapter"
@@ -19,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/postgresadapter"
@@ -39,6 +41,7 @@ type applicationOptions struct {
 	Pool           *pgxpool.Pool
 	Emitter        wideevent.Emitter
 	Metrics        *prometheus.Registry
+	Traces         trace.TracerProvider // tracing.Provider's, or a no-op one in tests
 	Users          password.Storage
 	SessionKey     []byte
 	InsecureCookie bool
@@ -71,10 +74,16 @@ type stores struct {
 	listener    *postgresadapter.Listener
 }
 
+// jobPropagators carry the acting user (JOB-011) and the trace (TRC-003) from the request that
+// enqueues a job into its handler; the store and the worker get the same.
+func jobPropagators() []jobs.Propagator {
+	return []jobs.Propagator{jobsauth.Identity(), jobsotel.NewPropagator()}
+}
+
 // newApplication wires repositories, stores, services, the registry and the engine, the job
 // worker and the router, in this order (LAY-002).
 func newApplication(options *applicationOptions) (*application, error) {
-	jobStore, err := jobspostgres.New(&jobspostgres.Options{Pool: options.Pool, Propagators: []jobs.Propagator{jobsauth.Identity()}})
+	jobStore, err := jobspostgres.New(&jobspostgres.Options{Pool: options.Pool, Propagators: jobPropagators()})
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +128,7 @@ func newApplication(options *applicationOptions) (*application, error) {
 	ready := &atomic.Bool{}
 	ready.Store(true)
 	router, err := server.NewRouter(&server.Options{
-		Engine: engine, Authentication: identities, Emitter: options.Emitter, Metrics: options.Metrics,
+		Engine: engine, Authentication: identities, Emitter: options.Emitter, Metrics: options.Metrics, Traces: options.Traces,
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
 				return errDraining
@@ -224,6 +233,10 @@ func newWorker(options *applicationOptions, jobStore *jobspostgres.Store, livewi
 	if err != nil {
 		return nil, err
 	}
+	spans, err := jobsotel.NewMiddleware(&jobsotel.Options{TracerProvider: options.Traces})
+	if err != nil {
+		return nil, err
+	}
 	queues := []string{model.QueueTodos, model.QueueMaintenance}
 	jobMetrics, err := jobsprometheus.New(&jobsprometheus.Options{Registerer: options.Metrics, Namespace: "todo", DepthSource: jobStore, Queues: queues})
 	if err != nil {
@@ -231,10 +244,10 @@ func newWorker(options *applicationOptions, jobStore *jobspostgres.Store, livewi
 	}
 	worker, err := jobs.NewWorker(&jobs.WorkerOptions{
 		Store:        jobStore,
-		Propagators:  []jobs.Propagator{jobsauth.Identity()}, // a job a user started runs as that user (JOB-011)
+		Propagators:  jobPropagators(),
 		DrainTimeout: shutdownBudget,
 		Queues:       map[string]jobs.QueueOptions{model.QueueTodos: {Concurrency: 4}, model.QueueMaintenance: {Concurrency: 1}},
-		Middleware:   []jobs.Middleware{wideEvents},
+		Middleware:   []jobs.Middleware{wideEvents, spans}, // the span inside the event, which gets its IDs (TRC-005)
 		Observer:     jobMetrics,
 		Schedules:    controller.Schedules(),
 	})
