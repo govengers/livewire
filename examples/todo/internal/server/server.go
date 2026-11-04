@@ -1,5 +1,5 @@
-// Package server builds the example's HTTP side: the gin router with its recovery, the
-// wide-event middleware and the request metrics, the auth routes, the API behind
+// Package server builds the example's HTTP side: the gin router with its recovery, the request's
+// span, the wide-event middleware and the request metrics, the auth routes, the API behind
 // authentication with livewire's REST routes and socket, the health routes, and the livewire
 // Observer that turns the engine's outcomes into metrics and one wide event per socket or
 // background outcome (D30, LOG-001).
@@ -11,15 +11,18 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
-	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/govengers/auth"
 	authginadapter "github.com/govengers/auth/ginadapter"
+	telemetryginadapter "github.com/govengers/telemetry/ginadapter"
+	"github.com/govengers/telemetry/tracing"
 	wideevent "github.com/govengers/wide-event-logger"
 	wideeventginadapter "github.com/govengers/wide-event-logger/ginadapter"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/ginadapter"
@@ -35,32 +38,54 @@ const SocketPath = controller.BasePath + "/socket"
 
 // Options configures the router; every field is required. Ready is the readiness check (a
 // database ping that fails once the server drains), Metrics the registry the request metrics
-// go to.
+// go to, Traces the provider of the requests' spans (a no-op one without a collector).
 type Options struct {
 	Engine         *livewire.Engine
 	Authentication *authentication.Authentication
 	Emitter        wideevent.Emitter
 	Metrics        prometheus.Registerer
+	Traces         trace.TracerProvider
 	Ready          func(ctx context.Context) error
 }
+
+// probes are the health routes: no wide event and no span (TRC-007).
+var probes = []string{"/healthz", "/readyz"}
 
 // NewRouter builds the router of the API; it fails without one of its options or when the
 // request metrics are registered already.
 func NewRouter(options *Options) (*gin.Engine, error) {
-	if options == nil || options.Engine == nil || options.Authentication == nil || options.Emitter == nil || options.Metrics == nil || options.Ready == nil {
-		return nil, errors.New("server: Options needs the Engine, the Authentication, the Emitter, the Metrics and Ready")
+	if options == nil || options.Engine == nil || options.Authentication == nil || options.Emitter == nil || options.Metrics == nil || options.Traces == nil || options.Ready == nil {
+		return nil, errors.New("server: Options needs the Engine, the Authentication, the Emitter, the Metrics, the Traces and Ready")
 	}
 	ready, engine := options.Ready, options.Engine
-	wideEvents, err := wideeventginadapter.NewMiddleware(&wideeventginadapter.Options{Emitter: options.Emitter, SkipPaths: []string{"/healthz", "/readyz"}})
+	spans := otelgin.Middleware("todo",
+		otelgin.WithTracerProvider(options.Traces),
+		otelgin.WithPropagators(propagation.TraceContext{}),
+		// no span for the probes, nor for the socket, whose request lives as long as the socket
+		otelgin.WithGinFilter(func(ginContext *gin.Context) bool {
+			return ginContext.FullPath() != SocketPath && !slices.Contains(probes, ginContext.FullPath())
+		}),
+	)
+	wideEvents, err := wideeventginadapter.NewMiddleware(&wideeventginadapter.Options{
+		Emitter:   options.Emitter,
+		SkipPaths: probes,
+		PreEnricher: func(we *wideevent.Event, ginContext *gin.Context) {
+			tracing.RecordTraceID(ginContext.Request.Context(), we) // the span is in the context: otelgin runs first (TRC-005)
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
-	requestMetrics, err := newRequestMetrics(options.Metrics)
+	// The socket route is left out: its request lives as long as the socket, which
+	// prometheusadapter measures. A request that panics counts as 500.
+	requestMetrics, err := telemetryginadapter.NewMetricsMiddleware(&telemetryginadapter.MetricsOptions{
+		Registerer: options.Metrics, Namespace: "todo", SkipRoutes: []string{SocketPath},
+	})
 	if err != nil {
 		return nil, err
 	}
 	router := gin.New()
-	router.Use(recovery(), wideEvents, requestMetrics)
+	router.Use(spans, recovery(), wideEvents, requestMetrics) // the span outside the recovery, so it sees the 500 of a panic
 	router.NoRoute(func(ginContext *gin.Context) { writeError(ginContext, livewire.NotFound()) })
 	router.GET("/healthz", func(ginContext *gin.Context) { ginContext.Status(http.StatusNoContent) })
 	router.GET("/readyz", func(ginContext *gin.Context) {
@@ -120,61 +145,6 @@ func recovery() gin.HandlerFunc {
 func writeError(ginContext *gin.Context, err error) {
 	status, body := livewire.ResponseFor(err)
 	ginContext.AbortWithStatusJSON(status, body)
-}
-
-// methods are the label values of a request's method; any other method is "other" (MET-004).
-var methods = []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions}
-
-// newRequestMetrics records the rate, the errors and the duration of every request by route
-// template, method and status class, and the requests in flight (MET-003, MET-004). A request
-// that panics counts as 5xx. The socket route is left out: its request lives as long as the
-// socket, which prometheusadapter measures.
-func newRequestMetrics(registerer prometheus.Registerer) (gin.HandlerFunc, error) {
-	requests := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "todo", Subsystem: "http", Name: "requests_total", Help: "HTTP requests by route, method and status class.",
-	}, []string{"route", "method", "status"})
-	durations := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "todo", Subsystem: "http", Name: "request_duration_seconds", Help: "HTTP request durations by route and method.",
-		Buckets: prometheus.DefBuckets,
-	}, []string{"route", "method"})
-	inFlight := prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "todo", Subsystem: "http", Name: "requests_in_flight", Help: "HTTP requests being served.",
-	})
-	for _, collector := range []prometheus.Collector{requests, durations, inFlight} {
-		if err := registerer.Register(collector); err != nil {
-			return nil, err
-		}
-	}
-	return func(ginContext *gin.Context) {
-		route := ginContext.FullPath()
-		if route == SocketPath {
-			ginContext.Next()
-			return
-		}
-		if route == "" {
-			route = "unmatched" // a client's path never becomes a label
-		}
-		method := ginContext.Request.Method
-		if !slices.Contains(methods, method) {
-			method = "other"
-		}
-		started := time.Now()
-		inFlight.Inc()
-		defer func() {
-			inFlight.Dec()
-			status := ginContext.Writer.Status()
-			recovered := recover()
-			if recovered != nil {
-				status = http.StatusInternalServerError
-			}
-			requests.WithLabelValues(route, method, strconv.Itoa(status/100)+"xx").Inc()
-			durations.WithLabelValues(route, method).Observe(time.Since(started).Seconds())
-			if recovered != nil {
-				panic(recovered) // the recovery outside answers it
-			}
-		}()
-		ginContext.Next()
-	}, nil
 }
 
 // recordIdentifiers puts the business identifiers of a socket unit's decoded parameters on its

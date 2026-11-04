@@ -30,19 +30,22 @@ import (
 	"github.com/govengers/auth/password"
 	"github.com/govengers/auth/session"
 	"github.com/govengers/config/v2"
+	"github.com/govengers/telemetry"
+	"github.com/govengers/telemetry/tracing"
 	wideevent "github.com/govengers/wide-event-logger"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
 	"github.com/govengers/livewire/examples/todo/internal/database"
 )
 
+// version is set at build time with -ldflags "-X main.version=<version>" (DEP-005).
+var version = "dev"
+
 const (
 	shutdownBudget     = 20 * time.Second // the API's drain, within a 30 s termination grace period
+	traceFlushTimeout  = 3 * time.Second  // after the readiness delay (5 s) and the drain (20 s), within the 30 s grace period
 	maximumConnections = 20
 )
 
@@ -86,16 +89,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	pool, closeDatabase, err := openDatabase(ctx, values)
+	traces, err := tracing.New(ctx, &tracing.Options{ServiceName: "todo", ServiceVersion: version}) // OTEL_*; a no-op without an endpoint (TRC-002)
+	if err != nil {
+		return err
+	}
+	defer flushTraces(traces) // last: after the servers, the worker and the pool stopped (TRC-009)
+	pool, closeDatabase, err := openDatabase(ctx, values, traces)
 	if err != nil {
 		return err
 	}
 	defer closeDatabase()
-	metrics := prometheus.NewRegistry() // the service's own registry (MET-002)
-	metrics.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	metrics := telemetry.NewRegistry() // the service's own registry with the runtime collectors (MET-002)
 	users := password.NewMemoryStorage()
 	application, err := newApplication(&applicationOptions{
-		Pool: pool, Emitter: emitter, Metrics: metrics, Users: users,
+		Pool: pool, Emitter: emitter, Metrics: metrics, Traces: traces.TracerProvider(), Users: users,
 		SessionKey: sessionKey, InsecureCookie: values.insecureCookie, AllowedOrigins: values.allowedOrigins,
 	})
 	if err != nil {
@@ -135,9 +142,18 @@ func newEmitter(development bool) (wideevent.Emitter, error) {
 	return wideevent.NewJSONEmitter(&wideevent.JSONEmitterOptions{Writer: os.Stderr}), nil
 }
 
+// flushTraces exports the spans still buffered; the process ends either way.
+func flushTraces(traces *tracing.Provider) {
+	flushContext, cancel := context.WithTimeout(context.Background(), traceFlushTimeout)
+	defer cancel()
+	if err := traces.Shutdown(flushContext); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+}
+
 // openDatabase opens the pool on DATABASE_URL, or on an embedded PostgreSQL without one, and
 // migrates it; the returned function closes both.
-func openDatabase(ctx context.Context, values *configuration) (*pgxpool.Pool, func(), error) {
+func openDatabase(ctx context.Context, values *configuration, traces *tracing.Provider) (*pgxpool.Pool, func(), error) {
 	url, stopEmbedded := values.databaseURL, func() {}
 	if url == "" {
 		embedded := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
@@ -149,7 +165,7 @@ func openDatabase(ctx context.Context, values *configuration) (*pgxpool.Pool, fu
 		url = fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/postgres", values.embeddedPostgresPort)
 		stopEmbedded = func() { _ = embedded.Stop() } // the process ends; a failed stop leaves the data for the next start
 	}
-	pool, err := database.NewPool(ctx, url, maximumConnections)
+	pool, err := database.NewPool(ctx, url, maximumConnections, traces.TracerProvider())
 	if err != nil {
 		stopEmbedded()
 		return nil, nil, err
@@ -180,7 +196,10 @@ func seedDemo(ctx context.Context, application *application, demoPassword string
 // side by side, so both fit a 30 s termination grace period.
 func serve(ctx context.Context, application *application, values *configuration) error {
 	apiServer := newServer(values.address, application.router)
-	metricsServer := newServer(values.metricsAddress, promhttp.HandlerFor(application.metrics, promhttp.HandlerOpts{}))
+	metricsServer, err := telemetry.NewMetricsServer(&telemetry.MetricsServerOptions{Registry: application.metrics, Address: values.metricsAddress})
+	if err != nil {
+		return err
+	}
 	group, groupContext := errgroup.WithContext(ctx)
 	group.Go(recovering(func() error { return application.engine.Run(groupContext) }))
 	group.Go(recovering(func() error { return application.worker.Run(groupContext) }))
