@@ -148,7 +148,8 @@ func ask(helper *assistant.Assistant) gin.HandlerFunc {
 			writeError(ginContext, livewire.Invalid(map[string]string{"question": "required, at most 4000 characters"}))
 			return
 		}
-		answer, err := helper.Ask(ginContext.Request.Context(), asked.Question)
+		// the wide event's request id, so the assistant's writes join this request's log line
+		answer, err := helper.Ask(ginContext.Request.Context(), ginContext.Writer.Header().Get(wideeventginadapter.RequestIDHeader), asked.Question)
 		if err != nil {
 			if we := wideevent.FromContext(ginContext.Request.Context()); we != nil {
 				we.Err("assistant.error", err) // the run's failure; the client gets the closed code only

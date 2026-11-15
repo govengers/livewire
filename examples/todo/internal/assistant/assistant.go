@@ -50,9 +50,14 @@ func New(options *Options) (*Assistant, error) {
 }
 
 // Ask runs one conversation of the question as the identity in ctx and answers the reply.
-func (a *Assistant) Ask(ctx context.Context, question string) (string, error) {
+// requestID names the conversation, so its writes carry it as their request id in the audit
+// and the history (aikidoadapter); "" makes a new one.
+func (a *Assistant) Ask(ctx context.Context, requestID, question string) (string, error) {
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
 	session, err := agent.NewLocalSession(&agent.SessionOptions{
-		ID: uuid.NewString(), Client: a.options.Client, Model: a.options.Model, Tools: a.tools,
+		ID: requestID, Client: a.options.Client, Model: a.options.Model, Tools: a.tools,
 		SystemPrompt: systemPrompt, MaximumTurns: maximumTurns,
 	})
 	if err != nil {

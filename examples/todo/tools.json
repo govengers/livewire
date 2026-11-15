@@ -638,10 +638,6 @@
             ],
             "description": "An inline filter document; registered as a stored filter on subscribe (D13)."
           },
-          "filterId": {
-            "description": "A stored filter's id; excludes filter.",
-            "type": "string"
-          },
           "limit": {
             "description": "Clamped to the resource's MaximumLimit (D14).",
             "minimum": 0,
@@ -1494,10 +1490,6 @@
               }
             ],
             "description": "An inline filter document; registered as a stored filter on subscribe (D13)."
-          },
-          "filterId": {
-            "description": "A stored filter's id; excludes filter.",
-            "type": "string"
           },
           "limit": {
             "description": "Clamped to the resource's MaximumLimit (D14).",
@@ -2390,10 +2382,6 @@
             ],
             "description": "An inline filter document; registered as a stored filter on subscribe (D13)."
           },
-          "filterId": {
-            "description": "A stored filter's id; excludes filter.",
-            "type": "string"
-          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -3271,7 +3259,7 @@
             "type": "string"
           },
           "contentEncoding": {
-            "description": "How content is written; text by default.",
+            "description": "How content is written; required, since a file of a type that is not text/* travels in base64.",
             "enum": [
               "text",
               "base64"
@@ -3295,7 +3283,8 @@
         "required": [
           "id",
           "content",
-          "contentType"
+          "contentType",
+          "contentEncoding"
         ],
         "type": "object"
       },

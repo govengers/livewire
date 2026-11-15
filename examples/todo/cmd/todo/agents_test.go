@@ -12,6 +12,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 
+	"github.com/govengers/livewire/mcpadapter"
+
 	"github.com/govengers/livewire/examples/todo/internal/server"
 )
 
@@ -45,7 +47,12 @@ func (a *testApplication) mcpSession(t *testing.T, username string) *mcp.ClientS
 
 func callText(t *testing.T, session *mcp.ClientSession, name string, arguments map[string]any) string {
 	t.Helper()
-	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: name, Arguments: arguments})
+	return resultText(t, session, &mcp.CallToolParams{Name: name, Arguments: arguments})
+}
+
+func resultText(t *testing.T, session *mcp.ClientSession, call *mcp.CallToolParams) string {
+	t.Helper()
+	result, err := session.CallTool(t.Context(), call)
 	require.NoError(t, err)
 	require.Len(t, result.Content, 1)
 	text := result.Content[0].(*mcp.TextContent).Text
@@ -83,8 +90,14 @@ func TestAnMCPClientWorksAsTheKeysUserAndIsAuditedAsTheAgent(t *testing.T) {
 	require.Contains(t, names, "getTodos")
 	require.Contains(t, names, "createTodo")
 	require.NotContains(t, names, "createKey", "no agent mints keys")
+	require.NotContains(t, names, "getTodosPresence", "no agent reads presence")
 
-	created := callText(t, alice, "createTodo", map[string]any{"body": map[string]any{"title": "over mcp", "priority": "high"}})
+	create := &mcp.CallToolParams{
+		Name: "createTodo", Arguments: map[string]any{"body": map[string]any{"title": "over mcp", "priority": "high"}},
+		Meta: mcp.Meta{mcpadapter.MetaIdempotencyKey: "019a0000-0000-7000-8000-0000000000aa"},
+	}
+	created := resultText(t, alice, create)
+	require.Equal(t, created, resultText(t, alice, create), "a retry with the same key answers the recorded response")
 	var todo struct {
 		ID string `json:"id"`
 	}
@@ -93,7 +106,7 @@ func TestAnMCPClientWorksAsTheKeysUserAndIsAuditedAsTheAgent(t *testing.T) {
 	require.NotContains(t, callText(t, bob, "getTodos", nil), "over mcp", "another workspace never sees it")
 
 	actors := application.actors(t, "createTodo")
-	require.Len(t, actors, 1)
+	require.Len(t, actors, 1, "the retry wrote nothing")
 	require.True(t, strings.HasPrefix(actors[0][0], "apikey:"), actors[0][0])
 	require.Equal(t, "agent:mcp", actors[0][1])
 	var historyActor string
@@ -128,6 +141,7 @@ func TestTheAssistantRunsTheToolsAsTheAskingUser(t *testing.T) {
 		options.Assistant, options.AssistantModel = model, "stub/model"
 	})
 	key := application.apiKey(t, "alice")
+	var requestID string
 	ask := func(body string) (int, map[string]any) {
 		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, application.server.URL+server.AssistantPath, bytes.NewReader([]byte(body)))
 		require.NoError(t, err)
@@ -136,6 +150,7 @@ func TestTheAssistantRunsTheToolsAsTheAskingUser(t *testing.T) {
 		response, err := application.server.Client().Do(request)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, response.Body.Close()) }()
+		requestID = response.Header.Get("X-Request-ID")
 		var answer map[string]any
 		require.NoError(t, json.NewDecoder(response.Body).Decode(&answer))
 		return response.StatusCode, answer
@@ -147,6 +162,9 @@ func TestTheAssistantRunsTheToolsAsTheAskingUser(t *testing.T) {
 	actors := application.actors(t, "createTodo")
 	require.Len(t, actors, 1)
 	require.Equal(t, "agent:assistant", actors[0][1])
+	var audited string
+	require.NoError(t, application.pool.QueryRow(t.Context(), "SELECT request_id FROM livewire_audit WHERE mutation = 'createTodo'").Scan(&audited))
+	require.Equal(t, requestID, audited, "the assistant's write joins the request that asked")
 	for _, actor := range application.actors(t, "createKey") {
 		require.NotEqual(t, "agent:assistant", actor[1], "the excluded tool never ran")
 	}

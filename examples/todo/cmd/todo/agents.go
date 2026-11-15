@@ -16,6 +16,10 @@ import (
 // conversation that allowed it.
 var agentExcluded = []string{"createKey"}
 
+// agentExcludedReads are the read kinds no agent gets: who else has a todo open is the UI's
+// business, and every tool costs the model context.
+var agentExcludedReads = []livewire.ReadKind{livewire.ReadPresence}
+
 // agents are the agent entry points the options turn on, nil when off.
 type agents struct {
 	mcp       http.Handler
@@ -37,7 +41,7 @@ func newAgents(options *applicationOptions, engine *livewire.Engine) (*agents, e
 		return nil, err
 	}
 	if options.MCP {
-		tools, err := toolset.New(&toolset.Options{Engine: engine, Catalogue: catalogue, Agent: "mcp", Exclude: agentExcluded})
+		tools, err := toolset.New(&toolset.Options{Engine: engine, Catalogue: catalogue, Agent: "mcp", Exclude: agentExcluded, ExcludeReads: agentExcludedReads})
 		if err != nil {
 			return nil, err
 		}
@@ -46,7 +50,7 @@ func newAgents(options *applicationOptions, engine *livewire.Engine) (*agents, e
 		}
 	}
 	if options.Assistant != nil {
-		tools, err := toolset.New(&toolset.Options{Engine: engine, Catalogue: catalogue, Agent: "assistant", Exclude: agentExcluded})
+		tools, err := toolset.New(&toolset.Options{Engine: engine, Catalogue: catalogue, Agent: "assistant", Exclude: agentExcluded, ExcludeReads: agentExcludedReads})
 		if err != nil {
 			return nil, err
 		}
