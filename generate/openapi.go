@@ -41,19 +41,7 @@ type openAPI struct {
 // renderOpenAPI writes the OpenAPI 3.0.3 document (D26: nullable, never anyOf null) of every
 // route the REST adapter mounts, as JSON under a YAML comment header.
 func renderOpenAPI(api *model, options OpenAPIOptions) ([]byte, error) {
-	document := &openAPI{model: api, schemas: object{}, wrappers: map[string]bool{}}
-	for _, named := range api.types.ordered {
-		document.schemas[named.name] = document.schema(named.definition)
-	}
-	document.schemas[relativeTimeName] = object{
-		"type": "object", "required": []string{"relative"}, "additionalProperties": false,
-		"properties": object{"relative": object{"type": "string", "pattern": relativePattern}},
-	}
-	for _, resource := range slices.Concat(api.resources, []*resourceModel{api.history}) {
-		if resource != nil {
-			document.filterSchemas(resource)
-		}
-	}
+	document := newOpenAPI(api)
 	paths, err := document.paths()
 	if err != nil {
 		return nil, err
@@ -92,6 +80,26 @@ func renderOpenAPI(api *model, options OpenAPIOptions) ([]byte, error) {
 		return nil, fmt.Errorf("generate: the OpenAPI document: %w", err)
 	}
 	return append([]byte("# "+header+"\n"), append(encoded, '\n')...), nil
+}
+
+// newOpenAPI starts a document with the components every operation refers to: the named
+// types, the relative time and the filter documents of every filterable read. The tool
+// catalogue (D82) derives its JSON Schemas from the same components.
+func newOpenAPI(api *model) *openAPI {
+	document := &openAPI{model: api, schemas: object{}, wrappers: map[string]bool{}}
+	for _, named := range api.types.ordered {
+		document.schemas[named.name] = document.schema(named.definition)
+	}
+	document.schemas[relativeTimeName] = object{
+		"type": "object", "required": []string{"relative"}, "additionalProperties": false,
+		"properties": object{"relative": object{"type": "string", "pattern": relativePattern}},
+	}
+	for _, resource := range slices.Concat(api.resources, []*resourceModel{api.history}) {
+		if resource != nil {
+			document.filterSchemas(resource)
+		}
+	}
+	return document
 }
 
 func info(options OpenAPIOptions) object {
@@ -402,12 +410,18 @@ func (o *openAPI) readOperation(read *readModel) object {
 		websocket["presence"] = object{"target": read.declaration, "ops": []string{string(livewire.OperationJoin), string(livewire.OperationLeave)}}
 	}
 	responses := object{"200": object{"description": "The " + describeRead(read) + ".", "content": jsonContent(o.schema(read.data))}}
-	return object{
+	return described(object{
 		"operationId": read.functionName(), "tags": []string{read.declaration},
 		"parameters":      o.parameters(read.parameters, read.reserved),
 		"responses":       errorResponses(responses, http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusInternalServerError),
 		websocketExtended: websocket,
-	}
+	}, read.description)
+}
+
+// described sets an operation's description to the declaration's (D82), when it has one.
+func described(operation object, description string) object {
+	setText(operation, "description", description)
+	return operation
 }
 
 func describeRead(read *readModel) string {
@@ -492,7 +506,7 @@ func (o *openAPI) mutationOperation(mutation *mutationModel) object {
 	if mutation.effect.Kind != "" {
 		operation["x-livewire-effect"] = object{"kind": string(mutation.effect.Kind), "target": mutation.effect.Target}
 	}
-	return operation
+	return described(operation, mutation.description)
 }
 
 func (o *openAPI) uploadOperation(upload *uploadModel) object {
@@ -507,7 +521,7 @@ func (o *openAPI) uploadOperation(upload *uploadModel) object {
 	}
 	return object{
 		"operationId": upload.name, "tags": []string{upload.name},
-		"description": "At most " + strconv.FormatInt(upload.maximumBytes, 10) + " bytes (D17).",
+		"description": strings.TrimSpace(upload.description + " At most " + strconv.FormatInt(upload.maximumBytes, 10) + " bytes (D17)."),
 		"parameters":  append(o.parameters(upload.parameters, reservedModel{}), idempotencyParameter()),
 		"requestBody": object{"required": true, "content": content},
 		"responses": errorResponses(object{strconv.Itoa(upload.status): object{"description": "The upload's answer.", "content": jsonContent(o.schema(upload.response))}},

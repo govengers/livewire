@@ -17,7 +17,9 @@ import (
 // 3.0.3 document ("" writes none), a YAML file whose content is JSON under the generated
 // header (YAML reads JSON, and a JSON file could not carry the header), so it must not end in
 // ".json". GoClient configures the Go client package and CommandLine the command-line client
-// (each written only with its Directory). At least one output is required. OpenAPI describes
+// (each written only with its Directory). CatalogueFile is the path of the tool catalogue
+// (D82) as JSON, NewCatalogue's tools under the generated header as their "$comment" ("" writes
+// none), which a test keeps current like the clients. At least one output is required. OpenAPI describes
 // the document and is required with OpenAPIFile.
 //
 // Enums names the values of named string types: reflection cannot list a Go type's
@@ -33,6 +35,7 @@ type Options struct {
 	OpenAPI             OpenAPIOptions
 	GoClient            GoClientOptions
 	CommandLine         CommandLineOptions
+	CatalogueFile       string
 	Enums               []Enum
 	Presence            bool
 }
@@ -210,6 +213,13 @@ func render(registry *livewire.Registry, options Options) ([]file, error) {
 		}
 		files = append(files, file{path: options.OpenAPIFile, content: document})
 	}
+	if options.CatalogueFile != "" {
+		catalogue, err := renderCatalogue(model)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, file{path: options.CatalogueFile, content: catalogue})
+	}
 	return files, nil
 }
 
@@ -222,8 +232,8 @@ func resolveOptions(options *Options) (Options, error) {
 	resolved.OpenAPI.Servers = slices.Clone(options.OpenAPI.Servers)
 	resolved.OpenAPI.SecuritySchemes = slices.Clone(options.OpenAPI.SecuritySchemes)
 	switch {
-	case resolved.TypeScriptDirectory == "" && resolved.OpenAPIFile == "" && resolved.GoClient.Directory == "" && resolved.CommandLine.Directory == "":
-		return Options{}, errors.New("generate: Options needs a TypeScriptDirectory, an OpenAPIFile, a GoClient.Directory or a CommandLine.Directory")
+	case resolved.TypeScriptDirectory == "" && resolved.OpenAPIFile == "" && resolved.GoClient.Directory == "" && resolved.CommandLine.Directory == "" && resolved.CatalogueFile == "":
+		return Options{}, errors.New("generate: Options needs a TypeScriptDirectory, an OpenAPIFile, a GoClient.Directory, a CommandLine.Directory or a CatalogueFile")
 	case strings.HasSuffix(strings.ToLower(resolved.OpenAPIFile), ".json"):
 		return Options{}, fmt.Errorf("generate: OpenAPIFile %q: the document is YAML under a header comment; name it .yaml", resolved.OpenAPIFile)
 	}
