@@ -24,6 +24,7 @@ import {
   itemID,
   wireParameters,
   type ApiError,
+  type ListQuery,
   type ListResponse,
   type LiveConnection,
   type LivePair,
@@ -259,6 +260,10 @@ function liveRead<Parameters extends object, Data>(
     const live = connection.value
     if (subscribedOn !== undefined && subscribedOn !== live) forget()
     subscribedOn = live
+    // Another identity ends the connection here, after the old subscription left it, so no end
+    // callback drops the data: an ended connection shows nothing (D66, D83).
+    live.checkIdentity()
+    if (live.ended) forget()
     const wire = wireParameters(current())
     if (storage !== undefined && live.ended) removeSnapshots(storage, live.identity())
     else if (storage !== undefined) {
@@ -310,15 +315,6 @@ function liveRead<Parameters extends object, Data>(
   }
 }
 
-/** The reserved parameters of a filterable list read the list state drives. */
-interface ListQuery {
-  filter?: unknown
-  sort?: readonly string[]
-  limit?: number
-  offset?: number
-  after?: string
-}
-
 export interface UseLiveListOptions<Query extends ListQuery> {
   /** The connection to use, or a ref or getter the list follows; the provided pair's by default. */
   connection?: MaybeRefOrGetter<LiveConnection>
@@ -331,22 +327,36 @@ export interface UseLiveListOptions<Query extends ListQuery> {
   /** offset (default): one page at a time, `page` moves it; cursor: pages tiled with loadMore() (D38). */
   mode?: 'offset' | 'cursor'
   /** The read's other parameters, if any. */
-  parameters?: MaybeRefOrGetter<Omit<Query, keyof ListQuery | 'filterId'>>
+  parameters?: MaybeRefOrGetter<Omit<Query, keyof ListQuery>>
 }
 
 export interface LiveList<Query extends ListQuery, Item> {
+  /**
+   * The rows, in cursor mode every loaded page's. While a changed query (filter, sort, limit,
+   * page, parameters) loads, the rows of the query before stay, stale, until its first page
+   * arrives (D76); a new connection drops them.
+   */
   items: ComputedRef<Item[]>
-  /** The total under scope and filter (at most CountCap + 1 under a cap, D14). */
+  /** The total under scope and filter (at most CountCap + 1 under a cap, D14); the one before while a changed query loads (D76). */
   total: ComputedRef<number | undefined>
   /** The refusal that ended a page, or the failed read of a page's next cursor (D64); retry() starts both again. */
   error: ComputedRef<ApiError | NetworkError | undefined>
+  /** The rows are not the current query's yet: a page still loads (the rows before shown meanwhile, D76), or the socket is not open. */
   stale: ComputedRef<boolean>
+  /**
+   * No rows yet and no error: the first load, the first after a new connection, and an ended
+   * connection (connection.end()), which never answers; a view tells the end apart by useLiveStatus.
+   */
   loading: ComputedRef<boolean>
   pending: ComputedRef<readonly string[]>
   filter: Ref<Query['filter']>
   sort: Ref<Query['sort']>
   limit: Ref<number | undefined>
-  /** The page in offset mode, from 1; a filter or sort change goes back to 1. */
+  /**
+   * The page in offset mode, from 1; a filter or sort change goes back to 1, a new limit alone to
+   * the page holding the row last paged to (D77, D82), a page set together with a limit is taken as set,
+   * unless it equals the current page: that is seen as a limit alone.
+   */
   page: Ref<number>
   /** The pages in offset mode, undefined before the first push or without a limit. */
   pages: ComputedRef<number | undefined>
@@ -378,8 +388,9 @@ interface Tile<Item> {
  * snapshot of a tile carries its `next`, which is taken and outdates any read of the page on its
  * way; when a diff changes its rows or its last row (a sort value moved), the page is read again
  * for its current `next`, the newest read wins, and the tile below follows it, so no row falls
- * between two tiles. A new connection (a new pair) starts over; the connection's end drops the
- * pages.
+ * between two tiles. A changed query keeps the rows and total before, stale, until its first
+ * page arrives, as useLive keeps its data (D76). A new connection (a new pair) starts over with
+ * nothing shown; the connection's end drops the pages.
  */
 export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Query, ListResponse<Item>>, options: UseLiveListOptions<Query> = {}): LiveList<Query, Item> {
   const connection = useLiveConnection(options.connection)
@@ -388,6 +399,8 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
   const limit = ref(options.limit)
   const page = ref(1)
   const tiles = shallowRef<Tile<Item>[]>([])
+  // The rows and total shown before a changed query, until its first page arrives (D76).
+  const held = shallowRef<{ items: Item[]; total: number | undefined }>()
   const open = ref(false)
   const cursor = options.mode === 'cursor'
   let disposed = false
@@ -396,10 +409,17 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
   // that limit; a new limit forgets it.
   const appliedLimit = ref<number>()
   const pageSize = (): number | undefined => appliedLimit.value ?? limit.value
-  const queryOf = (after: string | undefined): Query => {
+  // The query without its page: the parameters, the filter and a sort that is not empty.
+  const baseQuery = (): Record<string, unknown> => {
     const query: Record<string, unknown> = { ...(toValue(options.parameters) ?? {}) }
     if (filter.value !== undefined) query['filter'] = filter.value
     if (sort.value !== undefined && sort.value.length > 0) query['sort'] = sort.value
+    return query
+  }
+  // Two queries are one when their wire forms are: an empty sort is none, as are empty parameters (D77).
+  const queryKey = (): string => JSON.stringify(Object.entries(wireParameters(baseQuery())).sort())
+  const queryOf = (after: string | undefined): Query => {
+    const query = baseQuery()
     if (limit.value !== undefined) query['limit'] = limit.value
     if (cursor) {
       if (after !== undefined) query['after'] = after
@@ -420,6 +440,7 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
         if (disposed || tiles.value[position] !== tile) return
         const before = tile.data.value
         tile.data.value = state.data
+        if (position === 0) held.value = undefined
         tile.pending.value = state.pending
         tile.error.value = undefined
         tile.received.value = true
@@ -478,34 +499,11 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     )
   }
 
-  const stopTiles = (): void => {
-    const stopped = tiles.value
-    tiles.value = []
-    for (const tile of stopped) tile.subscription?.unsubscribe()
-  }
-  const restart = (): void => {
-    stopTiles()
-    tiles.value = [startTile(undefined, 0)]
-  }
-  watch(limit, () => {
-    appliedLimit.value = undefined
-  })
-  // A new connection starts over too.
-  watch(() => [connection.value, JSON.stringify([toValue(options.parameters), filter.value, sort.value, limit.value])], () => {
-    if (page.value !== 1 && !cursor) page.value = 1 // the page watcher restarts
-    else restart()
-  })
-  watch(page, restart, { immediate: true })
-  const stopStatus = followStatus(connection, (status) => {
-    open.value = status === 'open'
-  })
-  onScopeDispose(() => {
-    disposed = true
-    stopTiles()
-    stopStatus()
-  })
-
+  const first = computed(() => tiles.value[0])
+  // What the list shows of the query before: only while the first page of the current one is missing.
+  const before = computed(() => (first.value?.data.value === undefined ? held.value : undefined))
   const items = computed(() => {
+    if (before.value !== undefined) return before.value.items
     const seen = new Set<string>()
     const merged: Item[] = []
     for (const tile of tiles.value) {
@@ -519,7 +517,62 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     }
     return merged
   })
-  const first = computed(() => tiles.value[0])
+  const total = computed(() => (before.value === undefined ? first.value?.data.value?.total : before.value.total))
+
+  const stopTiles = (): void => {
+    const stopped = tiles.value
+    tiles.value = []
+    for (const tile of stopped) tile.subscription?.unsubscribe()
+  }
+  // A changed query keeps what the list shows until its first page arrives (D76); a new
+  // connection shows nothing of the one before, and neither does an ended one (D66, D83): the subscribe
+  // can find another identity and end the connection after the old tiles left it, so no tile's
+  // end runs then, and the rows are dropped after it.
+  let startedOn: LiveConnection | undefined
+  let startedKey: string | undefined
+  const restart = (live: LiveConnection, key: string): void => {
+    const shown = first.value?.data.value !== undefined || held.value !== undefined
+    const kept = shown && startedOn === live ? { items: items.value, total: total.value } : undefined
+    startedOn = live
+    startedKey = key
+    stopTiles()
+    tiles.value = [startTile(undefined, 0)]
+    held.value = live.ended ? undefined : kept
+  }
+  // The offset of the row the reader paged to (D82): a page set moves it, a new page size alone
+  // keeps it, so sizes changed back and forth return to it, answered or not.
+  let anchor = 0
+  // One watcher over everything that changes the subscription, so a limit and a page set in one
+  // tick are seen together (D82): a filter, sort, parameters or connection change goes back to
+  // page 1, as does every change in cursor mode; a new page size alone goes to the page holding
+  // the anchor (D77); a page set, with or without a new size, is taken as set. shortcut: a page set
+  // to the value it has is not seen and counts as a limit alone; record page writes if that matters.
+  watch([connection, queryKey, limit, page], ([live, query, size, at], [liveBefore, queryBefore, sizeBefore, atBefore]) => {
+    const key = JSON.stringify([query, size, at])
+    if (live === startedOn && key === startedKey) return // the page this watcher set itself, or a change back within a tick
+    if (size !== sizeBefore) appliedLimit.value = undefined
+    let targetPage = at
+    if (cursor || live !== liveBefore || query !== queryBefore) {
+      targetPage = 1
+      anchor = 0
+    } else if (size !== sizeBefore && at === atBefore) {
+      targetPage = pageHolding(anchor, pageSize())
+    } else {
+      anchor = (at - 1) * (pageSize() ?? 0)
+    }
+    page.value = targetPage
+    restart(live, JSON.stringify([query, size, targetPage]))
+  }, { immediate: true })
+  const stopStatus = followStatus(connection, (status) => {
+    open.value = status === 'open'
+    if (status === 'ended') held.value = undefined
+  })
+  onScopeDispose(() => {
+    disposed = true
+    stopTiles()
+    stopStatus()
+  })
+
   const error = computed(() => {
     for (const tile of tiles.value) {
       const failure = tile.error.value ?? tile.refreshError.value
@@ -528,10 +581,9 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
     return undefined
   })
   const stale = computed(() => !open.value || tiles.value.some((tile) => !tile.received.value))
-  const total = computed(() => first.value?.data.value?.total)
   return {
     items, total, error, stale, filter, sort, limit, page,
-    loading: computed(() => error.value === undefined && first.value?.data.value === undefined),
+    loading: computed(() => error.value === undefined && first.value?.data.value === undefined && before.value === undefined),
     pending: computed(() => tiles.value.flatMap((tile) => tile.pending.value)),
     pages: computed(() => {
       const size = pageSize()
@@ -555,6 +607,12 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
       })
     },
   }
+}
+
+/** The page of `size` rows that holds the row at `offset` (D77, D82); page 1 without a size. */
+function pageHolding(offset: number, size: number | undefined): number {
+  if (size === undefined || size <= 0) return 1
+  return Math.floor(offset / size) + 1
 }
 
 /** Whether a page's boundary moved: its rows changed, or its last row (whose sort values the next cursor holds) did. */

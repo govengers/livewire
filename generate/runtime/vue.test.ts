@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { createApp, effectScope, nextTick, reactive, ref, shallowRef, watch } from 'vue'
+import { computed, createApp, effectScope, nextTick, reactive, ref, shallowRef, watch } from 'vue'
 import { FakeClock, fakeSockets, settle } from './fakes'
 import { LiveConnection, createLivePair, liveRead, mutation, type ListResponse, type LivePair, type PresenceItem } from './runtime'
 import { livePairKey, livePlugin, useLive, useLiveConnection, useLiveList, useLivePair, useLivePresence, useLiveStatus, type SnapshotStorage } from './vue'
@@ -254,6 +254,39 @@ describe('useLiveList', () => {
     typeOnly.stop()
   })
 
+  test('a changed query keeps the rows and total before, stale, until its first page arrives (D76)', async () => {
+    const { connection, current } = connect()
+    const followed = shallowRef(connection)
+    const live = effectScope().run(() => useLiveList(parts, { connection: followed, limit: 2 }))!
+    const shown = () => [live.items.value.map((item) => item.id), live.total.value, live.pages.value, live.stale.value, live.loading.value]
+    expect(shown()).toEqual([[], undefined, undefined, true, true])
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], { total: 5 }) })
+    live.page.value = 2
+    await nextTick()
+    expect(shown()).toEqual([['a', 'b'], 5, 3, true, false])
+    live.filter.value = { search: 'x' }
+    await nextTick()
+    await nextTick()
+    expect([live.page.value, ...shown()]).toEqual([1, ['a', 'b'], 5, 3, true, false])
+    current().answer('subscribe', { subscription: 's3' })
+    current().receive({ sub: 's3', seq: 1, kind: 'snapshot', payload: list([{ id: 'c', name: 'C' }], { total: 1 }) })
+    expect(shown()).toEqual([['c'], 1, 1, false, false])
+
+    // A refused query keeps the rows before beside its error, as useLive keeps its data.
+    live.sort.value = ['secret']
+    await nextTick()
+    current().answer('subscribe', { subscription: 's4' })
+    current().receive({ sub: 's4', seq: 1, kind: 'error', payload: { code: 'forbidden_field', message: 'no' } })
+    expect([live.error.value?.message, ...shown()]).toEqual(['no', ['c'], 1, 1, true, false])
+
+    // Another connection shows nothing of the one before (D66).
+    followed.value = connect('password:bob').connection
+    await nextTick()
+    expect(shown()).toEqual([[], undefined, undefined, true, true])
+  })
+
   test('an error of a page is the list\'s, and retry subscribes again', () => {
     const { connection, current } = connect()
     const live = effectScope().run(() => useLiveList(parts, { connection, parameters: { board: 'x' } }))!
@@ -382,6 +415,22 @@ describe('useLiveList', () => {
   })
 })
 
+describe('descriptors in reactive state (D80)', () => {
+  test('a list and a mutation held in a deep reactive object work as given', async () => {
+    const { connection, current } = connect()
+    const page = reactive({ target: parts, remove: deletePart })
+    const live = effectScope().run(() => useLiveList(page.target, { connection }))!
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }]) })
+    const call = connection.call(page.remove, { id: 'a' }, undefined)
+    expect([live.items.value.map((item) => item.id), live.pending.value]).toEqual([['b'], ['a']])
+    current().answer('call', { status: 204 })
+    await call
+    expect(live.pending.value).toEqual([])
+  })
+})
+
 describe('useLivePresence', () => {
   test('joins with the state, joins again on a change, moves records and leaves with its scope (D37)', async () => {
     const { connection, current } = connect()
@@ -499,7 +548,38 @@ describe('useLiveList limits and cursors', () => {
     expect(current().last('subscribe').params).toEqual({ limit: '500', offset: '100' })
     live.limit.value = 50
     await nextTick()
-    expect(live.page.value).toBe(1)
+    await nextTick()
+    expect([live.page.value, current().last('subscribe').params]).toEqual([3, { limit: '50', offset: '100' }])
+  })
+
+  test('a new page size goes to the page holding the first row shown; a filter change to page 1 (D77)', async () => {
+    const { connection, current } = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection, limit: 10 }))!
+    current().open()
+    const answer = (limit: number) => {
+      const subscription = `s${subscribes(current().sent)}`
+      current().answer('subscribe', { subscription })
+      current().receive({ sub: subscription, seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }], { limit, total: 100 }) })
+    }
+    const moved = async (change: () => void) => {
+      change()
+      await nextTick()
+      await nextTick()
+      return [live.page.value, current().last('subscribe').params]
+    }
+    answer(10)
+    expect(await moved(() => (live.page.value = 3))).toEqual([3, { limit: '10', offset: '20' }])
+    answer(10)
+    expect(await moved(() => (live.limit.value = 25))).toEqual([1, { limit: '25' }])
+    answer(25)
+    expect(await moved(() => (live.page.value = 3))).toEqual([3, { limit: '25', offset: '50' }])
+    answer(25)
+    expect(await moved(() => (live.limit.value = 10))).toEqual([6, { limit: '10', offset: '50' }])
+    expect(await moved(() => (live.filter.value = { search: 'x' }))).toEqual([1, { filter: '{"search":"x"}', limit: '10' }])
+    const sent = subscribes(current().sent)
+    live.filter.value = { search: 'x' } // an equal document is no change
+    await nextTick()
+    expect(subscribes(current().sent)).toBe(sent)
   })
 
   test('a read of a tile\'s next started before a snapshot cannot override the snapshot\'s next (D64)', async () => {
@@ -648,5 +728,199 @@ describe('snapshot ownership and the end, last round (D66)', () => {
     identity = 'password:bob'
     await pair.client.read(dashboard, { board: 'a' }).catch(() => {})
     expect([pair.connection.ended, view.data.value]).toEqual([true, undefined])
+  })
+})
+
+describe('the rows before and the page across a changed query (D76, D77, D82, D83)', () => {
+  /** An offset list of parts at limit 2 with the snapshot [a] (total 1) of alice on screen. */
+  function shownList(options: { limit?: number } = {}) {
+    const connected = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection: connected.connection, limit: options.limit ?? 2 }))!
+    connected.current().open()
+    connected.current().answer('subscribe', { subscription: 's1' })
+    connected.current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }]) })
+    const shown = () => [connected.connection.ended, live.error.value?.name, live.items.value.map((item) => item.id), live.total.value]
+    return { ...connected, live, shown }
+  }
+
+  const changes: [string, (live: ReturnType<typeof shownList>['live']) => void][] = [
+    ['filter', (live) => (live.filter.value = { search: 'x' })],
+    ['sort', (live) => (live.sort.value = ['name'])],
+    ['limit', (live) => (live.limit.value = 5)],
+    ['page', (live) => (live.page.value = 2)],
+  ]
+  for (const [name, change] of changes) {
+    test(`a ${name} change that finds another identity drops the rows before at once`, async () => {
+      const { live, user, shown } = shownList()
+      user.value = 'password:bob'
+      change(live)
+      await nextTick()
+      expect(shown()).toEqual([true, 'EndedError', [], undefined])
+      expect(live.loading.value).toBe(false)
+    })
+  }
+
+  test('useLive: a parameter change that finds another identity drops the data at once', async () => {
+    const { connection, current, user } = connect()
+    const board = ref('a')
+    const view = effectScope().run(() => useLive(dashboard, () => ({ board: board.value }), { connection }))!
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'replace', payload: { title: 'of alice' } })
+    user.value = 'password:bob'
+    board.value = 'b'
+    await nextTick()
+    expect([connection.ended, view.error.value?.name, view.data.value, view.stale.value]).toEqual([true, 'EndedError', undefined, true])
+  })
+
+  test('the end of the connection drops the rows a changed query kept', async () => {
+    const { connection, live, shown } = shownList()
+    live.filter.value = { search: 'x' }
+    await nextTick()
+    expect(shown()).toEqual([false, undefined, ['a'], 1])
+    connection.end()
+    expect(shown()).toEqual([true, undefined, [], undefined])
+    expect(live.loading.value).toBe(true)
+  })
+
+  test('the first page of a changed query replaces the rows and total before, a missing total included', async () => {
+    const { current, live, shown } = shownList()
+    live.filter.value = { search: 'x' }
+    await nextTick()
+    current().answer('subscribe', { subscription: 's2' })
+    const { total: _, ...withoutTotal } = list([{ id: 'c', name: 'C' }])
+    current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: withoutTotal })
+    expect(shown()).toEqual([false, undefined, ['c'], undefined])
+  })
+
+  test('cursor mode keeps every loaded tile\'s rows until the first page of a changed query arrives', async () => {
+    const connected = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection: connected.connection, mode: 'cursor', limit: 2 }))!
+    const { current } = connected
+    current().open()
+    current().answer('subscribe', { subscription: 't1' })
+    current().receive({ sub: 't1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], { next: 'after-b', total: 4 }) })
+    live.loadMore()
+    current().answer('subscribe', { subscription: 't2' })
+    current().receive({ sub: 't2', seq: 1, kind: 'snapshot', payload: list([{ id: 'c', name: 'C' }, { id: 'd', name: 'D' }], { next: 'after-d' }) })
+    live.filter.value = { search: 'x' }
+    await nextTick()
+    expect([live.items.value.map((item) => item.id), live.total.value, live.stale.value]).toEqual([['a', 'b', 'c', 'd'], 4, true])
+    current().answer('subscribe', { subscription: 't3' })
+    current().receive({ sub: 't3', seq: 1, kind: 'snapshot', payload: list([{ id: 'x', name: 'X' }], { total: 1 }) })
+    expect([live.items.value.map((item) => item.id), live.total.value]).toEqual([['x'], 1])
+  })
+
+  /** An offset list at a limit with a snapshot of 100 rows, and a way to change it and read the subscribe that went out. */
+  function paged(limit: number) {
+    const connected = connect()
+    const live = effectScope().run(() => useLiveList(parts, { connection: connected.connection, limit }))!
+    const { current } = connected
+    current().open()
+    const answer = (size: number) => {
+      const subscription = `s${subscribes(current().sent)}`
+      current().answer('subscribe', { subscription })
+      current().receive({ sub: subscription, seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }], { limit: size, total: 100 }) })
+    }
+    const moved = async (change: () => void) => {
+      const sent = subscribes(current().sent)
+      change()
+      await nextTick()
+      await nextTick()
+      return [live.page.value, current().last('subscribe').params, subscribes(current().sent) - sent]
+    }
+    answer(limit)
+    return { live, answer, moved }
+  }
+
+  test('a limit and a page set in one tick take the page as set', async () => {
+    const fifty = paged(50)
+    expect(await fifty.moved(() => (fifty.live.page.value = 2))).toEqual([2, { limit: '50', offset: '50' }, 1])
+    fifty.answer(50)
+    expect(await fifty.moved(() => {
+      fifty.live.limit.value = 25
+      fifty.live.page.value = 3
+    })).toEqual([3, { limit: '25', offset: '50' }, 1])
+    fifty.answer(25)
+    expect(await fifty.moved(() => {
+      fifty.live.limit.value = 50
+      fifty.live.page.value = 2
+    })).toEqual([2, { limit: '50', offset: '50' }, 1])
+
+    const ten = paged(10)
+    expect(await ten.moved(() => (ten.live.page.value = 2))).toEqual([2, { limit: '10', offset: '10' }, 1])
+    ten.answer(10)
+    expect(await ten.moved(() => {
+      ten.live.limit.value = 20
+      ten.live.page.value = 3
+    })).toEqual([3, { limit: '20', offset: '40' }, 1])
+  })
+
+  test('page sizes changed back before an answer return to the page paged to', async () => {
+    const { live, answer, moved } = paged(10)
+    expect(await moved(() => (live.page.value = 3))).toEqual([3, { limit: '10', offset: '20' }, 1])
+    answer(10)
+    expect(await moved(() => (live.limit.value = 25))).toEqual([1, { limit: '25' }, 1])
+    expect(await moved(() => (live.limit.value = 10))).toEqual([3, { limit: '10', offset: '20' }, 1])
+  })
+
+  test('an empty sort is none, and so are empty parameters: nothing subscribes again', async () => {
+    const connected = connect()
+    const extra = shallowRef<{ board?: string | undefined } | undefined>(undefined)
+    const live = effectScope().run(() => useLiveList(parts, { connection: connected.connection, limit: 10, parameters: () => extra.value as { board?: string } }))!
+    connected.current().open()
+    const sent = subscribes(connected.current().sent)
+    live.sort.value = []
+    extra.value = {}
+    await nextTick()
+    extra.value = { board: undefined }
+    await nextTick()
+    expect(subscribes(connected.current().sent)).toBe(sent)
+    extra.value = { board: 'b' }
+    await nextTick()
+    expect(connected.current().last('subscribe').params).toEqual({ limit: '10', board: 'b' })
+  })
+})
+
+describe('the cursor pager of the wiki (D81)', () => {
+  /** The pager of generate/testdata/typescript/usage.ts (snippet cursor-pager), on the test's parts read. */
+  function useCursorPager(connection: LiveConnection, query: PartsQuery) {
+    const cursors = ref<string[]>([])
+    const page = useLive(parts, () => {
+      const after = cursors.value.at(-1)
+      return after === undefined ? query : { ...query, after }
+    }, { connection })
+    const nextCursor = (): string | undefined => (page.stale.value ? undefined : page.data.value?.next)
+    const next = (): void => {
+      const cursor = nextCursor()
+      if (cursor !== undefined && cursor !== cursors.value.at(-1)) cursors.value = [...cursors.value, cursor]
+    }
+    const previous = (): void => {
+      cursors.value = cursors.value.slice(0, -1)
+    }
+    return { page, next, previous, hasNext: computed(() => nextCursor() !== undefined) }
+  }
+
+  test('next after previous waits for the page before\'s snapshot', async () => {
+    const { connection, current } = connect()
+    const pager = effectScope().run(() => useCursorPager(connection, { limit: 2 }))!
+    current().open()
+    current().answer('subscribe', { subscription: 's1' })
+    current().receive({ sub: 's1', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }], { next: 'c1' }) })
+    pager.next()
+    await nextTick()
+    current().answer('subscribe', { subscription: 's2' })
+    current().receive({ sub: 's2', seq: 1, kind: 'snapshot', payload: list([{ id: 'b', name: 'B' }], { next: 'c2' }) })
+    pager.previous()
+    await nextTick()
+    expect(pager.hasNext.value).toBe(false)
+    pager.next()
+    await nextTick()
+    expect(current().last('subscribe').params).toEqual({ limit: '2' })
+    current().answer('subscribe', { subscription: 's3' })
+    current().receive({ sub: 's3', seq: 1, kind: 'snapshot', payload: list([{ id: 'a', name: 'A' }], { next: 'c1' }) })
+    pager.next()
+    await nextTick()
+    expect(current().last('subscribe').params).toEqual({ limit: '2', after: 'c1' })
   })
 })

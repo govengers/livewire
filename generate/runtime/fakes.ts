@@ -1,5 +1,5 @@
-// Test doubles of the runtime's tests: a WebSocket the test drives frame by frame and a fetch
-// that answers from a queue. Not copied by the generator.
+// Test doubles of the runtime's tests: a WebSocket the test drives frame by frame, a fetch that
+// answers from a queue and an XMLHttpRequest for uploads with progress. Not copied by the generator.
 
 import type { Clock, WebSocketLike } from './runtime'
 
@@ -141,4 +141,80 @@ export class FakeClock implements Clock {
 /** Resolves after the pending promise callbacks ran. */
 export function settle(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/** An XMLHttpRequest the test drives: it records the request and answers when told. */
+export class FakeXMLHttpRequest {
+  method = ''
+  url = ''
+  readonly headers: Record<string, string> = {}
+  withCredentials = false
+  body: unknown
+  aborted = false
+  status = 0
+  statusText = ''
+  responseText = ''
+  readonly upload: { onprogress: ((event: { loaded: number; total: number; lengthComputable: boolean }) => void) | null } = { onprogress: null }
+  onload: (() => void) | null = null
+  onerror: (() => void) | null = null
+  onabort: (() => void) | null = null
+
+  open(method: string, url: string | URL): void {
+    this.method = method
+    this.url = String(url)
+  }
+
+  setRequestHeader(name: string, value: string): void {
+    this.headers[name] = value
+  }
+
+  send(body: unknown): void {
+    this.body = body
+  }
+
+  abort(): void {
+    this.aborted = true
+    this.onabort?.()
+  }
+
+  /** The body went out up to loaded bytes of total; without a total the platform cannot tell. */
+  progress(loaded: number, total?: number): void {
+    this.upload.onprogress?.({ loaded, total: total ?? 0, lengthComputable: total !== undefined })
+  }
+
+  respond(status: number, body = ''): void {
+    this.status = status
+    this.responseText = body
+    this.onload?.()
+  }
+
+  /** No answer came: offline, refused. */
+  fail(): void {
+    this.onerror?.()
+  }
+}
+
+/** Puts a FakeXMLHttpRequest on globalThis until restore(); requests are the ones made, in order. */
+export function fakeXMLHttpRequests(): { requests: FakeXMLHttpRequest[]; current(): FakeXMLHttpRequest; restore(): void } {
+  const requests: FakeXMLHttpRequest[] = []
+  class Request extends FakeXMLHttpRequest {
+    constructor() {
+      super()
+      requests.push(this)
+    }
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'XMLHttpRequest')
+  Object.defineProperty(globalThis, 'XMLHttpRequest', { configurable: true, writable: true, value: Request })
+  return {
+    requests,
+    current: () => {
+      const request = requests.at(-1)
+      if (request === undefined) throw new Error('no XMLHttpRequest was made')
+      return request
+    },
+    restore: () => {
+      if (descriptor === undefined) Reflect.deleteProperty(globalThis, 'XMLHttpRequest')
+      else Object.defineProperty(globalThis, 'XMLHttpRequest', descriptor)
+    },
+  }
 }
