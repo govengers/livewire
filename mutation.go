@@ -71,7 +71,7 @@ func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: 
 // optimistic effect on live lists (D36). The body is validated with `validate` tags
 // (go-playground/validator, D44) after the structural checks; a tag the validator cannot
 // parse, on any struct reachable from Request, is a declaration error. Description says
-// what the mutation does, for people and agents (D82); "" leaves the OpenAPI operation
+// what the mutation does, for people and agents (D85); "" leaves the OpenAPI operation
 // without one and the tool catalogue with a description of its own.
 type MutationOptions[Parameters, Request, Response any] struct {
 	Description string

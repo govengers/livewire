@@ -3,7 +3,7 @@ module github.com/govengers/livewire/mcpadapter
 go 1.26.0
 
 // The adapter builds against the livewire of this checkout; a release requires the livewire
-// version that ships the toolset (D82).
+// version that ships the toolset (D85).
 replace github.com/govengers/livewire => ../
 
 require (

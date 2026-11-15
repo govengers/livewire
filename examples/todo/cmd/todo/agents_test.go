@@ -15,7 +15,7 @@ import (
 	"github.com/govengers/livewire/examples/todo/internal/server"
 )
 
-// The agents on the application as main wires them (D82, D83): an MCP client with a user's API
+// The agents on the application as main wires them (D85, D86): an MCP client with a user's API
 // key, and the in-process assistant on a scripted model, each acting for the user and audited
 // under its own name.
 

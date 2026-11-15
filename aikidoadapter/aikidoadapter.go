@@ -1,4 +1,4 @@
-// Package aikidoadapter registers a livewire toolset (D82, D83) as github.com/govengers/aikido
+// Package aikidoadapter registers a livewire toolset (D85, D86) as github.com/govengers/aikido
 // tools: every tool the toolset selects becomes one aikido tool whose handler runs
 // Toolset.Call in process under the identity in the run's context, so an aikido agent reads
 // and writes through the API's own authorization, scope, column checks, audit and

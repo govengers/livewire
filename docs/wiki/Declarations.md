@@ -18,6 +18,7 @@ A resource is a filterable list. Its reads are the list (`GET Path`), the item (
 <!-- snippet: examples/todo/internal/controller/registry.go#resource -->
 ```go
 return livewire.NewResource("todos", "/todos", &livewire.ResourceOptions[api.TodoItem]{
+    Description:  "The todos of the caller's workspace.",
     Tables:       []string{"todos"},
     Read:         authorization.IsUser(),
     Fields:       c.todos.Fields(),
@@ -112,10 +113,12 @@ func WorkspaceScope(ctx context.Context) (query.Predicate, error) {
 <!-- snippet: examples/todo/internal/controller/registry.go#typed-reads -->
 ```go
 livewire.NewList("activity", "/activity", &livewire.ListOptions[api.ActivityItem, api.ActivityParameters]{
-    Tables: []string{"activity"}, Read: authorization.IsUser(), Load: todos.activity,
+    Description: "The workspace's activity lines, of one todo when todoId is given.",
+    Tables:      []string{"activity"}, Read: authorization.IsUser(), Load: todos.activity,
 }),
 livewire.NewObject("summary", "/summary", &livewire.ObjectOptions[api.SummaryItem, livewire.NoParameters]{
-    Tables: []string{"todos", "attachments"}, Read: authorization.IsUser(), Load: todos.summary,
+    Description: "How many todos of the workspace are open and done, and how many attachments they have.",
+    Tables:      []string{"todos", "attachments"}, Read: authorization.IsUser(), Load: todos.summary,
 }),
 ```
 
@@ -139,15 +142,18 @@ A mutation is a write with a JSON body, on `POST`, `PUT`, `PATCH` or `DELETE`:
 <!-- snippet: examples/todo/internal/controller/registry.go#mutations -->
 ```go
 livewire.NewMutation("createTodo", http.MethodPost, "/todos", &livewire.MutationOptions[livewire.NoParameters, api.CreateTodoRequest, api.TodoItem]{
-    Check: authorization.IsUser(), Status: http.StatusCreated, ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"),
+    Description: "Creates a todo in the caller's workspace.",
+    Check:       authorization.IsUser(), Status: http.StatusCreated, ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"),
     Handle: todos.create,
 }),
 livewire.NewMutation("updateTodo", http.MethodPatch, "/todos/{id}", &livewire.MutationOptions[api.TodoParameters, api.UpdateTodoRequest, api.TodoItem]{
-    Check: authorization.IsUser(), Resource: "todos", Effect: livewire.Upserts("todos"),
+    Description: "Changes the fields of a todo that the body carries; clearDueAt removes the due time.",
+    Check:       authorization.IsUser(), Resource: "todos", Effect: livewire.Upserts("todos"),
     Handle: todos.update,
 }),
 livewire.NewMutation("deleteTodo", http.MethodDelete, "/todos/{id}", &livewire.MutationOptions[api.TodoParameters, livewire.NoBody, livewire.NoContent]{
-    Check: authorization.IsUser(), Effect: livewire.Removes("todos"),
+    Description: "Deletes a todo.",
+    Check:       authorization.IsUser(), Effect: livewire.Removes("todos"),
     Handle: todos.delete,
 }),
 ```
@@ -198,7 +204,8 @@ An upload is a binary write, REST only: a raw body or a multipart part `file`, o
 <!-- snippet: examples/todo/internal/controller/registry.go#upload -->
 ```go
 livewire.NewUpload("uploadAttachment", "/todos/{id}/attachments", &livewire.UploadOptions[api.TodoParameters, api.AttachmentItem]{
-    Check: authorization.IsUser(), Status: http.StatusCreated,
+    Description: "Attaches a file to a todo.",
+    Check:       authorization.IsUser(), Status: http.StatusCreated,
     ContentTypes: []string{"text/plain", "image/png", "application/pdf"}, MaximumBytes: maximumAttachmentBytes,
     Handle: todos.attach,
 }),

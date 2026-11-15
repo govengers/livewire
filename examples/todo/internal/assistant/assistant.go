@@ -1,4 +1,4 @@
-// Package assistant is the example's in-process agent (D82, D83): one govengers/aikido run per
+// Package assistant is the example's in-process agent (D85, D86): one govengers/aikido run per
 // question, whose tools are the API's own, generated from the livewire registry and run under
 // the identity of the request that asked, so the assistant can do exactly what its user can
 // and the audit names it as acting for the user.

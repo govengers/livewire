@@ -13,7 +13,7 @@ import (
 	"github.com/govengers/livewire"
 )
 
-// ToolKind is what a tool of the catalogue runs (D82).
+// ToolKind is what a tool of the catalogue runs (D85).
 type ToolKind string
 
 // The tool kinds.
@@ -23,7 +23,7 @@ const (
 	ToolUpload   ToolKind = "upload"   // an upload: Engine.Upload
 )
 
-// The members of a tool's arguments besides the declaration's parameters (D82): a mutation's
+// The members of a tool's arguments besides the declaration's parameters (D85): a mutation's
 // body under ArgumentBody, an upload's file as ArgumentContent with its ArgumentContentType,
 // written as ArgumentContentEncoding says (ContentText, the default, or ContentBase64).
 // Every other member is a parameter of the declaration, the reserved ones of a filterable
@@ -40,7 +40,7 @@ const (
 // maximumToolNameBytes is the longest tool name every model provider accepts.
 const maximumToolNameBytes = 64
 
-// Tool is one operation of the registry as an agent calls it (D82): its name (the OpenAPI
+// Tool is one operation of the registry as an agent calls it (D85): its name (the OpenAPI
 // operation id), a description, the kind and whether it changes data, what it runs (the
 // declaration, the read kind, the REST method and path), and three JSON Schemas (draft
 // 2020-12, self-contained with $defs): Parameters, the tool's arguments as a model sends
@@ -73,7 +73,7 @@ type CatalogueOptions struct {
 	Presence bool
 }
 
-// Catalogue is every read, mutation and upload of a registry as a tool (D82): the main, item,
+// Catalogue is every read, mutation and upload of a registry as a tool (D85): the main, item,
 // distinct and history reads of a resource, a typed list's and an object's read, the
 // presence reads when the engine serves presence, every mutation and every upload. Exports
 // (a CSV stream), batches and stored filters are not tools. A Catalogue is immutable and safe
@@ -226,7 +226,7 @@ func describeTools(api *model) ([]Tool, error) {
 func refuseArgumentNames(name string, properties object) error {
 	for _, reserved := range []string{ArgumentBody, ArgumentContent, ArgumentContentType, ArgumentContentEncoding} {
 		if _, taken := properties[reserved]; taken {
-			return fmt.Errorf("generate: %s: the parameter %q is the tool argument of the body or file (D82); rename it", name, reserved)
+			return fmt.Errorf("generate: %s: the parameter %q is the tool argument of the body or file (D85); rename it", name, reserved)
 		}
 	}
 	return nil

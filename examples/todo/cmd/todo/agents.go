@@ -24,9 +24,9 @@ type agents struct {
 
 // snippet:begin agents
 
-// newAgents builds the API's tools from the registry (D82) and, as the options ask, the MCP
+// newAgents builds the API's tools from the registry (D85) and, as the options ask, the MCP
 // server for agents outside the process and the in-process assistant; each acts for the
-// identity of its request and is audited under its own name (D83).
+// identity of its request and is audited under its own name (D86).
 func newAgents(options *applicationOptions, engine *livewire.Engine) (*agents, error) {
 	built := &agents{}
 	if !options.MCP && options.Assistant == nil {

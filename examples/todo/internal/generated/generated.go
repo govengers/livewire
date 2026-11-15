@@ -33,7 +33,7 @@ func Options(root string) *generate.Options {
 		},
 		GoClient:      generate.GoClientOptions{Directory: filepath.Join(root, "client", "todoclient"), ImportPath: modulePath + "/client/todoclient"},
 		CommandLine:   generate.CommandLineOptions{Directory: filepath.Join(root, "client", "todocommand"), Name: "todo"},
-		CatalogueFile: filepath.Join(root, "tools.json"), // the agent tools (D82)
+		CatalogueFile: filepath.Join(root, "tools.json"), // the agent tools (D85)
 		Enums:         []generate.Enum{generate.EnumOf(api.Priorities()...)},
 		Presence:      true,
 	}
@@ -41,7 +41,7 @@ func Options(root string) *generate.Options {
 
 // snippet:end options
 
-// CatalogueOptions are the options of the tool catalogue the agents get (D82), the same enums
+// CatalogueOptions are the options of the tool catalogue the agents get (D85), the same enums
 // and presence as the generated clients'.
 func CatalogueOptions() *generate.CatalogueOptions {
 	options := Options(".")

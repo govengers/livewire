@@ -84,7 +84,7 @@ func renderOpenAPI(api *model, options OpenAPIOptions) ([]byte, error) {
 
 // newOpenAPI starts a document with the components every operation refers to: the named
 // types, the relative time and the filter documents of every filterable read. The tool
-// catalogue (D82) derives its JSON Schemas from the same components.
+// catalogue (D85) derives its JSON Schemas from the same components.
 func newOpenAPI(api *model) *openAPI {
 	document := &openAPI{model: api, schemas: object{}, wrappers: map[string]bool{}}
 	for _, named := range api.types.ordered {
@@ -418,7 +418,7 @@ func (o *openAPI) readOperation(read *readModel) object {
 	}, read.description)
 }
 
-// described sets an operation's description to the declaration's (D82), when it has one.
+// described sets an operation's description to the declaration's (D85), when it has one.
 func described(operation object, description string) object {
 	setText(operation, "description", description)
 	return operation

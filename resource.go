@@ -122,7 +122,7 @@ const (
 // repository passes them to postgresadapter.WriteCSV, which writes a text a spreadsheet would
 // run as a formula with a single quote in front (D69). Partition names a subscription's
 // partition (D25); nil means the tenant. Description says what the resource holds, for
-// people and agents (D82).
+// people and agents (D85).
 type ResourceOptions[Item any] struct {
 	Description     string
 	Tables          []string

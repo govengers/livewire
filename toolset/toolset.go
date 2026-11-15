@@ -1,10 +1,10 @@
-// Package toolset runs the tool catalogue of a registry (generate.Catalogue, D82) in process:
+// Package toolset runs the tool catalogue of a registry (generate.Catalogue, D85) in process:
 // an agent's tool call becomes Engine.Read, Engine.Call or Engine.Upload under the identity in
 // the context, so authorization, scope, column checks, audit and idempotency are exactly the
 // API's. A Toolset selects the tools one agent gets (include and exclude lists, read-only
 // mode), asks a confirmation hook before a call that changes data, caps the answer's size and
 // marks every call as the agent's on behalf of the identity, which the audit records as the
-// real actor (D83). Its refusals are *Error values with a closed code, never internal text.
+// real actor (D86). Its refusals are *Error values with a closed code, never internal text.
 //
 // The adapters register a Toolset with an agent framework: aikidoadapter (govengers/aikido
 // tools) and mcpadapter (a Model Context Protocol server), each a module of its own.
@@ -29,14 +29,14 @@ import (
 	"github.com/govengers/livewire/generate"
 )
 
-// AgentProvider is the provider of the identity a Toolset puts behind the caller's (D83): the
+// AgentProvider is the provider of the identity a Toolset puts behind the caller's (D86): the
 // audit's real actor of an agent's call is "agent:<Options.Agent>".
 const AgentProvider = "agent"
 
 // DefaultMaximumResultBytes is the answer size cap when Options.MaximumResultBytes is zero.
 const DefaultMaximumResultBytes = 64 << 10
 
-// Codes of a Toolset's own refusals, beside livewire's closed set (D83).
+// Codes of a Toolset's own refusals, beside livewire's closed set (D86).
 const (
 	// CodeDeclined: the confirmation hook declined a call that changes data; nothing ran.
 	CodeDeclined livewire.Code = "declined"
@@ -135,7 +135,7 @@ func (t *Toolset) Tools() []generate.Tool {
 }
 
 // Call runs the tool of the name with the model's arguments (a JSON object; empty or null is
-// {}) for the identity in ctx, as the agent on its behalf (D83), and answers the REST body: a
+// {}) for the identity in ctx, as the agent on its behalf (D86), and answers the REST body: a
 // read's payload, a mutation's or upload's response (JSON null for none). idempotencyKey is
 // the call's Idempotency-Key (D16), a UUID; "" uses a new UUID v7, so every call is its own
 // write and a caller that retries one call passes the same key. A write runs on a context
@@ -215,7 +215,7 @@ type committedNotice struct {
 	Notice      string `json:"notice"`
 }
 
-// onBehalf marks the identity in ctx as acting through the agent (D83): the identity stays
+// onBehalf marks the identity in ctx as acting through the agent (D86): the identity stays
 // the effective one, so every check, scope and column check is its own, and the agent becomes
 // its Impersonator, the real actor the audit, the history and the Observer record. An
 // impersonation the identity was under stays behind the agent.

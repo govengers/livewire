@@ -26,7 +26,7 @@ type File struct {
 
 // UploadOptions declares a binary write (D17). Check, ContentTypes, MaximumBytes and Handle
 // are required; Status is the success status (default 200). Description says what the
-// upload does, for people and agents (D82).
+// upload does, for people and agents (D85).
 type UploadOptions[Parameters, Response any] struct {
 	Description  string
 	Check        authorization.Check

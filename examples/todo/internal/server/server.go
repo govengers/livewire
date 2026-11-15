@@ -53,7 +53,7 @@ type Options struct {
 	Assistant      *assistant.Assistant
 }
 
-// The routes of the agents (D82).
+// The routes of the agents (D85).
 const (
 	MCPPath       = controller.BasePath + "/mcp"
 	AssistantPath = controller.BasePath + "/assistant"

@@ -16,7 +16,7 @@ import (
 // ListOptions declares a typed-parameters list. Read and Load are required; Guarded names
 // the fields of Item whose Read check strips them (D39); a live list (Tables set) needs an
 // item with a JSON field "id". Partition names a subscription's partition (D25); nil means
-// the tenant. Description says what the list holds, for people and agents (D82).
+// the tenant. Description says what the list holds, for people and agents (D85).
 type ListOptions[Item, Parameters any] struct {
 	Description string
 	Tables      []string
@@ -103,7 +103,7 @@ func (l *List) validate(guarded []GuardedField) error {
 // ObjectOptions declares a typed-parameters object. Read and Load are required; Guarded
 // names the fields of Item whose Read check strips them (D39). Partition names a
 // subscription's partition (D25); nil means the tenant. Description says what the object
-// holds, for people and agents (D82).
+// holds, for people and agents (D85).
 type ObjectOptions[Item, Parameters any] struct {
 	Description string
 	Tables      []string

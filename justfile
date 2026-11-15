@@ -5,7 +5,7 @@ govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 sqlc := "go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1"
 oasdiff := "go run github.com/oasdiff/oasdiff@v1.35.0"
 coverage_threshold := "80"
-# The nested modules of the agent adapters (D84): each keeps its dependency (aikido, the MCP SDK) out of livewire's go.mod
+# The nested modules of the agent adapters (D87): each keeps its dependency (aikido, the MCP SDK) out of livewire's go.mod
 adapters := "aikidoadapter mcpadapter"
 excluded := "/examples/|/test/|/generate/internal/fixture/|/internal/toolfixture/"
 # CI (GitHub sets CI) has bun: the TypeScript parts of the e2e suite fail there instead of skipping

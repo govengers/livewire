@@ -18,15 +18,16 @@ func Options(root string) *generate.Options {
                 {Name: "apiKey", Type: "http", Scheme: "bearer", Description: "An API key from POST /api/v1/keys (D20)."},
             },
         },
-        GoClient:    generate.GoClientOptions{Directory: filepath.Join(root, "client", "todoclient"), ImportPath: modulePath + "/client/todoclient"},
-        CommandLine: generate.CommandLineOptions{Directory: filepath.Join(root, "client", "todocommand"), Name: "todo"},
-        Enums:       []generate.Enum{generate.EnumOf(api.Priorities()...)},
-        Presence:    true,
+        GoClient:      generate.GoClientOptions{Directory: filepath.Join(root, "client", "todoclient"), ImportPath: modulePath + "/client/todoclient"},
+        CommandLine:   generate.CommandLineOptions{Directory: filepath.Join(root, "client", "todocommand"), Name: "todo"},
+        CatalogueFile: filepath.Join(root, "tools.json"), // the agent tools (D85)
+        Enums:         []generate.Enum{generate.EnumOf(api.Priorities()...)},
+        Presence:      true,
     }
 }
 ```
 
-- Every output is optional; `TypeScriptDirectory`, `OpenAPIFile`, `GoClient.Directory` or `CommandLine.Directory` turns one on.
+- Every output is optional; `TypeScriptDirectory`, `OpenAPIFile`, `GoClient.Directory`, `CommandLine.Directory` or `CatalogueFile` (the agent tools as JSON, [Agent-Tools](Agent-Tools.md)) turns one on.
 - `Enums` lists the values of named string types (`generate.EnumOf(api.Priorities()...)`), which reflection cannot enumerate; an `enum:"a,b"` tag on a field wins.
 - `Presence` says the engine has a `PresenceStore`; only then are the presence reads, routes and joins generated, as only then does the REST adapter mount them.
 - The mapping of Go types is encoding/json's (D63), and so is when a field is absent and when it is null; [Type mapping](#type-mapping) has the rules. `Write` refuses what it cannot describe: a type encoding/json cannot marshal, identifiers that collide, a Go client type it cannot import.

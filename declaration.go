@@ -34,7 +34,7 @@ const (
 // is the HTTP method of the main REST route (GET for reads); Tables are the tables whose
 // changes re-run the declaration's subscriptions, none means not live; Description is the
 // declaration's human-readable description ("" for none), which the OpenAPI document and the
-// tool catalogue show (D82); Check is the static
+// tool catalogue show (D85); Check is the static
 // gate (D8) that runs before parameters are resolved against the database and before a body
 // is read; Parameters describes the parameters struct for the generators; DecodeParameters
 // fills a new parameters value (a *Parameters) from source and answers a missing path

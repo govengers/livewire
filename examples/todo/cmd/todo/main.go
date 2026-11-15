@@ -146,7 +146,7 @@ func loadConfiguration() (*configuration, error) {
 		config.String("DEMO_PASSWORD").Sensitive().Into(&values.demoPassword),
 		config.Bool("DEVELOPMENT_LOGS").Default(false).Into(&values.developmentLogs),
 		config.Int("READINESS_DELAY_SECONDS").Default(5).Into(&values.readinessDelaySeconds), // the load balancer's notice; with the 20 s drain within a 30 s grace period
-		config.Bool("MCP_ENABLED").Default(false).Into(&values.mcp),                          // the API's tools for outside agents at /api/v1/mcp (D82)
+		config.Bool("MCP_ENABLED").Default(false).Into(&values.mcp),                          // the API's tools for outside agents at /api/v1/mcp (D85)
 		config.String("ASSISTANT_MODEL").Into(&values.assistantModel),                        // an OpenRouter model id: the assistant at /api/v1/assistant; empty: none
 		config.String("OPENROUTER_API_KEY").Sensitive().Into(&values.openRouterKey),          // required with ASSISTANT_MODEL
 	})

@@ -1,5 +1,5 @@
-// Package toolfixture is the registry the tests of the toolset and its adapters run (D82,
-// D83): notes, a resource with a guarded column, a create whose body passes the column's
+// Package toolfixture is the registry the tests of the toolset and its adapters run (D85,
+// D86): notes, a resource with a guarded column, a create whose body passes the column's
 // write check, an admin-only delete and an upload, served by an engine on in-memory stores
 // that records every audit entry. It is test support for this repository's modules only.
 package toolfixture

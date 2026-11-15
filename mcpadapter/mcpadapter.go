@@ -1,4 +1,4 @@
-// Package mcpadapter serves a livewire toolset (D82, D83) as a Model Context Protocol server
+// Package mcpadapter serves a livewire toolset (D85, D86) as a Model Context Protocol server
 // on the Streamable HTTP transport of github.com/modelcontextprotocol/go-sdk: every tool the
 // toolset selects is an MCP tool, and a tools/call runs Toolset.Call in process under the
 // identity of that very HTTP request. It is a module of its own, so livewire does not

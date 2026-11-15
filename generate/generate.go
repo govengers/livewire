@@ -18,7 +18,7 @@ import (
 // header (YAML reads JSON, and a JSON file could not carry the header), so it must not end in
 // ".json". GoClient configures the Go client package and CommandLine the command-line client
 // (each written only with its Directory). CatalogueFile is the path of the tool catalogue
-// (D82) as JSON, NewCatalogue's tools under the generated header as their "$comment" ("" writes
+// (D85) as JSON, NewCatalogue's tools under the generated header as their "$comment" ("" writes
 // none), which a test keeps current like the clients. At least one output is required. OpenAPI describes
 // the document and is required with OpenAPIFile.
 //
