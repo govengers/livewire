@@ -134,8 +134,8 @@ func (t *Toolset) Tools() []generate.Tool {
 	return tools
 }
 
-// Call runs the tool of the name with the model's arguments (a JSON object; empty is {})
-// for the identity in ctx, as the agent on its behalf (D83), and answers the REST body: a
+// Call runs the tool of the name with the model's arguments (a JSON object; empty or null is
+// {}) for the identity in ctx, as the agent on its behalf (D83), and answers the REST body: a
 // read's payload, a mutation's or upload's response (JSON null for none). idempotencyKey is
 // the call's Idempotency-Key (D16), a UUID; "" uses a new UUID v7, so every call is its own
 // write and a caller that retries one call passes the same key. A write runs on a context
@@ -295,8 +295,8 @@ func (a *arguments) file() (*livewire.File, error) {
 // boolean as its JSON text, an object (the filter) as its JSON, an array as one value per
 // element, null as absent.
 func parseArguments(raw json.RawMessage, members map[string]bool) (*arguments, error) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		raw = json.RawMessage("{}")
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || string(trimmed) == "null" {
+		raw = json.RawMessage("{}") // no arguments, as some clients send them
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {

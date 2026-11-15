@@ -165,7 +165,7 @@ func TestTheArgumentsAreCheckedBeforeAnythingRuns(t *testing.T) {
 	ctx := toolfixture.User(t.Context())
 	for name, arguments := range map[string]string{
 		"not an object":    `[1]`,
-		"null":             `null`,
+		"a string":         `"x"`,
 		"unknown argument": `{"title":"x"}`,
 		"nested list":      `{"limit":[[1]]}`,
 	} {
