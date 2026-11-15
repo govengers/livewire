@@ -820,7 +820,11 @@ function sendWithProgress(url: URL, request: RequestInit, onProgress: UploadProg
     transfer.onload = () => {
       settle()
       const empty = transfer.status === 204 || transfer.status === 205 || transfer.status === 304
-      resolve(new Response(empty ? null : transfer.responseText, { status: transfer.status, statusText: transfer.statusText }))
+      try {
+        resolve(new Response(empty ? null : transfer.responseText, { status: transfer.status, statusText: transfer.statusText }))
+      } catch (error) {
+        reject(error) // a status a Response cannot hold (outside 200-599): no answer, as fetch has it
+      }
     }
     // An abort by the signal rejects with its reason, as fetch does; anything else got no answer.
     transfer.onerror = transfer.onabort = () => {

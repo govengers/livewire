@@ -376,7 +376,15 @@ describe('Client', () => {
       const aborted = new Client({ baseURL: base }).upload(attach, { id: 'p' }, file, { signal: controller.signal, onProgress })
       await settle()
       controller.abort(reason)
-      await expect(aborted).rejects.toMatchObject({ name: 'NetworkError', cause: reason })
+      const abortError = await aborted.catch((caught: unknown) => caught)
+      expect(abortError).toBeInstanceOf(NetworkError)
+      expect((abortError as NetworkError).cause).toBe(reason)
+
+      // A status no Response can hold rejects instead of leaving the upload unsettled.
+      const odd = new Client({ baseURL: base }).upload(attach, { id: 'p' }, file, { onProgress })
+      await settle()
+      transfers.current().respond(999, 'no')
+      await expect(odd).rejects.toMatchObject({ name: 'NetworkError' })
 
       // A signal that aborts while the headers resolve sends nothing.
       let release = (): void => {}
@@ -385,8 +393,10 @@ describe('Client', () => {
       const before = new Client({ baseURL: base, headers }).upload(attach, { id: 'p' }, file, { signal: early.signal, onProgress })
       early.abort(reason)
       release()
-      await expect(before).rejects.toMatchObject({ name: 'NetworkError', cause: reason })
-      expect(transfers.requests.length).toBe(2)
+      const earlyError = await before.catch((caught: unknown) => caught)
+      expect(earlyError).toBeInstanceOf(NetworkError)
+      expect((earlyError as NetworkError).cause).toBe(reason)
+      expect(transfers.requests.length).toBe(3)
     } finally {
       globalThis.fetch = platformFetch
       transfers.restore()

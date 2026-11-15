@@ -341,7 +341,10 @@ export interface LiveList<Query extends ListQuery, Item> {
   error: ComputedRef<ApiError | NetworkError | undefined>
   /** The rows are not the current query's yet: a page still loads (the rows before shown meanwhile, D76), or the socket is not open. */
   stale: ComputedRef<boolean>
-  /** No rows yet and no error: the first load and the first after a new connection; the one condition a skeleton should show for. */
+  /**
+   * No rows yet and no error: the first load, the first after a new connection, and an ended
+   * connection (connection.end()), which never answers; a view tells the end apart by useLiveStatus.
+   */
   loading: ComputedRef<boolean>
   pending: ComputedRef<readonly string[]>
   filter: Ref<Query['filter']>
@@ -349,7 +352,8 @@ export interface LiveList<Query extends ListQuery, Item> {
   limit: Ref<number | undefined>
   /**
    * The page in offset mode, from 1; a filter or sort change goes back to 1, a new limit alone to
-   * the page holding the row last paged to (D77, D82), a page set together with a limit is taken as set.
+   * the page holding the row last paged to (D77, D82), a page set together with a limit is taken as set,
+   * unless it equals the current page: that is seen as a limit alone.
    */
   page: Ref<number>
   /** The pages in offset mode, undefined before the first push or without a limit. */
@@ -539,7 +543,8 @@ export function useLiveList<Query extends ListQuery, Item>(target: LiveTarget<Qu
   // One watcher over everything that changes the subscription, so a limit and a page set in one
   // tick are seen together (D82): a filter, sort, parameters or connection change goes back to
   // page 1, as does every change in cursor mode; a new page size alone goes to the page holding
-  // the anchor (D77); a page set, with or without a new size, is taken as set.
+  // the anchor (D77); a page set, with or without a new size, is taken as set. shortcut: a page set
+  // to the value it has is not seen and counts as a limit alone; record page writes if that matters.
   watch([connection, queryKey, limit, page], ([live, query, size, at], [liveBefore, queryBefore, sizeBefore, atBefore]) => {
     const key = JSON.stringify([query, size, at])
     if (live === startedOn && key === startedKey) return // the page this watcher set itself, or a change back within a tick
