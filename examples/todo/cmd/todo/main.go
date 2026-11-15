@@ -11,6 +11,10 @@
 //	curl -b cookies -X POST localhost:8080/api/v1/keys # an API key for the CLI: TODO_API_KEY
 //	TODO_BASE_URL=http://localhost:8080/api/v1 TODO_API_KEY=... go run ./cmd/todo-cli todos list
 //	curl localhost:9090/metrics
+//
+// MCP_ENABLED=true serves the API's tools to agents at /api/v1/mcp (an MCP client with the API
+// key as its bearer token); ASSISTANT_MODEL with OPENROUTER_API_KEY answers questions at
+// POST /api/v1/assistant {"question": "..."} with an in-process agent on the same tools.
 package main
 
 import (
@@ -27,6 +31,8 @@ import (
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/gin-gonic/gin"
+	"github.com/govengers/aikido/llm"
+	"github.com/govengers/aikido/llm/openrouter"
 	"github.com/govengers/auth/password"
 	"github.com/govengers/auth/session"
 	"github.com/govengers/config/v2"
@@ -62,6 +68,9 @@ type configuration struct {
 	demoPassword          string
 	developmentLogs       bool
 	readinessDelaySeconds int
+	mcp                   bool
+	assistantModel        string
+	openRouterKey         string
 }
 
 func main() {
@@ -101,9 +110,16 @@ func run() error {
 	defer closeDatabase()
 	metrics := telemetry.NewRegistry() // the service's own registry with the runtime collectors (MET-002)
 	users := password.NewMemoryStorage()
+	var model llm.Client // the assistant's, nil without ASSISTANT_MODEL
+	if values.assistantModel != "" {
+		if model, err = newAssistantClient(values); err != nil {
+			return err
+		}
+	}
 	application, err := newApplication(&applicationOptions{
 		Pool: pool, Emitter: emitter, Metrics: metrics, Traces: traces.TracerProvider(), Users: users,
 		SessionKey: sessionKey, InsecureCookie: values.insecureCookie, AllowedOrigins: values.allowedOrigins,
+		MCP: values.mcp, Assistant: model, AssistantModel: values.assistantModel,
 	})
 	if err != nil {
 		return err
@@ -130,8 +146,19 @@ func loadConfiguration() (*configuration, error) {
 		config.String("DEMO_PASSWORD").Sensitive().Into(&values.demoPassword),
 		config.Bool("DEVELOPMENT_LOGS").Default(false).Into(&values.developmentLogs),
 		config.Int("READINESS_DELAY_SECONDS").Default(5).Into(&values.readinessDelaySeconds), // the load balancer's notice; with the 20 s drain within a 30 s grace period
+		config.Bool("MCP_ENABLED").Default(false).Into(&values.mcp),                          // the API's tools for outside agents at /api/v1/mcp (D82)
+		config.String("ASSISTANT_MODEL").Into(&values.assistantModel),                        // an OpenRouter model id: the assistant at /api/v1/assistant; empty: none
+		config.String("OPENROUTER_API_KEY").Sensitive().Into(&values.openRouterKey),          // required with ASSISTANT_MODEL
 	})
 	return values, err
+}
+
+// newAssistantClient is the assistant's model client on OpenRouter.
+func newAssistantClient(values *configuration) (llm.Client, error) {
+	if values.openRouterKey == "" {
+		return nil, errors.New("ASSISTANT_MODEL needs OPENROUTER_API_KEY")
+	}
+	return openrouter.NewClient(&openrouter.Options{APIKey: values.openRouterKey})
 }
 
 // newEmitter writes the wide events as JSON lines, or for a terminal in development (LOG-013).

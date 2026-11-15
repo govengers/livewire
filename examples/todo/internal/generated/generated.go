@@ -1,5 +1,6 @@
 // Package generated names the artifacts the generator writes from the registry (D19): the
-// TypeScript client below web/src/api, the OpenAPI document, the Go client and the CLI. The
+// TypeScript client below web/src/api, the OpenAPI document, the Go client, the CLI and the
+// tool catalogue of the agents. The
 // generator command writes them and the tests check that the committed ones are current.
 package generated
 
@@ -30,11 +31,19 @@ func Options(root string) *generate.Options {
 				{Name: "apiKey", Type: "http", Scheme: "bearer", Description: "An API key from POST /api/v1/keys (D20)."},
 			},
 		},
-		GoClient:    generate.GoClientOptions{Directory: filepath.Join(root, "client", "todoclient"), ImportPath: modulePath + "/client/todoclient"},
-		CommandLine: generate.CommandLineOptions{Directory: filepath.Join(root, "client", "todocommand"), Name: "todo"},
-		Enums:       []generate.Enum{generate.EnumOf(api.Priorities()...)},
-		Presence:    true,
+		GoClient:      generate.GoClientOptions{Directory: filepath.Join(root, "client", "todoclient"), ImportPath: modulePath + "/client/todoclient"},
+		CommandLine:   generate.CommandLineOptions{Directory: filepath.Join(root, "client", "todocommand"), Name: "todo"},
+		CatalogueFile: filepath.Join(root, "tools.json"), // the agent tools (D82)
+		Enums:         []generate.Enum{generate.EnumOf(api.Priorities()...)},
+		Presence:      true,
 	}
 }
 
 // snippet:end options
+
+// CatalogueOptions are the options of the tool catalogue the agents get (D82), the same enums
+// and presence as the generated clients'.
+func CatalogueOptions() *generate.CatalogueOptions {
+	options := Options(".")
+	return &generate.CatalogueOptions{Enums: options.Enums, Presence: options.Presence}
+}

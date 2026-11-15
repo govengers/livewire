@@ -2049,6 +2049,7 @@
   "paths": {
     "/api/v1/activity": {
       "get": {
+        "description": "The workspace's activity lines, of one todo when todoId is given.",
         "operationId": "getActivity",
         "parameters": [
           {
@@ -2303,6 +2304,7 @@
     },
     "/api/v1/keys": {
       "post": {
+        "description": "Creates an API key of the caller, for the CLI and the Go client; the answer shows the key once.",
         "operationId": "createKey",
         "parameters": [
           {
@@ -2358,6 +2360,7 @@
     },
     "/api/v1/summary": {
       "get": {
+        "description": "How many todos of the workspace are open and done, and how many attachments they have.",
         "operationId": "getSummary",
         "parameters": [],
         "responses": {
@@ -2401,6 +2404,7 @@
     },
     "/api/v1/summary/presence": {
       "get": {
+        "description": "How many todos of the workspace are open and done, and how many attachments they have.",
         "operationId": "getSummaryPresence",
         "parameters": [
           {
@@ -2460,6 +2464,7 @@
     },
     "/api/v1/todos": {
       "get": {
+        "description": "The todos of the caller's workspace.",
         "operationId": "getTodos",
         "parameters": [
           {
@@ -2552,6 +2557,7 @@
         }
       },
       "post": {
+        "description": "Creates a todo in the caller's workspace.",
         "operationId": "createTodo",
         "parameters": [
           {
@@ -2621,6 +2627,7 @@
     },
     "/api/v1/todos/distinct": {
       "get": {
+        "description": "The todos of the caller's workspace.",
         "operationId": "getTodosDistinct",
         "parameters": [
           {
@@ -2804,6 +2811,7 @@
     },
     "/api/v1/todos/presence": {
       "get": {
+        "description": "The todos of the caller's workspace.",
         "operationId": "getTodosPresence",
         "parameters": [
           {
@@ -2863,6 +2871,7 @@
     },
     "/api/v1/todos/{id}": {
       "delete": {
+        "description": "Deletes a todo.",
         "operationId": "deleteTodo",
         "parameters": [
           {
@@ -2922,6 +2931,7 @@
         }
       },
       "get": {
+        "description": "The todos of the caller's workspace.",
         "operationId": "getTodosItem",
         "parameters": [
           {
@@ -2973,6 +2983,7 @@
         }
       },
       "patch": {
+        "description": "Changes the fields of a todo that the body carries; clearDueAt removes the due time.",
         "operationId": "updateTodo",
         "parameters": [
           {
@@ -3051,7 +3062,7 @@
     },
     "/api/v1/todos/{id}/attachments": {
       "post": {
-        "description": "At most 1048576 bytes (D17).",
+        "description": "Attaches a file to a todo. At most 1048576 bytes (D17).",
         "operationId": "uploadAttachment",
         "parameters": [
           {
@@ -3152,6 +3163,7 @@
     },
     "/api/v1/todos/{id}/history": {
       "get": {
+        "description": "The todos of the caller's workspace.",
         "operationId": "getTodosHistory",
         "parameters": [
           {

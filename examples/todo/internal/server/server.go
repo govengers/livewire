@@ -29,6 +29,7 @@ import (
 	"github.com/govengers/livewire/prometheusadapter"
 
 	"github.com/govengers/livewire/examples/todo/internal/api"
+	"github.com/govengers/livewire/examples/todo/internal/assistant"
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
 	"github.com/govengers/livewire/examples/todo/internal/controller"
 )
@@ -36,9 +37,11 @@ import (
 // SocketPath is the route of the live socket.
 const SocketPath = controller.BasePath + "/socket"
 
-// Options configures the router; every field is required. Ready is the readiness check (a
-// database ping that fails once the server drains), Metrics the registry the request metrics
-// go to, Traces the provider of the requests' spans (a no-op one without a collector).
+// Options configures the router; every field is required but the agents. Ready is the
+// readiness check (a database ping that fails once the server drains), Metrics the registry the
+// request metrics go to, Traces the provider of the requests' spans (a no-op one without a
+// collector). MCP, when set, is served at MCPPath and Assistant at AssistantPath, both behind
+// the API's authentication.
 type Options struct {
 	Engine         *livewire.Engine
 	Authentication *authentication.Authentication
@@ -46,7 +49,15 @@ type Options struct {
 	Metrics        prometheus.Registerer
 	Traces         trace.TracerProvider
 	Ready          func(ctx context.Context) error
+	MCP            http.Handler
+	Assistant      *assistant.Assistant
 }
+
+// The routes of the agents (D82).
+const (
+	MCPPath       = controller.BasePath + "/mcp"
+	AssistantPath = controller.BasePath + "/assistant"
+)
 
 // probes are the health routes: no wide event and no span (TRC-007).
 var probes = []string{"/healthz", "/readyz"}
@@ -111,7 +122,42 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 		socket(ginContext)
 	})
 	// snippet:end routes
+	if options.MCP != nil {
+		api.POST(MCPPath, gin.WrapH(options.MCP)) // stateless: every request is a session of its own
+	}
+	if options.Assistant != nil {
+		api.POST(AssistantPath, ask(options.Assistant))
+	}
 	return router, nil
+}
+
+// question is the body of the assistant's route; reply its answer.
+type question struct {
+	Question string `json:"question" binding:"required,max=4000"`
+}
+
+type reply struct {
+	Reply string `json:"reply"`
+}
+
+// ask answers one question with the assistant, as the request's identity.
+func ask(helper *assistant.Assistant) gin.HandlerFunc {
+	return func(ginContext *gin.Context) {
+		var asked question
+		if err := ginContext.ShouldBindJSON(&asked); err != nil {
+			writeError(ginContext, livewire.Invalid(map[string]string{"question": "required, at most 4000 characters"}))
+			return
+		}
+		answer, err := helper.Ask(ginContext.Request.Context(), asked.Question)
+		if err != nil {
+			if we := wideevent.FromContext(ginContext.Request.Context()); we != nil {
+				we.Err("assistant.error", err) // the run's failure; the client gets the closed code only
+			}
+			writeError(ginContext, err)
+			return
+		}
+		ginContext.JSON(http.StatusOK, reply{Reply: answer})
+	}
 }
 
 // snippet:begin recovery

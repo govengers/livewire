@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/google/uuid"
+	"github.com/govengers/aikido/llm"
 	"github.com/govengers/auth"
 	authginadapter "github.com/govengers/auth/ginadapter"
 	"github.com/govengers/auth/password"
@@ -36,7 +37,9 @@ import (
 )
 
 // applicationOptions is what the application is built from: the migrated pool, the wide event
-// emitter, the metrics registry, the users' storage and the session and socket settings.
+// emitter, the metrics registry, the users' storage, the session and socket settings, and the
+// agents: MCP serves the API's tools at /api/v1/mcp, Assistant (with its AssistantModel)
+// answers questions at /api/v1/assistant; both are off by default.
 type applicationOptions struct {
 	Pool           *pgxpool.Pool
 	Emitter        wideevent.Emitter
@@ -46,6 +49,9 @@ type applicationOptions struct {
 	SessionKey     []byte
 	InsecureCookie bool
 	AllowedOrigins []string
+	MCP            bool
+	Assistant      llm.Client
+	AssistantModel string
 }
 
 // application is the wired service: what serve runs and the tests drive.
@@ -121,15 +127,7 @@ func newApplication(options *applicationOptions) (*application, error) {
 	}
 	ready := &atomic.Bool{}
 	ready.Store(true)
-	router, err := server.NewRouter(&server.Options{
-		Engine: engine, Authentication: identities, Emitter: options.Emitter, Metrics: options.Metrics, Traces: options.Traces,
-		Ready: func(ctx context.Context) error {
-			if !ready.Load() {
-				return errDraining
-			}
-			return options.Pool.Ping(ctx)
-		},
-	})
+	router, err := newRouter(options, engine, identities, ready)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +135,25 @@ func newApplication(options *applicationOptions) (*application, error) {
 		registry: engine.Registry(), engine: engine, worker: worker, router: router,
 		metrics: options.Metrics, users: options.Users, accounts: accountService, jobStore: jobStore, ready: ready,
 	}, nil
+}
+
+// newRouter builds the router with the agents the options turn on; ready is the readiness,
+// true until the drain starts.
+func newRouter(options *applicationOptions, engine *livewire.Engine, identities *authentication.Authentication, ready *atomic.Bool) (http.Handler, error) {
+	agents, err := newAgents(options, engine)
+	if err != nil {
+		return nil, err
+	}
+	return server.NewRouter(&server.Options{
+		Engine: engine, Authentication: identities, Emitter: options.Emitter, Metrics: options.Metrics, Traces: options.Traces,
+		MCP: agents.mcp, Assistant: agents.assistant,
+		Ready: func(ctx context.Context) error {
+			if !ready.Load() {
+				return errDraining
+			}
+			return options.Pool.Ping(ctx)
+		},
+	})
 }
 
 // snippet:begin move-member
