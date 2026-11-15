@@ -207,11 +207,11 @@ func renderFilters(api *model) ([]byte, error) {
 	builder.WriteString(typescriptHeader)
 	// The generic filter types are the runtime's, so a component needs no generated file to type a
 	// filter (D78); filters.ts re-exports them for the applications that import them from here.
-	builder.WriteString(`import type { FilterDocument, FilterNode, SearchableFilterDocument, SortTerm, TimeValue } from './runtime'
+	builder.WriteString(`import type { FilterDocument, FilterNode, ListQuery, SearchableFilterDocument, SortTerm, TimeValue } from './runtime'
 
-export type { FilterDocument, FilterNode, SearchableFilterDocument, SortTerm, TimeValue }
+export type { FilterDocument, FilterNode, ListQuery, SearchableFilterDocument, SortTerm, TimeValue }
 `)
-	identifiers := newIdentifiers("FilterNode", "FilterDocument", "SearchableFilterDocument", "SortTerm", "TimeValue", "FilterDocuments")
+	identifiers := newIdentifiers("FilterNode", "FilterDocument", "ListQuery", "SearchableFilterDocument", "SortTerm", "TimeValue", "FilterDocuments")
 	resources := slices.Clone(api.resources)
 	if api.history != nil {
 		resources = append(resources, api.history)

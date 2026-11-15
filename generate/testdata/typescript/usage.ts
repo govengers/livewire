@@ -211,6 +211,9 @@ export function generics(): void {
   }
   const node: FilterNode<PartsCondition> = { or: [{ field: 'kind', op: 'eq', value: 'nut' }] }
   const document: filters.FilterDocument<PartsCondition> = { where: node } satisfies FilterDocument<PartsCondition>
+  const fromFilters: filters.ListQuery<PartsFilter, PartsSortTerm> = query
+  const fromRuntime: ListQuery<PartsFilter, PartsSortTerm> = fromFilters
+  console.log(fromRuntime)
   const term: SortTerm<'name'> = '-name'
   const time: TimeValue = { relative: '-7d' }
   console.log(query, facets, document, term, time)
@@ -227,13 +230,15 @@ export function useCursorPager(query: PartsListQuery) {
     const after = cursors.value.at(-1)
     return after === undefined ? query : { ...query, after }
   })
+  // While a page loads, useLive shows the page before (D21): its next is no position after this one.
+  const nextCursor = (): string | undefined => (page.stale.value ? undefined : page.data.value?.next)
   const next = (): void => {
-    const cursor = page.data.value?.next
+    const cursor = nextCursor()
     if (cursor !== undefined && cursor !== cursors.value.at(-1)) cursors.value = [...cursors.value, cursor]
   }
   const previous = (): void => {
     cursors.value = cursors.value.slice(0, -1)
   }
-  return { page, next, previous, hasPrevious: computed(() => cursors.value.length > 0), hasNext: computed(() => page.data.value?.next !== undefined) }
+  return { page, next, previous, hasPrevious: computed(() => cursors.value.length > 0), hasNext: computed(() => nextCursor() !== undefined) }
 }
 // snippet:end cursor-pager
