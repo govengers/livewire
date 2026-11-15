@@ -353,6 +353,46 @@ describe('Client', () => {
     }
   })
 
+  test('an upload keeps the credentials and the abort reason of fetch on both transports (D79, D84)', async () => {
+    const file = new Blob(['x'], { type: 'image/png' })
+    const onProgress = () => {}
+    const transfers = fakeXMLHttpRequests()
+    const platformFetch = globalThis.fetch
+    const { fetch, calls } = fakeFetch(json({ size: 1 }, 201))
+    globalThis.fetch = fetch
+    try {
+      const include = new Client({ baseURL: base, credentials: 'include' }).upload(attach, { id: 'p' }, file, { onProgress })
+      await settle()
+      expect(transfers.current().withCredentials).toBe(true)
+      transfers.current().respond(201, '{"size":1}')
+      await include
+
+      // XMLHttpRequest sends same-origin cookies whatever it is told: 'omit' goes through fetch.
+      expect(await new Client({ baseURL: base, credentials: 'omit' }).upload(attach, { id: 'p' }, file, { onProgress })).toEqual({ size: 1 })
+      expect([transfers.requests.length, calls.length, calls[0]?.request.credentials]).toEqual([1, 1, 'omit'])
+
+      const reason = new Error('the reader left')
+      const controller = new AbortController()
+      const aborted = new Client({ baseURL: base }).upload(attach, { id: 'p' }, file, { signal: controller.signal, onProgress })
+      await settle()
+      controller.abort(reason)
+      await expect(aborted).rejects.toMatchObject({ name: 'NetworkError', cause: reason })
+
+      // A signal that aborts while the headers resolve sends nothing.
+      let release = (): void => {}
+      const headers = () => new Promise<Record<string, string>>((resolve) => (release = () => resolve({})))
+      const early = new AbortController()
+      const before = new Client({ baseURL: base, headers }).upload(attach, { id: 'p' }, file, { signal: early.signal, onProgress })
+      early.abort(reason)
+      release()
+      await expect(before).rejects.toMatchObject({ name: 'NetworkError', cause: reason })
+      expect(transfers.requests.length).toBe(2)
+    } finally {
+      globalThis.fetch = platformFetch
+      transfers.restore()
+    }
+  })
+
   test('the library routes: batch, stored filters, export', async () => {
     const { fetch, calls } = fakeFetch(json([{ status: 201, payload: {} }]), json(list([])), new Response(null, { status: 204 }), new Response('id\n1\n', { status: 200 }))
     const client = new Client({ baseURL: base, fetch })

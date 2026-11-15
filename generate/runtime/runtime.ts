@@ -542,8 +542,9 @@ export interface UploadOptions<ContentType extends string> extends CallOptions {
   /**
    * Called as the body goes out: the bytes sent and the total, null when the platform cannot tell
    * (D79). fetch reports no upload progress, so with it the upload goes through XMLHttpRequest
-   * where the platform has one (a browser); elsewhere (bun, Node) and through a
-   * ClientOptions.fetch, which is the application's transport, it goes through fetch and reports
+   * where the platform has one (a browser); elsewhere (bun, Node), through a ClientOptions.fetch,
+   * which is the application's transport, and under ClientOptions.credentials 'omit', which
+   * XMLHttpRequest cannot keep for a same-origin request (D84), it goes through fetch and reports
    * none.
    */
   onProgress?: UploadProgress
@@ -770,8 +771,10 @@ export class Client {
     progress.sent = true
     let response: Response
     try {
-      // The one transport switch (D79): only XMLHttpRequest reports upload progress.
-      const onProgress = this.options.fetch === undefined && typeof XMLHttpRequest !== 'undefined' ? options.onProgress : undefined
+      // The one transport switch (D79): only XMLHttpRequest reports upload progress, and it sends
+      // same-origin cookies whatever withCredentials says, so 'omit' stays on fetch (D84).
+      const progressable = this.options.fetch === undefined && typeof XMLHttpRequest !== 'undefined' && request.credentials !== 'omit'
+      const onProgress = progressable ? options.onProgress : undefined
       response = await (onProgress === undefined ? (this.options.fetch ?? fetch)(this.url(path), request) : sendWithProgress(this.url(path), request, onProgress))
     } catch (cause) {
       throw new NetworkError(`livewire: ${method} ${path} got no answer`, { cause })
@@ -811,7 +814,7 @@ function sendWithProgress(url: URL, request: RequestInit, onProgress: UploadProg
     const settle = (): void => signal?.removeEventListener('abort', abort)
     transfer.open(request.method ?? 'GET', url)
     for (const [name, value] of Object.entries(request.headers as Record<string, string>)) transfer.setRequestHeader(name, value)
-    // Same-origin requests carry the cookies anyway; a cross-origin one only under 'include', as with fetch.
+    // Same-origin requests carry the cookies anyway ('omit' never comes here); a cross-origin one only under 'include', as with fetch.
     transfer.withCredentials = request.credentials === 'include'
     transfer.upload.onprogress = (event) => onProgress(event.loaded, event.lengthComputable ? event.total : null)
     transfer.onload = () => {
@@ -819,9 +822,10 @@ function sendWithProgress(url: URL, request: RequestInit, onProgress: UploadProg
       const empty = transfer.status === 204 || transfer.status === 205 || transfer.status === 304
       resolve(new Response(empty ? null : transfer.responseText, { status: transfer.status, statusText: transfer.statusText }))
     }
+    // An abort by the signal rejects with its reason, as fetch does; anything else got no answer.
     transfer.onerror = transfer.onabort = () => {
       settle()
-      reject(new TypeError('livewire: the upload got no answer'))
+      reject(signal?.aborted === true ? signal.reason : new TypeError('livewire: the upload got no answer'))
     }
     transfer.send(request.body as XMLHttpRequestBodyInit)
   })
