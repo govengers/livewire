@@ -27,7 +27,8 @@ const (
 // body under ArgumentBody, an upload's file as ArgumentContent with its ArgumentContentType,
 // written as ArgumentContentEncoding says (ContentText, the default, or ContentBase64).
 // Every other member is a parameter of the declaration, the reserved ones of a filterable
-// read included (filter as a JSON document, not as text).
+// read included (filter as a JSON document, not as text) except filterId: stored filters are
+// no tools, so an agent never holds a filter's id.
 const (
 	ArgumentBody            = "body"
 	ArgumentContent         = "content"
@@ -203,11 +204,16 @@ func describeTools(api *model) ([]Tool, error) {
 		}
 		properties[ArgumentContent] = object{"type": "string", "description": "The file: its text as it is, or its bytes in base64 with contentEncoding base64; at most " + strconv.FormatInt(upload.maximumBytes, 10) + " bytes."}
 		properties[ArgumentContentType] = object{"type": "string", "enum": upload.contentTypes, "description": "The file's content type."}
-		properties[ArgumentContentEncoding] = object{"type": "string", "enum": []string{ContentText, ContentBase64}, "description": "How content is written; text by default."}
+		required = append(required, ArgumentContent, ArgumentContentType)
+		encoding := object{"type": "string", "enum": []string{ContentText, ContentBase64}, "description": "How content is written; text by default."}
+		if slices.ContainsFunc(upload.contentTypes, func(contentType string) bool { return !strings.HasPrefix(contentType, "text/") }) {
+			encoding["description"], required = "How content is written; required, since a file of a type that is not text/* travels in base64.", append(required, ArgumentContentEncoding)
+		}
+		properties[ArgumentContentEncoding] = encoding
 		tools = append(tools, Tool{
 			Name: upload.name, Description: describeUploadTool(upload), Kind: ToolUpload, Mutating: true,
 			Target: upload.name, Method: http.MethodPost, Path: api.basePath + upload.path,
-			Parameters: document.toolSchema(argumentsSchema(properties, append(required, ArgumentContent, ArgumentContentType))),
+			Parameters: document.toolSchema(argumentsSchema(properties, required)),
 			Result:     document.toolSchema(document.schema(upload.response)),
 		})
 	}
@@ -239,6 +245,9 @@ func (o *openAPI) argumentProperties(parameters []parameterModel, reserved reser
 	properties, required := object{}, []string{}
 	for _, parameter := range o.parameters(parameters, reserved) {
 		name, _ := parameter["name"].(string)
+		if name == livewire.ParameterFilterID {
+			continue
+		}
 		schema, ok := parameter["schema"].(object)
 		if !ok { // the filter: a JSON document, not its text
 			schema = parameter["content"].(object)["application/json"].(object)["schema"].(object)

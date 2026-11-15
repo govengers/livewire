@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/govengers/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -23,13 +24,19 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-// serve mounts the MCP handler behind a stand-in for the application's authentication: the
-// bearer key "alice" is a user, "root" an admin, anything else no identity.
-func serve(t *testing.T) (*toolfixture.Fixture, *httptest.Server) {
+// serve mounts the MCP handler behind a stand-in for the application's authentication and
+// its wide-event middleware: the bearer key "alice" is a user, "root" an admin, "impersonated"
+// alice impersonated by an inactive root, anything else no identity; every answer carries
+// the request id "request-1". change, when set, changes the toolset's options.
+func serve(t *testing.T, change func(*toolset.Options)) (*toolfixture.Fixture, *httptest.Server) {
 	t.Helper()
 	fixture, err := toolfixture.New()
 	require.NoError(t, err)
-	tools, err := toolset.New(&toolset.Options{Engine: fixture.Engine, Catalogue: fixture.Catalogue, Agent: "mcp", Exclude: []string{"attachNote"}})
+	options := &toolset.Options{Engine: fixture.Engine, Catalogue: fixture.Catalogue, Agent: "mcp", Exclude: []string{"attachNote"}}
+	if change != nil {
+		change(options)
+	}
+	tools, err := toolset.New(options)
 	require.NoError(t, err)
 	handler, err := mcpadapter.New(&mcpadapter.Options{Toolset: tools, Name: "notes", Version: "1.0.0"})
 	require.NoError(t, err)
@@ -40,7 +47,10 @@ func serve(t *testing.T) (*toolfixture.Fixture, *httptest.Server) {
 			ctx = toolfixture.User(ctx)
 		case "Bearer root":
 			ctx = toolfixture.Admin(ctx)
+		case "Bearer impersonated":
+			ctx = auth.WithIdentity(ctx, &auth.Identity{Provider: "password", Subject: "alice", Active: true, Impersonator: &auth.Identity{Provider: "password", Subject: "root", Active: false}})
 		}
+		writer.Header().Set(mcpadapter.RequestIDHeader, "request-1")
 		handler.ServeHTTP(writer, request.WithContext(ctx))
 	}))
 	t.Cleanup(server.Close)
@@ -80,7 +90,7 @@ func text(t *testing.T, result *mcp.CallToolResult) string {
 
 func TestAClientListsTheSelectedToolsWithTheirSchemas(t *testing.T) {
 	t.Parallel()
-	_, server := serve(t)
+	_, server := serve(t, nil)
 	session := connect(t, server, "alice")
 	listed, err := session.ListTools(t.Context(), nil)
 	require.NoError(t, err)
@@ -90,8 +100,12 @@ func TestAClientListsTheSelectedToolsWithTheirSchemas(t *testing.T) {
 	}
 	require.Len(t, byName, 3)
 	require.True(t, byName["getNotes"].Annotations.ReadOnlyHint)
-	require.True(t, *byName["deleteNote"].Annotations.DestructiveHint)
 	require.False(t, byName["createNote"].Annotations.ReadOnlyHint)
+	for _, tool := range listed.Tools {
+		require.Nil(t, tool.Annotations.DestructiveHint, "a write may overwrite: the protocol's default, destructive")
+	}
+	require.True(t, byName["deleteNote"].Annotations.IdempotentHint)
+	require.False(t, byName["createNote"].Annotations.IdempotentHint)
 	schema, err := json.Marshal(byName["createNote"].InputSchema)
 	require.NoError(t, err)
 	require.Contains(t, string(schema), `"required":["body"]`)
@@ -99,7 +113,7 @@ func TestAClientListsTheSelectedToolsWithTheirSchemas(t *testing.T) {
 
 func TestACallRunsAsTheIdentityOfItsRequest(t *testing.T) {
 	t.Parallel()
-	fixture, server := serve(t)
+	fixture, server := serve(t, nil)
 	alice, root := connect(t, server, "alice"), connect(t, server, "root")
 	list := &mcp.CallToolParams{Name: "getNotes", Arguments: map[string]any{"limit": 10}}
 
@@ -128,7 +142,7 @@ func TestACallRunsAsTheIdentityOfItsRequest(t *testing.T) {
 
 func TestAWriteIsAuditedAsTheAgentWithTheClientsKey(t *testing.T) {
 	t.Parallel()
-	fixture, server := serve(t)
+	fixture, server := serve(t, nil)
 	alice := connect(t, server, "alice")
 	key := uuid.Must(uuid.NewV7()).String()
 	create := &mcp.CallToolParams{
@@ -145,6 +159,7 @@ func TestAWriteIsAuditedAsTheAgentWithTheClientsKey(t *testing.T) {
 	require.Equal(t, "password:alice", livewire.OwnerKey(entries[0].Identity))
 	require.Equal(t, "agent:mcp", livewire.OwnerKey(entries[0].Identity.Real()))
 	require.Equal(t, key, entries[0].IdempotencyKey)
+	require.Equal(t, "request-1", entries[0].RequestID, "the request id the middleware answers with")
 
 	result, err = alice.CallTool(t.Context(), create)
 	require.NoError(t, err)
@@ -154,7 +169,7 @@ func TestAWriteIsAuditedAsTheAgentWithTheClientsKey(t *testing.T) {
 
 func TestARequestWithoutIdentityIsRefused(t *testing.T) {
 	t.Parallel()
-	_, server := serve(t)
+	_, server := serve(t, nil)
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL,
 		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
 	require.NoError(t, err)
@@ -183,4 +198,61 @@ func TestNewRefusesIncompleteOptions(t *testing.T) {
 	require.NoError(t, err)
 	_, err = mcpadapter.New(&mcpadapter.Options{Toolset: tools})
 	require.Error(t, err, "a server needs a name")
+	_, err = mcpadapter.New(&mcpadapter.Options{Toolset: tools, Name: "notes", MaximumRequestBytes: -1})
+	require.Error(t, err, "a server keeps a body cap")
+}
+
+func TestAKeyThatIsNoStringIsRefused(t *testing.T) {
+	t.Parallel()
+	fixture, server := serve(t, nil)
+	result, err := connect(t, server, "alice").CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "createNote", Arguments: map[string]any{"body": map[string]any{"title": "x"}}, Meta: mcp.Meta{mcpadapter.MetaIdempotencyKey: 12345},
+	})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	require.Contains(t, text(t, result), `"code":"invalid_request"`)
+	require.Len(t, fixture.Notes(), 1, "a retry the client believes safe never writes under a fresh key")
+}
+
+func TestAPanicIsAnInternalRefusalAndTheServerLives(t *testing.T) {
+	t.Parallel()
+	_, server := serve(t, func(options *toolset.Options) {
+		options.Confirm = func(context.Context, *toolset.Call) error { panic("secret internal state: hunter2") }
+	})
+	alice := connect(t, server, "alice")
+	result, err := alice.CallTool(t.Context(), &mcp.CallToolParams{Name: "createNote", Arguments: map[string]any{"body": map[string]any{"title": "x"}}})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	require.Contains(t, text(t, result), `"code":"internal"`)
+	require.NotContains(t, text(t, result), "hunter2")
+	result, err = alice.CallTool(t.Context(), &mcp.CallToolParams{Name: "getNotes"})
+	require.NoError(t, err)
+	require.False(t, result.IsError, "the server still answers")
+}
+
+func TestAnInactiveImpersonatorIsRefusedThroughTheAgent(t *testing.T) {
+	t.Parallel()
+	fixture, server := serve(t, nil)
+	result, err := connect(t, server, "impersonated").CallTool(t.Context(), &mcp.CallToolParams{Name: "createNote", Arguments: map[string]any{"body": map[string]any{"title": "x"}}})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	require.Contains(t, text(t, result), `"code":"forbidden"`)
+	require.Len(t, fixture.Notes(), 1)
+}
+
+func TestARequestBehindASameHostProxyIsServed(t *testing.T) {
+	t.Parallel()
+	_, server := serve(t, nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL,
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"getNotes","arguments":{}}}`))
+	require.NoError(t, err)
+	request.Host = "app.example.com" // a reverse proxy on the same host that keeps the Host header
+	request.Header.Set("Authorization", "Bearer alice")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("Mcp-Protocol-Version", "2025-06-18")
+	response, err := server.Client().Do(request)
+	require.NoError(t, err)
+	defer func() { _ = response.Body.Close() }()
+	require.Equal(t, http.StatusOK, response.StatusCode)
 }

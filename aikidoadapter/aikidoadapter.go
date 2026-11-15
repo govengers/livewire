@@ -33,18 +33,21 @@ type Options struct {
 // Register adds every tool of the toolset to registry, in the toolset's order, with the
 // tool's name, description and argument schema. A handler answers the tool's JSON; a refusal
 // reaches the model as the toolset's *toolset.Error, whose text is a closed code, a message
-// safe to show and the offending fields. Every call gets an Idempotency-Key of its own. It
+// safe to show and the offending fields. Every call gets an Idempotency-Key of its own, and
+// its request id in the audit and the history is the agent session's id (SessionOptions.ID),
+// so the writes of one session join each other and whatever the application logged under
+// that id. It
 // fails on a nil registry or toolset and on a name the registry holds already (matching
 // tools.ErrDuplicateTool); tools registered before that failure stay registered.
 func Register(registry *tools.Registry, options *Options) error {
 	if registry == nil || options == nil || options.Toolset == nil {
 		return errors.New("aikidoadapter: Register needs a registry and Options with a Toolset")
 	}
-	toolset := options.Toolset
-	for _, tool := range toolset.Tools() {
+	selected := options.Toolset
+	for _, tool := range selected.Tools() {
 		name := tool.Name
-		handler := func(ctx context.Context, arguments json.RawMessage, _ tools.Environment) (tools.Result, error) {
-			answer, err := toolset.Call(ctx, name, arguments, "")
+		handler := func(ctx context.Context, arguments json.RawMessage, environment tools.Environment) (tools.Result, error) {
+			answer, err := selected.Call(ctx, name, arguments, toolset.CallOptions{RequestID: environment.SessionID})
 			if err != nil {
 				return tools.Result{}, err
 			}

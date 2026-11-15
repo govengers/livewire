@@ -14,7 +14,14 @@
 // The server is stateless (no Mcp-Session-Id, POST only, JSON answers): each request is a
 // session of its own, so an identity never outlives its request and any replica can answer.
 // A client may set the call's Idempotency-Key (a UUID) as `_meta.idempotencyKey` of
-// tools/call to retry it safely; without one every call is its own write.
+// tools/call to retry it safely; without one every call is its own write. A write's request
+// id in the audit and the history is the X-Request-ID the application's middleware answers
+// with (govengers/wide-event-logger's does), as on REST, so it joins the request's log line.
+//
+// The handler needs no DNS rebinding protection of its own, since every request carries an
+// identity the application authenticated, so it is off and a same-host reverse proxy may keep
+// the Host header. A request body is at most Options.MaximumRequestBytes; an upload's content
+// travels in base64 in it, a third larger than the file.
 package mcpadapter
 
 import (
@@ -34,55 +41,78 @@ import (
 // Idempotency-Key.
 const MetaIdempotencyKey = "idempotencyKey"
 
+// RequestIDHeader is the response header whose value, set by the application's middleware
+// before the handler runs, is the request id of the calls of that request.
+const RequestIDHeader = "X-Request-ID"
+
+// DefaultMaximumRequestBytes is the request body cap when Options.MaximumRequestBytes is zero.
+const DefaultMaximumRequestBytes = mcp.DefaultMaxRequestBodyBytes
+
 // Options configures New. Toolset is required: the tools, their selection, the
 // confirmation hook, the answer cap and the agent's name are its options. Name (required) and
 // Version describe the server to clients in its initialize answer; Instructions, when set,
-// tell a client's model how to use the tools.
+// tell a client's model how to use the tools. MaximumRequestBytes caps a request's body (0:
+// DefaultMaximumRequestBytes, 4 MiB); a server with an upload larger than about three
+// quarters of it raises it, since the content arrives in base64.
 type Options struct {
-	Toolset      *toolset.Toolset
-	Name         string
-	Version      string
-	Instructions string
+	Toolset             *toolset.Toolset
+	Name                string
+	Version             string
+	Instructions        string
+	MaximumRequestBytes int64
 }
 
 // New validates options and builds the MCP handler. A tool's annotations follow its kind: a
-// read is read-only, a DELETE is destructive, a PUT or DELETE idempotent. A tool call's
+// read is read-only, a PUT or DELETE idempotent, and every write keeps the protocol's
+// default, destructive, since a POST or a PATCH may overwrite as much as a DELETE removes. A
+// tool call's
 // answer is the tool's JSON as one text content; a refusal is a result with isError set
 // whose text is the *toolset.Error as JSON ({code, message, fields}), a closed code and a
 // message safe to show.
 func New(options *Options) (http.Handler, error) {
-	if options == nil || options.Toolset == nil || options.Name == "" {
-		return nil, errors.New("mcpadapter: Options needs a Toolset and a Name")
+	if options == nil || options.Toolset == nil || options.Name == "" || options.MaximumRequestBytes < 0 {
+		return nil, errors.New("mcpadapter: Options needs a Toolset, a Name and a MaximumRequestBytes of 0 or more")
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: options.Name, Version: options.Version}, &mcp.ServerOptions{Instructions: options.Instructions})
 	tools := options.Toolset
 	for _, tool := range tools.Tools() {
 		name := tool.Name
-		destructive := tool.Method == http.MethodDelete
 		server.AddTool(&mcp.Tool{
 			Name: name, Description: tool.Description, InputSchema: tool.Parameters,
 			Annotations: &mcp.ToolAnnotations{
-				ReadOnlyHint: !tool.Mutating, DestructiveHint: &destructive,
-				IdempotentHint: !tool.Mutating || tool.Method == http.MethodPut || destructive,
+				ReadOnlyHint:   !tool.Mutating,
+				IdempotentHint: !tool.Mutating || tool.Method == http.MethodPut || tool.Method == http.MethodDelete,
 			},
 		}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			key, _ := request.Params.Meta[MetaIdempotencyKey].(string)
-			answer, err := tools.Call(ctx, name, request.Params.Arguments, key)
+			key, isText := request.Params.Meta[MetaIdempotencyKey].(string)
+			if member := request.Params.Meta[MetaIdempotencyKey]; member != nil && !isText { // a retry the client believes safe must not write twice
+				return refusal(&toolset.Error{Code: livewire.CodeInvalidRequest, Message: "The idempotency key is not a UUID.", Fields: map[string]string{"idempotencyKey": "not a string"}}), nil
+			}
+			requestID, _ := ctx.Value(requestIDKey{}).(string)
+			answer, err := tools.Call(ctx, name, request.Params.Arguments, toolset.CallOptions{IdempotencyKey: key, RequestID: requestID})
 			if err != nil {
 				return refusal(err), nil
 			}
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(answer)}}}, nil
 		})
 	}
-	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
+	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{
+		Stateless: true, JSONResponse: true, DisableLocalhostProtection: true, MaxRequestBodyBytes: options.MaximumRequestBytes,
+	})
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if auth.IdentityFrom(request.Context()) == nil {
 			writeUnauthenticated(writer)
 			return
 		}
+		if requestID := writer.Header().Get(RequestIDHeader); requestID != "" {
+			request = request.WithContext(context.WithValue(request.Context(), requestIDKey{}, requestID))
+		}
 		streamable.ServeHTTP(writer, request)
 	}), nil
 }
+
+// requestIDKey carries a request's id from the handler to its tool calls.
+type requestIDKey struct{}
 
 func refusal(err error) *mcp.CallToolResult {
 	refused, ok := errors.AsType[*toolset.Error](err)

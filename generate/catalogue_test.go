@@ -74,6 +74,7 @@ func TestTheCatalogueDescribesEveryOperationAsATool(t *testing.T) {
 	require.NoError(t, valid(t, list, `{"limit":5,"sort":"-title","filter":{"where":{"and":[{"field":"title","op":"contains","value":"a"}]},"search":"x"}}`))
 	require.Error(t, valid(t, list, `{"filter":{"where":{"field":"title","op":"gt","value":1}}}`), "the conditions are typed per field")
 	require.Error(t, valid(t, list, `{"page":1}`), "no member beside the declared ones")
+	require.Error(t, valid(t, list, `{"filterId":"x"}`), "stored filters are no tools")
 
 	create := compileSchema(t, tools[1].Parameters)
 	require.NoError(t, valid(t, create, `{"body":{"title":"x"}}`))
@@ -84,8 +85,9 @@ func TestTheCatalogueDescribesEveryOperationAsATool(t *testing.T) {
 	remove := compileSchema(t, tools[2].Parameters)
 	require.Error(t, valid(t, remove, `{}`), "the path parameter is required")
 	attach := compileSchema(t, tools[3].Parameters)
-	require.NoError(t, valid(t, attach, `{"id":"019a0000-0000-7000-8000-000000000001","content":"x","contentType":"text/plain"}`))
-	require.Error(t, valid(t, attach, `{"id":"019a0000-0000-7000-8000-000000000001","content":"x","contentType":"image/png"}`))
+	require.NoError(t, valid(t, attach, `{"id":"019a0000-0000-7000-8000-000000000001","content":"x","contentType":"text/plain","contentEncoding":"text"}`))
+	require.Error(t, valid(t, attach, `{"id":"019a0000-0000-7000-8000-000000000001","content":"x","contentType":"image/png"}`), "a binary type needs its encoding")
+	require.Error(t, valid(t, attach, `{"id":"019a0000-0000-7000-8000-000000000001","content":"x","contentType":"image/gif","contentEncoding":"base64"}`))
 }
 
 func TestTheCatalogueHandsOutCopies(t *testing.T) {

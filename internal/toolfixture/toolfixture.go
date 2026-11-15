@@ -55,13 +55,14 @@ type Fixture struct {
 	mutex     sync.Mutex
 	notes     []Note
 	audit     []livewire.AuditEntry
+	outcomes  []livewire.Outcome
 	keys      map[string]bool
 }
 
 // New builds the fixture with one note, "first", whose secret is "hidden".
 func New() (*Fixture, error) {
 	fixture := &Fixture{notes: []Note{{ID: uuid.MustParse("019a0000-0000-7000-8000-000000000001"), Title: "first", Secret: "hidden"}}, keys: map[string]bool{}}
-	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: "/api"})
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: "/api", Observer: fixture.observe})
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +85,7 @@ func New() (*Fixture, error) {
 			Check: authorization.IsAdmin(), Handle: fixture.remove,
 		}),
 		livewire.NewUpload("attachNote", "/notes/{id}/attachments", &livewire.UploadOptions[NoteParameters, Attachment]{
-			Check: authorization.IsUser(), ContentTypes: []string{"text/plain"}, MaximumBytes: 64, Handle: fixture.attach,
+			Check: authorization.IsUser(), ContentTypes: []string{"text/plain", "image/png"}, MaximumBytes: 64, Handle: fixture.attach,
 		}),
 	)
 	if err != nil {
@@ -105,6 +106,12 @@ func New() (*Fixture, error) {
 	return fixture, nil
 }
 
+// NewEngine is an engine of registry that serves no socket and runs no store, for a test's
+// own declarations; it has no idempotency or audit store, so it serves reads only.
+func NewEngine(registry *livewire.Registry) (*livewire.Engine, error) {
+	return livewire.NewEngine(&livewire.EngineOptions{Registry: registry, IdentitySource: refuseSockets{}, Transactor: transactor{}, SameHostOnly: true})
+}
+
 // User is ctx with alice, a user without roles.
 func User(ctx context.Context) context.Context {
 	return auth.WithIdentity(ctx, &auth.Identity{Provider: "password", Subject: "alice", Username: "alice", Active: true})
@@ -120,6 +127,19 @@ func (f *Fixture) Audit() []livewire.AuditEntry {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	return slices.Clone(f.audit)
+}
+
+// Outcomes returns what the engine and the toolset reported to the registry's Observer.
+func (f *Fixture) Outcomes() []livewire.Outcome {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return slices.Clone(f.outcomes)
+}
+
+func (f *Fixture) observe(_ context.Context, outcome livewire.Outcome) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.outcomes = append(f.outcomes, outcome)
 }
 
 // Notes returns the notes.

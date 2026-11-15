@@ -9,6 +9,7 @@ import (
 	"github.com/govengers/aikido/llm"
 	"github.com/govengers/aikido/llm/llmtest"
 	"github.com/govengers/aikido/tools"
+	"github.com/govengers/auth"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
@@ -22,11 +23,15 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func newRegistry(t *testing.T, readOnly bool) (*toolfixture.Fixture, *tools.Registry) {
+func newRegistry(t *testing.T, change func(*toolset.Options)) (*toolfixture.Fixture, *tools.Registry) {
 	t.Helper()
 	fixture, err := toolfixture.New()
 	require.NoError(t, err)
-	selected, err := toolset.New(&toolset.Options{Engine: fixture.Engine, Catalogue: fixture.Catalogue, Agent: "assistant", ReadOnly: readOnly})
+	options := &toolset.Options{Engine: fixture.Engine, Catalogue: fixture.Catalogue, Agent: "assistant"}
+	if change != nil {
+		change(options)
+	}
+	selected, err := toolset.New(options)
 	require.NoError(t, err)
 	registry := tools.NewRegistry()
 	require.NoError(t, aikidoadapter.Register(registry, &aikidoadapter.Options{Toolset: selected}))
@@ -63,7 +68,7 @@ func run(ctx context.Context, t *testing.T, registry *tools.Registry, calls ...l
 
 func TestAnAgentReadsAndWritesAsTheIdentityThroughTheAPI(t *testing.T) {
 	t.Parallel()
-	fixture, registry := newRegistry(t, false)
+	fixture, registry := newRegistry(t, nil)
 	note := fixture.Notes()[0].ID.String()
 	results := run(toolfixture.User(t.Context()), t, registry,
 		llm.ToolCall{ID: "list", Name: "getNotes", Arguments: `{"limit":10}`},
@@ -94,12 +99,13 @@ func TestAnAgentReadsAndWritesAsTheIdentityThroughTheAPI(t *testing.T) {
 	require.Len(t, entries, 1)
 	require.Equal(t, "password:alice", livewire.OwnerKey(entries[0].Identity))
 	require.Equal(t, "agent:assistant", livewire.OwnerKey(entries[0].Identity.Real()))
+	require.Equal(t, "conversation", entries[0].RequestID, "the session's writes share its id")
 	require.Len(t, fixture.Notes(), 2)
 }
 
 func TestAReadOnlyAgentGetsNoWrite(t *testing.T) {
 	t.Parallel()
-	_, registry := newRegistry(t, true)
+	_, registry := newRegistry(t, func(options *toolset.Options) { options.ReadOnly = true })
 	var names []string
 	for _, definition := range registry.Definitions() {
 		names = append(names, definition.Name)
@@ -120,4 +126,32 @@ func TestRegisterRefusesAMissingToolsetAndADuplicate(t *testing.T) {
 	registry := tools.NewRegistry()
 	require.NoError(t, aikidoadapter.Register(registry, &aikidoadapter.Options{Toolset: selected}))
 	require.ErrorIs(t, aikidoadapter.Register(registry, &aikidoadapter.Options{Toolset: selected}), tools.ErrDuplicateTool)
+}
+
+func TestAPanicReachesTheModelAsACodeOnly(t *testing.T) {
+	t.Parallel()
+	_, registry := newRegistry(t, func(options *toolset.Options) {
+		options.Confirm = func(context.Context, *toolset.Call) error { panic("secret internal state: hunter2") }
+	})
+	results := run(toolfixture.User(t.Context()), t, registry, llm.ToolCall{ID: "create", Name: "createNote", Arguments: `{"body":{"title":"x"}}`})
+	require.False(t, results["create"].OK)
+	require.Contains(t, results["create"].Error, "internal: ")
+	require.NotContains(t, results["create"].Error, "hunter2")
+	require.NotContains(t, results["create"].Error, "panicked")
+}
+
+func TestAnImpersonatorIsTheRealActorBehindTheAgent(t *testing.T) {
+	t.Parallel()
+	fixture, registry := newRegistry(t, nil)
+	impersonated := func(active bool) context.Context {
+		root := &auth.Identity{Provider: "password", Subject: "root", Active: active, Roles: []string{auth.RoleAdmin}}
+		return auth.WithIdentity(t.Context(), &auth.Identity{Provider: "password", Subject: "alice", Active: true, Impersonator: root})
+	}
+	results := run(impersonated(true), t, registry, llm.ToolCall{ID: "create", Name: "createNote", Arguments: `{"body":{"title":"x"}}`})
+	require.True(t, results["create"].OK, results["create"].Error)
+	require.Equal(t, "agent:assistant@password:root", livewire.OwnerKey(fixture.Audit()[0].Identity.Real()))
+	results = run(impersonated(false), t, registry, llm.ToolCall{ID: "create", Name: "createNote", Arguments: `{"body":{"title":"y"}}`})
+	require.False(t, results["create"].OK)
+	require.Contains(t, results["create"].Error, "forbidden: ")
+	require.Len(t, fixture.Notes(), 2)
 }

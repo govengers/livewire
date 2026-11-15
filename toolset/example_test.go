@@ -29,7 +29,7 @@ func ExampleNew() {
 		fmt.Println(err)
 		return
 	}
-	answer, err := tools.Call(ctx, "createNote", json.RawMessage(`{"body":{"title":"buy milk"}}`), "")
+	answer, err := tools.Call(ctx, "createNote", json.RawMessage(`{"body":{"title":"buy milk"}}`), toolset.CallOptions{})
 	// snippet:end toolset
 	if err != nil {
 		fmt.Println(err)
@@ -38,7 +38,7 @@ func ExampleNew() {
 	var created toolfixture.Note
 	_ = json.Unmarshal(answer, &created)
 	fmt.Println(created.Title, fixture.Audit()[0].Identity.Real().Subject)
-	_, err = tools.Call(ctx, "createNote", json.RawMessage(`{"body":{"title":"x","secret":"mine"}}`), "")
+	_, err = tools.Call(ctx, "createNote", json.RawMessage(`{"body":{"title":"x","secret":"mine"}}`), toolset.CallOptions{})
 	fmt.Println(err)
 	// Output:
 	// buy milk assistant

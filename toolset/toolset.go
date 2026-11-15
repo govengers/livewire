@@ -18,7 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
 
@@ -48,7 +50,10 @@ const (
 // engine's registry, and so is Agent, the name the audit shows as the real actor of every
 // call (letters, digits, dots, dashes and underscores). Include lists the tools the agent
 // gets (empty: every tool), Exclude the tools it does not get; a name either lists that is no
-// tool of the catalogue is refused. ReadOnly drops every tool that changes data. Confirm, when
+// tool of the catalogue is refused. ExcludeReads drops the reads of these kinds without
+// listing their names (livewire.ReadDistinct, ReadHistory and ReadPresence answer what a
+// person rarely asks an agent for and cost the most schema). ReadOnly drops every tool that
+// changes data. Confirm, when
 // set, runs before every call that changes data: an error declines the call (CodeDeclined)
 // and nothing runs. MaximumResultBytes caps an answer (0: DefaultMaximumResultBytes, negative:
 // no cap): a read past it is refused with CodeTooLarge, a write past it, which committed,
@@ -59,6 +64,7 @@ type Options struct {
 	Agent              string
 	Include            []string
 	Exclude            []string
+	ExcludeReads       []livewire.ReadKind
 	ReadOnly           bool
 	Confirm            func(ctx context.Context, call *Call) error
 	MaximumResultBytes int
@@ -89,6 +95,12 @@ func New(options *Options) (*Toolset, error) {
 	}
 	resolved := *options
 	resolved.Include, resolved.Exclude = slices.Clone(options.Include), slices.Clone(options.Exclude)
+	resolved.ExcludeReads = slices.Clone(options.ExcludeReads)
+	for _, kind := range resolved.ExcludeReads {
+		if !slices.Contains([]livewire.ReadKind{livewire.ReadMain, livewire.ReadItem, livewire.ReadDistinct, livewire.ReadHistory, livewire.ReadPresence}, kind) {
+			return nil, fmt.Errorf("toolset: Options.ExcludeReads has %q, which is no read kind", kind)
+		}
+	}
 	if resolved.MaximumResultBytes == 0 {
 		resolved.MaximumResultBytes = DefaultMaximumResultBytes
 	}
@@ -102,6 +114,7 @@ func New(options *Options) (*Toolset, error) {
 		switch {
 		case len(resolved.Include) > 0 && !slices.Contains(resolved.Include, tool.Name),
 			slices.Contains(resolved.Exclude, tool.Name),
+			tool.Kind == generate.ToolRead && slices.Contains(resolved.ExcludeReads, tool.Read),
 			resolved.ReadOnly && tool.Mutating:
 			continue
 		}
@@ -134,23 +147,40 @@ func (t *Toolset) Tools() []generate.Tool {
 	return tools
 }
 
+// CallOptions are what a transport knows about one call besides its arguments.
+// IdempotencyKey is the call's Idempotency-Key (D16), a UUID; "" uses a new UUID v7, so
+// every call is its own write and a caller that retries one call passes the same key.
+// RequestID is what the audit and the history record as the call's request id (D31), so an
+// agent's writes join the request or run that caused them; "" lets the engine make one.
+type CallOptions struct {
+	IdempotencyKey string
+	RequestID      string
+}
+
 // Call runs the tool of the name with the model's arguments (a JSON object; empty or null is
 // {}) for the identity in ctx, as the agent on its behalf (D86), and answers the REST body: a
-// read's payload, a mutation's or upload's response (JSON null for none). idempotencyKey is
-// the call's Idempotency-Key (D16), a UUID; "" uses a new UUID v7, so every call is its own
-// write and a caller that retries one call passes the same key. A write runs on a context
-// the caller's cancellation does not reach once it started, as the REST adapter's do (D60),
-// so a started write commits and is audited as what it did. Every failure is an *Error.
-func (t *Toolset) Call(ctx context.Context, name string, arguments json.RawMessage, idempotencyKey string) (json.RawMessage, error) {
+// read's payload, a mutation's or upload's response (JSON null for none). A write runs on a
+// context the caller's cancellation does not reach once it started, as the REST adapter's do
+// (D60), so a started write commits and is audited as what it did. Every failure is an
+// *Error; a panic of a check, the confirmation hook or anything else the call runs is
+// answered as CodeInternal without its text and reported to the registry's Observer, since a
+// transport like an MCP server runs the call where no recovery of the application reaches.
+func (t *Toolset) Call(ctx context.Context, name string, arguments json.RawMessage, options CallOptions) (answer json.RawMessage, err error) {
 	members, ok := t.members[name]
 	if !ok {
 		return nil, &Error{Code: livewire.CodeNotFound, Message: "There is no tool of this name."}
 	}
 	tool, _ := t.options.Catalogue.Lookup(name)
-	parsed, err := parseArguments(arguments, members)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			answer, err = nil, t.panicked(ctx, tool, fmt.Errorf("toolset: %s panicked: %v\n%s", tool.Name, recovered, debug.Stack()))
+		}
+	}()
+	parsed, err := parseArguments(arguments, members, tool.Kind)
 	if err != nil {
 		return nil, err
 	}
+	idempotencyKey := options.IdempotencyKey
 	if idempotencyKey == "" {
 		idempotencyKey = uuid.Must(uuid.NewV7()).String()
 	} else if _, err := uuid.Parse(idempotencyKey); err != nil {
@@ -171,13 +201,13 @@ func (t *Toolset) Call(ctx context.Context, name string, arguments json.RawMessa
 		payload, err = t.options.Engine.Read(ctx, livewire.ReadRequest{Target: tool.Target, Kind: tool.Read, Source: parsed.source})
 	case generate.ToolMutation:
 		_, payload, err = t.options.Engine.Call(context.WithoutCancel(ctx), livewire.CallRequest{
-			Target: tool.Target, Source: parsed.source, Body: parsed.body, IdempotencyKey: idempotencyKey,
+			Target: tool.Target, Source: parsed.source, Body: parsed.body, IdempotencyKey: idempotencyKey, RequestID: options.RequestID,
 		})
 	case generate.ToolUpload:
 		var file *livewire.File
 		if file, err = parsed.file(); err == nil {
 			_, payload, err = t.options.Engine.Upload(context.WithoutCancel(ctx), livewire.UploadRequest{
-				Target: tool.Target, Source: parsed.source, File: file, IdempotencyKey: idempotencyKey,
+				Target: tool.Target, Source: parsed.source, File: file, IdempotencyKey: idempotencyKey, RequestID: options.RequestID,
 			})
 		}
 	}
@@ -185,6 +215,22 @@ func (t *Toolset) Call(ctx context.Context, name string, arguments json.RawMessa
 		return nil, errorOf(err)
 	}
 	return t.bounded(tool, payload)
+}
+
+// panicked reports a recovered panic to the registry's Observer, as the engine reports the
+// panics it recovers, and answers it as CodeInternal.
+func (t *Toolset) panicked(ctx context.Context, tool generate.Tool, err error) *Error {
+	kind := livewire.OutcomeRequest
+	if tool.Mutating {
+		kind = livewire.OutcomeCall
+	}
+	func() {
+		defer func() { _ = recover() }() // the panic of an Observer has nobody left to report to
+		t.options.Engine.Registry().Observe(ctx, livewire.Outcome{
+			Kind: kind, Target: tool.Target, Identity: auth.IdentityFrom(ctx), Status: http.StatusInternalServerError, Err: err,
+		})
+	}()
+	return errorOf(err)
 }
 
 // bounded answers the payload within the cap.
@@ -215,18 +261,25 @@ type committedNotice struct {
 	Notice      string `json:"notice"`
 }
 
-// onBehalf marks the identity in ctx as acting through the agent (D86): the identity stays
-// the effective one, so every check, scope and column check is its own, and the agent becomes
-// its Impersonator, the real actor the audit, the history and the Observer record. An
-// impersonation the identity was under stays behind the agent.
+// onBehalf marks the identity in ctx as acting through the agent (D86): the identity
+// stays the effective one, so every check, scope and column check is its own, and the agent
+// becomes its Impersonator, the real actor the audit, the history and the Observer record. An
+// identity that is already impersonated keeps its impersonator in that real actor, whose
+// subject is then "<agent>@<the impersonator's owner key>" (an agent name has no "@"), and the
+// agent is active exactly when the impersonator is, so the audit names the human behind the
+// call and a deactivated impersonator stays refused.
 func onBehalf(ctx context.Context, agent string) context.Context {
 	identity := auth.IdentityFrom(ctx)
 	if identity == nil {
 		return ctx
 	}
 	acting := identity.Clone()
+	subject := agent
+	if acting.Impersonator != nil {
+		subject = agent + "@" + livewire.OwnerKey(acting.Impersonator)
+	}
 	acting.Impersonator = &auth.Identity{
-		Provider: AgentProvider, Subject: agent, Username: agent, Name: agent, Active: true, Impersonator: acting.Impersonator,
+		Provider: AgentProvider, Subject: subject, Username: agent, Name: agent, Active: identity.Real().Active, Impersonator: acting.Impersonator,
 	}
 	return auth.WithIdentity(ctx, acting)
 }
@@ -275,6 +328,9 @@ func (a *arguments) file() (*livewire.File, error) {
 		return nil, invalidArgument(generate.ArgumentContent, "required")
 	}
 	content := []byte(*a.content)
+	if a.encoding == "" && !strings.HasPrefix(a.typ, "text/") { // base64 text stored as an image's bytes is a silent corruption
+		return nil, invalidArgument(generate.ArgumentContentEncoding, "required for a content type that is not text/*")
+	}
 	switch a.encoding {
 	case "", generate.ContentText:
 	case generate.ContentBase64:
@@ -290,11 +346,11 @@ func (a *arguments) file() (*livewire.File, error) {
 }
 
 // parseArguments reads the model's arguments: a JSON object whose members are the tool's
-// (an unknown one is refused, as an unknown body field is, D40). The body and the content
-// members stay apart; every other member is a parameter: a string as it is, a number or a
-// boolean as its JSON text, an object (the filter) as its JSON, an array as one value per
-// element, null as absent.
-func parseArguments(raw json.RawMessage, members map[string]bool) (*arguments, error) {
+// (an unknown one is refused, as an unknown body field is, D40). A mutation's body and an
+// upload's content members stay apart; every other member, every member of a read included,
+// is a parameter: a string as it is, a number or a boolean as its JSON text, an object (the
+// filter) as its JSON, an array as one value per element, null as absent.
+func parseArguments(raw json.RawMessage, members map[string]bool, kind generate.ToolKind) (*arguments, error) {
 	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || string(trimmed) == "null" {
 		raw = json.RawMessage("{}") // no arguments, as some clients send them
 	}
@@ -308,14 +364,14 @@ func parseArguments(raw json.RawMessage, members map[string]bool) (*arguments, e
 			return nil, invalidArgument(name, "unknown argument")
 		}
 		var err error
-		switch name {
-		case generate.ArgumentBody:
+		switch {
+		case kind == generate.ToolMutation && name == generate.ArgumentBody:
 			parsed.body = value
-		case generate.ArgumentContent:
+		case kind == generate.ToolUpload && name == generate.ArgumentContent:
 			parsed.content, err = textArgument(value)
-		case generate.ArgumentContentEncoding:
+		case kind == generate.ToolUpload && name == generate.ArgumentContentEncoding:
 			parsed.encoding, err = optionalText(value)
-		case generate.ArgumentContentType:
+		case kind == generate.ToolUpload && name == generate.ArgumentContentType:
 			parsed.typ, err = optionalText(value)
 		default:
 			err = parsed.source.add(name, value)
