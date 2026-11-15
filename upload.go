@@ -25,8 +25,10 @@ type File struct {
 }
 
 // UploadOptions declares a binary write (D17). Check, ContentTypes, MaximumBytes and Handle
-// are required; Status is the success status (default 200).
+// are required; Status is the success status (default 200). Description says what the
+// upload does, for people and agents (D82).
 type UploadOptions[Parameters, Response any] struct {
+	Description  string
 	Check        authorization.Check
 	Status       int
 	ContentTypes []string
@@ -61,6 +63,7 @@ func NewUpload[Parameters, Response any](name, path string, options *UploadOptio
 		contentTypes:   slices.Clone(options.ContentTypes),
 		maximumBytes:   options.MaximumBytes,
 	}
+	upload.description = options.Description
 	if handle := options.Handle; handle != nil {
 		upload.handle = func(ctx context.Context, parameters any, file *File) (any, error) {
 			return handle(ctx, parameters.(*Parameters), file)

@@ -32,7 +32,9 @@ const (
 // refused by Registry.Add. Path is relative to the registry's BasePath and uses `{name}`
 // placeholders. Name is the wire target and the identifier of the generated clients; Method
 // is the HTTP method of the main REST route (GET for reads); Tables are the tables whose
-// changes re-run the declaration's subscriptions, none means not live; Check is the static
+// changes re-run the declaration's subscriptions, none means not live; Description is the
+// declaration's human-readable description ("" for none), which the OpenAPI document and the
+// tool catalogue show (D82); Check is the static
 // gate (D8) that runs before parameters are resolved against the database and before a body
 // is read; Parameters describes the parameters struct for the generators; DecodeParameters
 // fills a new parameters value (a *Parameters) from source and answers a missing path
@@ -44,6 +46,7 @@ type Declaration interface {
 	Method() string
 	Path() string
 	Tables() []string
+	Description() string
 	Check() authorization.Check
 	Parameters() []Parameter
 	DecodeParameters(source ParameterSource) (any, error)
@@ -62,14 +65,15 @@ type PartitionResolver func(ctx context.Context, parameters any) string
 // signature is what every declaration kind shares. The kinds embed it; its methods are the
 // Declaration interface.
 type signature struct {
-	name       string
-	method     string
-	path       string
-	tables     []string
-	check      authorization.Check
-	parameters *parameterSpecification
-	registry   *Registry
-	err        error
+	name        string
+	method      string
+	path        string
+	description string
+	tables      []string
+	check       authorization.Check
+	parameters  *parameterSpecification
+	registry    *Registry
+	err         error
 }
 
 // liveness is the part the three live kinds (Resource, List, Object) share.
@@ -100,6 +104,8 @@ func (s *signature) Method() string { return s.method }
 func (s *signature) Path() string { return s.path }
 
 func (s *signature) Tables() []string { return slices.Clone(s.tables) }
+
+func (s *signature) Description() string { return s.description }
 
 func (s *signature) Check() authorization.Check { return s.check }
 

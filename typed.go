@@ -16,13 +16,14 @@ import (
 // ListOptions declares a typed-parameters list. Read and Load are required; Guarded names
 // the fields of Item whose Read check strips them (D39); a live list (Tables set) needs an
 // item with a JSON field "id". Partition names a subscription's partition (D25); nil means
-// the tenant.
+// the tenant. Description says what the list holds, for people and agents (D82).
 type ListOptions[Item, Parameters any] struct {
-	Tables    []string
-	Read      authorization.Check
-	Partition PartitionResolver
-	Guarded   []GuardedField
-	Load      func(ctx context.Context, parameters *Parameters) ([]Item, error)
+	Description string
+	Tables      []string
+	Read        authorization.Check
+	Partition   PartitionResolver
+	Guarded     []GuardedField
+	Load        func(ctx context.Context, parameters *Parameters) ([]Item, error)
 }
 
 // List is a read that answers a ListResponse of every item its loader returns for the
@@ -47,7 +48,7 @@ func NewList[Item, Parameters any](name, path string, options *ListOptions[Item,
 		itemType:  reflect.TypeFor[Item](),
 		guarded:   guardedFields(options.Guarded),
 	}
-	list.partition = options.Partition
+	list.partition, list.description = options.Partition, options.Description
 	if load := options.Load; load != nil {
 		list.load = func(ctx context.Context, parameters any) (any, error) {
 			items, err := load(ctx, parameters.(*Parameters))
@@ -101,13 +102,15 @@ func (l *List) validate(guarded []GuardedField) error {
 
 // ObjectOptions declares a typed-parameters object. Read and Load are required; Guarded
 // names the fields of Item whose Read check strips them (D39). Partition names a
-// subscription's partition (D25); nil means the tenant.
+// subscription's partition (D25); nil means the tenant. Description says what the object
+// holds, for people and agents (D82).
 type ObjectOptions[Item, Parameters any] struct {
-	Tables    []string
-	Read      authorization.Check
-	Partition PartitionResolver
-	Guarded   []GuardedField
-	Load      func(ctx context.Context, parameters *Parameters) (*Item, error)
+	Description string
+	Tables      []string
+	Read        authorization.Check
+	Partition   PartitionResolver
+	Guarded     []GuardedField
+	Load        func(ctx context.Context, parameters *Parameters) (*Item, error)
 }
 
 // Object is a read that answers one item for the typed parameters.
@@ -131,7 +134,7 @@ func NewObject[Item, Parameters any](name, path string, options *ObjectOptions[I
 		itemType:  reflect.TypeFor[Item](),
 		guarded:   guardedFields(options.Guarded),
 	}
-	object.partition = options.Partition
+	object.partition, object.description = options.Partition, options.Description
 	if load := options.Load; load != nil {
 		object.load = func(ctx context.Context, parameters any) (any, error) {
 			item, err := load(ctx, parameters.(*Parameters))
