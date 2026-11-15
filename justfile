@@ -39,6 +39,10 @@ test-example:
 test-adapters:
     for module in {{adapters}}; do (cd "$module" && go test -race ./...); done
 
+# Before tagging the adapters (D87): each adapter in a copy without the replace, against the released livewire it is to require, so a tag never ships a go.mod whose livewire lacks the toolset; then set that require in the adapter's go.mod
+adapters-against version:
+    for module in {{adapters}}; do copy="$(mktemp -d)"; cp -R "$module/." "$copy"; (cd "$copy" && go mod edit -dropreplace=github.com/govengers/livewire -require=github.com/govengers/livewire@{{version}} && go mod tidy && go vet ./... && go test ./...) || { rm -rf "$copy"; echo "$module does not build against livewire {{version}}"; exit 1; }; rm -rf "$copy"; done
+
 # The TypeScript gates of the generator (tsc on the generated client, the runtime's bun tests), failing without bun
 test-typescript:
     cd generate/runtime && bun install --frozen-lockfile
