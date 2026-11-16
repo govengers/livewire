@@ -27,19 +27,47 @@ const Channel = "livewire"
 // notifies those two. A TRUNCATE notifies one delete without id and partition, which reaches
 // every subscription of the table. An id or partition value longer than 500 bytes is sent as
 // "", so the payload stays below pg_notify's 8000 bytes: such a change reaches every
-// subscription of the table, never fewer than it should.
+// subscription of the table, never fewer than it should. It reads only the id and the
+// partition column of the row (D88), so a large column costs a write nothing extra and a
+// json value that jsonb refuses fails no write; an id or partition value is sent as to_jsonb
+// writes it as text. An installation that ran an earlier release's form runs
+// TriggerUpgradeSQL.
 const TriggerFunctionSQL = `CREATE OR REPLACE FUNCTION livewire_notify() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-	old_row jsonb := CASE WHEN TG_OP IN ('UPDATE', 'DELETE') THEN to_jsonb(OLD) END;
-	new_row jsonb := CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN to_jsonb(NEW) END;
 	partition_column text := CASE WHEN TG_NARGS > 0 THEN TG_ARGV[0] END;
 	table_name text := (SELECT relname FROM pg_class WHERE oid = coalesce(pg_partition_root(TG_RELID), TG_RELID));
 	operation text := CASE WHEN TG_OP = 'TRUNCATE' THEN 'delete' ELSE lower(TG_OP) END;
-	row_id text := coalesce(coalesce(new_row, old_row)->>'id', '');
-	old_id text := coalesce(old_row->>'id', '');
-	row_partition text := coalesce(coalesce(new_row, old_row)->>partition_column, '');
-	old_partition text := coalesce(old_row->>partition_column, '');
+	has_id boolean := false;
+	has_partition boolean := false;
+	row_id text := '';
+	old_id text := '';
+	row_partition text := '';
+	old_partition text := '';
 BEGIN
+	-- Only the id and the partition column are read, each converted on its own as to_jsonb
+	-- converts it in a row (D88): converting the whole row fails on a json value jsonb refuses
+	-- and pays for every large column.
+	IF TG_LEVEL = 'ROW' THEN
+		SELECT coalesce(bool_or(attname = 'id'), false), coalesce(bool_or(attname = partition_column), false)
+			INTO has_id, has_partition
+			FROM pg_attribute WHERE attrelid = TG_RELID AND attnum > 0 AND NOT attisdropped AND attname IN ('id', partition_column);
+		IF has_id AND TG_OP <> 'INSERT' THEN
+			old_id := coalesce(to_jsonb(OLD.id) #>> '{}', '');
+		END IF;
+		IF has_partition AND TG_OP <> 'INSERT' THEN
+			EXECUTE format('SELECT to_jsonb(($1).%I) #>> ''{}''', partition_column) INTO old_partition USING OLD;
+			old_partition := coalesce(old_partition, '');
+		END IF;
+		row_id := old_id;
+		row_partition := old_partition;
+		IF has_id AND TG_OP <> 'DELETE' THEN
+			row_id := coalesce(to_jsonb(NEW.id) #>> '{}', '');
+		END IF;
+		IF has_partition AND TG_OP <> 'DELETE' THEN
+			EXECUTE format('SELECT to_jsonb(($1).%I) #>> ''{}''', partition_column) INTO row_partition USING NEW;
+			row_partition := coalesce(row_partition, '');
+		END IF;
+	END IF;
 	PERFORM pg_notify('` + Channel + `', json_build_object('table', table_name, 'op', operation,
 		'id', CASE WHEN octet_length(row_id) <= 500 THEN row_id ELSE '' END,
 		'partition', CASE WHEN octet_length(row_partition) <= 500 THEN row_partition ELSE '' END)::text);
@@ -202,9 +230,31 @@ CREATE INDEX livewire_presence_socket ON livewire_presence (socket);
 CREATE INDEX livewire_presence_updated_at ON livewire_presence (updated_at);
 CREATE TRIGGER livewire_notify AFTER INSERT OR DELETE ON livewire_presence
 	FOR EACH ROW EXECUTE FUNCTION livewire_notify('tenant');
-CREATE TRIGGER livewire_notify_update AFTER UPDATE ON livewire_presence
-	FOR EACH ROW WHEN ((to_jsonb(OLD) - 'updated_at') IS DISTINCT FROM (to_jsonb(NEW) - 'updated_at'))
-	EXECUTE FUNCTION livewire_notify('tenant');
+` + presenceUpdateTriggerSQL + `;
+`
+
+// presenceUpdateTriggerSQL is the update trigger of livewire_presence: it compares the
+// columns by name, so a heartbeat converts nothing (D88). A column added to the table is
+// added here, or its changes notify nothing.
+const presenceUpdateTriggerSQL = `CREATE OR REPLACE TRIGGER livewire_notify_update AFTER UPDATE ON livewire_presence
+	FOR EACH ROW WHEN ((OLD.tenant, OLD.target, OLD.key, OLD.socket, OLD.owner, OLD.display, OLD.state)
+		IS DISTINCT FROM (NEW.tenant, NEW.target, NEW.key, NEW.socket, NEW.owner, NEW.display, NEW.state))
+	EXECUTE FUNCTION livewire_notify('tenant')`
+
+// TriggerUpgradeSQL brings the trigger functions and triggers of an installation that ran an
+// earlier release's TriggerFunctionSQL, HistorySQL or PresenceSQL to this release's form
+// (D88): it replaces livewire_notify() and livewire_history() (creating the latter if
+// HistorySQL never ran) and the update trigger of livewire_presence where that table exists.
+// It is idempotent and changes no table, so the application runs it in a goose migration of
+// its own, in the migration's transaction, whenever a release says its trigger SQL changed;
+// on an installation that already has this form it changes nothing. Replacing the presence
+// trigger waits for the SHARE ROW EXCLUSIVE lock on livewire_presence, so the migration sets
+// its own lock_timeout (DAT-006).
+const TriggerUpgradeSQL = TriggerFunctionSQL + historyFunctionSQL + `DO $livewire$ BEGIN
+	IF to_regclass('livewire_presence') IS NOT NULL THEN
+		EXECUTE $trigger$` + presenceUpdateTriggerSQL + `$trigger$;
+	END IF;
+END $livewire$;
 `
 
 // historyFunctionSQL is the trigger function of HistorySQL: it closes the open version of
@@ -216,23 +266,29 @@ DECLARE
 	history text := (SELECT format('%I.%I', namespace.nspname, class.relname || '_history')
 		FROM pg_class class JOIN pg_namespace namespace ON namespace.oid = class.relnamespace
 		WHERE class.oid = coalesce(pg_partition_root(TG_RELID), TG_RELID));
-	current_row jsonb := to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END);
+	current_row jsonb;
 	actor jsonb := nullif(current_setting('livewire.actor', true), '')::jsonb;
-	row_id uuid := (current_row->>'id')::uuid;
+	row_id uuid := CASE WHEN TG_OP = 'DELETE' THEN OLD.id ELSE NEW.id END;
 	next_version integer;
 	stamp timestamptz;
 	last_life integer;
 	last_operation text;
 	last_transaction xid8;
 	current_life integer;
-	starts boolean := TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND (to_jsonb(OLD)->>'id') IS DISTINCT FROM (current_row->>'id'));
+	starts boolean := TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND OLD.id IS DISTINCT FROM NEW.id);
 BEGIN
-	IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = to_jsonb(NEW) THEN
+	-- Each row is converted once (D88): an update whose rows are byte for byte equal stops
+	-- before any conversion, one whose rows convert to equal jsonb stops after it.
+	IF TG_OP = 'UPDATE' AND OLD *= NEW THEN
 		RETURN NULL;
 	END IF;
-	IF TG_OP = 'UPDATE' AND (to_jsonb(OLD)->>'id') IS DISTINCT FROM (current_row->>'id') THEN
+	current_row := to_jsonb(CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END);
+	IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = current_row THEN
+		RETURN NULL;
+	END IF;
+	IF TG_OP = 'UPDATE' AND OLD.id IS DISTINCT FROM NEW.id THEN
 		EXECUTE format('UPDATE %s SET valid_to = greatest(clock_timestamp(), valid_from) WHERE id = $1 AND valid_to IS NULL', history)
-			USING (to_jsonb(OLD)->>'id')::uuid;
+			USING OLD.id;
 	END IF;
 	EXECUTE format('SELECT coalesce(max(version), 0) + 1, greatest(clock_timestamp(), max(valid_from), max(valid_to)) FROM %s WHERE id = $1', history)
 		INTO next_version, stamp USING row_id;
