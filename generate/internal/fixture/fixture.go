@@ -320,3 +320,28 @@ type InlineNote struct {
 	} `json:"inline"`
 	Text string `json:"text"`
 }
+
+// TwiceNote has two JSON fields under the Go name ID, which a list item cannot declare.
+type TwiceNote struct {
+	Secondary
+	ID   int    `json:"id"`
+	Text string `json:"text"`
+}
+
+// TimedNote has an unnamed struct field that marshals itself through an embedded time.Time,
+// which a list item cannot write out as fields.
+type TimedNote struct {
+	ID     int                 `json:"id"`
+	Inline struct{ time.Time } `json:"inline"`
+	Text   string              `json:"text"`
+}
+
+type statAlias = Stat
+
+// AliasNote has a tagged embedded field under the unexported Go name of an alias, which a list
+// item cannot declare.
+type AliasNote struct {
+	statAlias `json:"base"`
+	ID        int    `json:"id"`
+	Text      string `json:"text"`
+}

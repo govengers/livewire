@@ -164,8 +164,15 @@ func (f *goFile) typeExpression(goType reflect.Type, unnamedStructs bool) (strin
 }
 
 // structExpression is the expression of an unnamed struct: its JSON fields as structFields
-// declares them.
+// declares them. One that encodes or decodes itself through an embedded type's methods is
+// refused, since its fields written out would drop those methods.
 func (f *goFile) structExpression(goType reflect.Type) (string, error) {
+	pointer := reflect.PointerTo(goType)
+	for _, method := range []reflect.Type{jsonMarshalerType, jsonUnmarshalerType, textMarshalerType, textUnmarshalerType} {
+		if pointer.Implements(method) {
+			return "", fmt.Errorf("generate: the Go client cannot declare the unnamed struct %s: it has %s, which its fields written out would lose; give it a name in an importable package", goType, method.Method(0).Name)
+		}
+	}
 	fields, err := f.structFields(goType, nil)
 	if err != nil {
 		return "", err
@@ -176,7 +183,9 @@ func (f *goFile) structExpression(goType reflect.Type) (string, error) {
 // structFields are the fields of a struct the generated code declares itself (a list item's,
 // D93): every JSON field of goType but those named in leave, flat (embedded structs' fields
 // promoted, an unexported one's too, as encoding/json reads them), each under its Go name,
-// type and json options. Two JSON fields of one Go name cannot be declared side by side.
+// type and json options. Two JSON fields of one Go name cannot be declared side by side,
+// nor one under an unexported Go name (a tagged embedded unexported alias), which encoding/json
+// would leave out.
 func (f *goFile) structFields(goType reflect.Type, leave []string) ([]string, error) {
 	var fields []string
 	declared := map[string]bool{}
@@ -185,6 +194,9 @@ func (f *goFile) structFields(goType reflect.Type, leave []string) ([]string, er
 			continue
 		}
 		goName := field.StructField.Name
+		if !token.IsExported(goName) {
+			return nil, fmt.Errorf("generate: %s has the JSON field %q under the unexported Go name %s, which the Go client cannot declare: export the name", goType, field.Name, goName)
+		}
 		if declared[goName] {
 			return nil, fmt.Errorf("generate: %s has two JSON fields named %s in Go; the Go client cannot declare a struct of its fields: rename one of them", goType, goName)
 		}

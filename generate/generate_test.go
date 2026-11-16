@@ -507,3 +507,22 @@ func TestTheListItemKeepsWhatAnUnnamedStructPromotes(t *testing.T) {
 		"Inline struct {\n\t\tHidden string `json:\"hidden\"`\n\t\tA      int    `json:\"a\"`\n\t} `json:\"inline\"`",
 		"encoding/json promotes the fields of an embedded unexported struct, so the list item declares them")
 }
+
+func TestTheListItemRefusesFieldsItCannotDeclare(t *testing.T) {
+	testCases := []struct {
+		name     string
+		registry func(t *testing.T) *livewire.Registry
+		message  string
+	}{
+		{"two JSON fields of one Go name", detailRegistry[fixture.TwiceNote], "two JSON fields named ID"},
+		{"an unnamed struct that marshals itself", detailRegistry[fixture.TimedNote], "has MarshalJSON"},
+		{"a field under an unexported Go name", detailRegistry[fixture.AliasNote], "unexported Go name statAlias"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := generate.Write(testCase.registry(t), goOptions(t.TempDir()))
+			require.ErrorContains(t, err, testCase.message)
+			require.ErrorContains(t, err, "its list item NotesListItem")
+		})
+	}
+}
