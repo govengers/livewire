@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -159,6 +160,16 @@ func TestRefusalsAreErrors(t *testing.T) {
 			require.Contains(t, refusal.Error(), testCase.expected.Message)
 		})
 	}
+}
+
+func TestIsNotReplayableTellsTheRepeatOfASecretResponse(t *testing.T) {
+	notKept := `{"code":"conflict","message":"m","fields":{"idempotencyKey":"` + livewire.NotReplayable + `"}}`
+	created, _ := newRESTClient(t, answer(http.StatusConflict, notKept))
+	err := created.Call(t.Context(), &client.Call{Method: http.MethodPost, Path: "/keys"}, nil)
+	require.True(t, client.IsNotReplayable(fmt.Errorf("wrapped: %w", err)))
+	other, _ := newRESTClient(t, answer(http.StatusConflict, `{"code":"conflict","message":"m"}`))
+	require.False(t, client.IsNotReplayable(other.Call(t.Context(), &client.Call{Method: http.MethodPost, Path: "/keys"}, nil)), "another conflict")
+	require.False(t, client.IsNotReplayable(errors.New(livewire.NotReplayable)))
 }
 
 func TestTransportFailuresWrapTheCause(t *testing.T) {

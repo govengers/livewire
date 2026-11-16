@@ -75,7 +75,7 @@ func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: 
 // without one and the tool catalogue with a description of its own. SecretResponse keeps
 // the response out of the idempotency record because it carries a secret shown once (a new
 // API key, D91): the record keeps only the status, and a repeat of the key answers a 409
-// conflict whose field idempotencyKey is NotReplayableText instead of the response.
+// conflict whose field idempotencyKey is NotReplayable instead of the response.
 type MutationOptions[Parameters, Request, Response any] struct {
 	Description    string
 	SecretResponse bool

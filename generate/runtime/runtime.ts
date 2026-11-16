@@ -276,6 +276,18 @@ export class ApiError extends Error {
   }
 }
 
+/** The value of the idempotencyKey field of the 409 conflict that answers the repeat of a call whose answer shows a secret once (D91). */
+export const notReplayable = 'not_replayable'
+
+/**
+ * Whether error is the 409 conflict of a repeated Idempotency-Key whose call ran but whose answer
+ * the server does not keep (a secret shown once, D91): sending it again under a new key would run
+ * it twice, so offer to revoke and create instead.
+ */
+export function isNotReplayable(error: unknown): boolean {
+  return error instanceof ApiError && error.code === 'conflict' && error.fields['idempotencyKey'] === notReplayable
+}
+
 function isStringRecord(value: unknown): value is Record<string, string> {
   return typeof value === 'object' && value !== null && Object.values(value).every((entry) => typeof entry === 'string')
 }

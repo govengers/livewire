@@ -11,6 +11,7 @@ import {
   applyListChange,
   batchCall,
   exportTarget,
+  isNotReplayable,
   liveRead,
   mutation,
   prepareCall,
@@ -148,6 +149,13 @@ describe('wire helpers', () => {
     expect(new ApiError(401, { error: 'nope' }).code).toBe('unauthenticated')
     expect(new ApiError(0, notFound).status).toBe(404)
     expect(new ApiError(409, { code: 'something_else' }).code).toBe('conflict')
+  })
+
+  test('isNotReplayable tells the repeat of a call whose answer is not kept from another conflict', () => {
+    expect(isNotReplayable(new ApiError(409, { code: 'conflict', message: 'm', fields: { idempotencyKey: 'not_replayable' } }))).toBe(true)
+    expect(isNotReplayable(new ApiError(409, { code: 'conflict', message: 'm' }))).toBe(false)
+    expect(isNotReplayable(new ApiError(400, { code: 'invalid_request', message: 'm', fields: { idempotencyKey: 'not_replayable' } }))).toBe(false)
+    expect(isNotReplayable(new Error('not_replayable'))).toBe(false)
   })
 
   test('the constructors validate their options', () => {

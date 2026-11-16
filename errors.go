@@ -240,15 +240,17 @@ func newError(status int, code Code, fields map[string]string) *Error {
 // is conflict, and the field idempotencyKey says the call ran, so the client does not send it
 // again under a new key without knowing that.
 func notReplayable() *Error {
-	return newError(http.StatusConflict, CodeConflict, map[string]string{idempotencyKeyField: NotReplayableText})
+	return newError(http.StatusConflict, CodeConflict, map[string]string{idempotencyKeyField: NotReplayable})
 }
 
 // idempotencyKeyField is the field a refusal of the Idempotency-Key names.
 const idempotencyKeyField = "idempotencyKey"
 
-// NotReplayableText is the text of the idempotencyKey field of the 409 conflict that answers
-// the repeat of a SecretResponse call (D91), so a client can tell it from another conflict.
-const NotReplayableText = "the call ran; its answer is not kept"
+// NotReplayable is the value of the idempotencyKey field of the 409 conflict that answers the
+// repeat of a SecretResponse call (D91): the call ran and its answer is not kept. It is a
+// stable token, not a text, so a client tells this conflict from another by comparing it
+// (client.IsNotReplayable, isNotReplayable in the TypeScript runtime).
+const NotReplayable = "not_replayable"
 
 func invalidParameter(name, message string) *Error {
 	return Invalid(map[string]string{name: message})

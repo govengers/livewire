@@ -192,7 +192,7 @@ type TodoParameters struct {
 - The body is decoded strictly (D40): it must be an object, an unknown member at any depth and a repeated member are 400 `invalid_request` naming the member's path. Then the field checks run ([Column checks](#column-checks)), then the `validate` tags (go-playground/validator, D44), each failure named by its JSON path. A tag the validator cannot parse fails `Add`.
 - `Check` runs before the body is read, on REST too (D8).
 - The handler runs inside the engine's transaction, after the `Idempotency-Key` was reserved; `livewire.IdempotencyKeyFrom(ctx)` reads the key ([Postgres](Postgres.md#the-transactor)).
-- `SecretResponse: true` keeps the response out of the idempotency record, for a response that shows a secret once, such as a new API key (D91): a repeat of the key answers 409 `conflict` whose field `idempotencyKey` is `livewire.NotReplayableText` instead of the response, so the client knows the call ran.
+- `SecretResponse: true` keeps the response out of the idempotency record, for a response that shows a secret once, such as a new API key (D91): a repeat of the key answers 409 `conflict` whose field `idempotencyKey` is `not_replayable` (`livewire.NotReplayable`) instead of the response, so the client knows the call ran; `client.IsNotReplayable(err)` in Go and `isNotReplayable(error)` in the TypeScript runtime test for it.
 - A string, a member name or a parameter holding U+0000 is 400 `invalid_request` naming it (D95): PostgreSQL text cannot store it.
 
 ### Client ids
