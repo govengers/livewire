@@ -26,20 +26,23 @@ lint: && openapi-breaking
 # Unit tests with the race detector, cached by go test (TST-014): a rerun runs only the packages whose test binary or inputs changed;
 # fails below the coverage threshold (examples, the e2e suite, the test harnesses and the generator's fixture with its generated clients excluded);
 # then the example's and the adapters' tests. The TypeScript gates, whose inputs the cache cannot see, are test-typescript's
-test: && test-example test-adapters
+test *flags: && (test-example flags) (test-adapters flags)
     mkdir -p sandbox
-    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -coverprofile=sandbox/unit.raw.cover ./...
+    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -coverprofile=sandbox/unit.raw.cover {{flags}} ./...
     grep -v -E '{{excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
     go tool cover -func=sandbox/unit.cover > sandbox/unit.func
     awk -v threshold={{coverage_threshold}} '/^total:/ { found = 1; sub("%", "", $3); print "coverage " $3 "%"; if ($3 + 0 < threshold) { print "coverage is below " threshold "%"; exit 1 } } END { if (!found) { print "no coverage total"; exit 1 } }' sandbox/unit.func
 
+# Every unit test, the example's and the adapters' included, uncached and shuffled: the nightly run and before a release (TST-014, TST-005)
+test-all: (test "-count=1" "-shuffle=on")
+
 # The example application's tests (a module of its own, examples/todo): the contract gates, the generated Go client and CLI against it; cached by go test
-test-example:
-    cd examples/todo && go test -race ./...
+test-example *flags:
+    cd examples/todo && go test -race {{flags}} ./...
 
 # The agent adapters' tests (modules of their own), cached by go test: they read nothing the cache cannot see
-test-adapters:
-    for module in {{adapters}}; do (cd "$module" && go test -race ./...); done
+test-adapters *flags:
+    for module in {{adapters}}; do (cd "$module" && go test -race {{flags}} ./...); done
 
 # Before tagging the adapters (D87): each adapter in a copy without the replace, against the released livewire it is to require, so a tag never ships a go.mod whose livewire lacks the toolset; then set that require in the adapter's go.mod
 adapters-against version:
@@ -56,6 +59,9 @@ test-typescript:
 test-e2e: && db-check-example
     mkdir -p sandbox
     {{require_typescript}} {{gotestsum}} --format testname --jsonfile sandbox/e2e.json -- -tags e2e -count=1 ./test/e2e/...
+
+# The end-to-end suite for the nightly run: test-e2e, which never skips (it has no TST-015 record of a green run)
+test-e2e-all: test-e2e
 
 # The example's SQL check chain (DAT-016), not hermetic (bunx fetches squawk, go run builds sqlc with cgo): squawk on the migrations, sqlc generate leaving nothing changed or new, the build, and sqlc vet on a fresh database the app's own migrator migrated
 db-check-example:

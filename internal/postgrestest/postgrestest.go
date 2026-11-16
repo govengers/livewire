@@ -5,7 +5,7 @@
 // The binaries are unpacked once per machine and PostgreSQL version into the directory
 // embedded-postgres caches its downloads in (~/.embedded-postgres-go, which the govengers CI
 // restores), and every test binary runs its instance in a directory of its package's own
-// below it (D88). Unpacking inside a -race test binary takes about 40 s; a start from the
+// below it (D89). Unpacking inside a -race test binary takes about 40 s; a start from the
 // unpacked binaries takes a few seconds.
 package postgrestest
 

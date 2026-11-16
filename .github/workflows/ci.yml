@@ -5,6 +5,8 @@ on:
     branches: [main, feat/v1]
     tags: ["v*"]
   pull_request:
+  schedule:
+    - cron: "47 2 * * *" # nightly: every test uncached (just test-all, test-e2e-all), so a flaky test hides in the cache for a day at most (TST-014)
 
 permissions:
   contents: read
@@ -13,6 +15,7 @@ jobs:
   go-library:
     uses: govengers/.github/.github/workflows/go-library.yml@v1
     with:
+      full: ${{ github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v') }}
       bun-version: "1.4.2" # the TypeScript gates (just test-typescript, the e2e suite's runtime, the example's type check)
     permissions:
       contents: write # the badges job pushes test and coverage badges to the badges branch
