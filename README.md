@@ -88,6 +88,10 @@ options := &generate.Options{
 
 The packages, what each depends on and which wiki page covers it: [docs/wiki/Home.md](docs/wiki/Home.md#packages).
 
+## Agents
+
+Every read, mutation and upload is also a tool an AI agent calls without a hand-written tool: `generate.NewCatalogue` describes them with JSON Schemas, `toolset` runs them in process under the user's identity (same checks, columns, audit and idempotency as the API, the audit naming the agent as the real actor), and two adapter modules hand them to govengers/aikido (`aikidoadapter`) or to any MCP client (`mcpadapter`, Streamable HTTP behind the application's authentication). See [Agent-Tools](docs/wiki/Agent-Tools.md).
+
 ## Identity
 
 A client serves one identity for its whole life. The TypeScript `Client` (REST) and `LiveConnection` (socket) are a pair (`createLivePair`) that never switches: another identity, a 4401 close or `end()` ends both, and every open request fails with an `EndedError`. Neither sees the session cookie, so the application ends the pair before the request that changes the session (login, logout, switch), then makes the next one and puts it into the ref it gave `livePlugin`, which the Vue composables follow ([details](docs/wiki/Generated-Clients.md#one-pair-per-identity)). A Go `client.Client` serves one API key.

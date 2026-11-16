@@ -121,8 +121,10 @@ const (
 // ExportColumns, or every field, without those whose Read check refuses the caller, and a
 // repository passes them to postgresadapter.WriteCSV, which writes a text a spreadsheet would
 // run as a formula with a single quote in front (D69). Partition names a subscription's
-// partition (D25); nil means the tenant.
+// partition (D25); nil means the tenant. Description says what the resource holds, for
+// people and agents (D85).
 type ResourceOptions[Item any] struct {
+	Description     string
 	Tables          []string
 	Read            authorization.Check
 	Partition       PartitionResolver
@@ -190,7 +192,7 @@ func NewResource[Item any](name, path string, options *ResourceOptions[Item]) *R
 		distinct:        options.Distinct,
 		export:          options.Export,
 	}
-	resource.partition = options.Partition
+	resource.partition, resource.description = options.Partition, options.Description
 	if options.Item != nil {
 		resource.item = &ItemKey{Parameter: options.Item.Parameter, Field: options.Item.Field}
 	}

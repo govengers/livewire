@@ -70,8 +70,11 @@ func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: 
 // JSON name (D39); FieldChecks adds a check per JSON field of Request. Effect is the
 // optimistic effect on live lists (D36). The body is validated with `validate` tags
 // (go-playground/validator, D44) after the structural checks; a tag the validator cannot
-// parse, on any struct reachable from Request, is a declaration error.
+// parse, on any struct reachable from Request, is a declaration error. Description says
+// what the mutation does, for people and agents (D85); "" leaves the OpenAPI operation
+// without one and the tool catalogue with a description of its own.
 type MutationOptions[Parameters, Request, Response any] struct {
+	Description string
 	Check       authorization.Check
 	Status      int
 	ClientID    ClientIDVersion
@@ -118,6 +121,7 @@ func NewMutation[Parameters, Request, Response any](name, method, path string, o
 		writeChecks:    maps.Clone(options.FieldChecks),
 		effect:         options.Effect,
 	}
+	mutation.description = options.Description
 	fallback := http.StatusOK
 	if !mutation.HasContent() {
 		fallback = http.StatusNoContent

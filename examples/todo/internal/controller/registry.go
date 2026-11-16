@@ -62,35 +62,42 @@ func newRegistry(todos *todoController, accounts *accountController, observer li
 		todos.resource(),
 		// snippet:begin typed-reads
 		livewire.NewList("activity", "/activity", &livewire.ListOptions[api.ActivityItem, api.ActivityParameters]{
-			Tables: []string{"activity"}, Read: authorization.IsUser(), Load: todos.activity,
+			Description: "The workspace's activity lines, of one todo when todoId is given.",
+			Tables:      []string{"activity"}, Read: authorization.IsUser(), Load: todos.activity,
 		}),
 		livewire.NewObject("summary", "/summary", &livewire.ObjectOptions[api.SummaryItem, livewire.NoParameters]{
-			Tables: []string{"todos", "attachments"}, Read: authorization.IsUser(), Load: todos.summary,
+			Description: "How many todos of the workspace are open and done, and how many attachments they have.",
+			Tables:      []string{"todos", "attachments"}, Read: authorization.IsUser(), Load: todos.summary,
 		}),
 		// snippet:end typed-reads
 		// snippet:begin mutations
 		livewire.NewMutation("createTodo", http.MethodPost, "/todos", &livewire.MutationOptions[livewire.NoParameters, api.CreateTodoRequest, api.TodoItem]{
-			Check: authorization.IsUser(), Status: http.StatusCreated, ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"),
+			Description: "Creates a todo in the caller's workspace.",
+			Check:       authorization.IsUser(), Status: http.StatusCreated, ClientID: livewire.UUIDv7, Effect: livewire.Upserts("todos"),
 			Handle: todos.create,
 		}),
 		livewire.NewMutation("updateTodo", http.MethodPatch, "/todos/{id}", &livewire.MutationOptions[api.TodoParameters, api.UpdateTodoRequest, api.TodoItem]{
-			Check: authorization.IsUser(), Resource: "todos", Effect: livewire.Upserts("todos"),
+			Description: "Changes the fields of a todo that the body carries; clearDueAt removes the due time.",
+			Check:       authorization.IsUser(), Resource: "todos", Effect: livewire.Upserts("todos"),
 			Handle: todos.update,
 		}),
 		livewire.NewMutation("deleteTodo", http.MethodDelete, "/todos/{id}", &livewire.MutationOptions[api.TodoParameters, livewire.NoBody, livewire.NoContent]{
-			Check: authorization.IsUser(), Effect: livewire.Removes("todos"),
+			Description: "Deletes a todo.",
+			Check:       authorization.IsUser(), Effect: livewire.Removes("todos"),
 			Handle: todos.delete,
 		}),
 		// snippet:end mutations
 		// snippet:begin upload
 		livewire.NewUpload("uploadAttachment", "/todos/{id}/attachments", &livewire.UploadOptions[api.TodoParameters, api.AttachmentItem]{
-			Check: authorization.IsUser(), Status: http.StatusCreated,
+			Description: "Attaches a file to a todo.",
+			Check:       authorization.IsUser(), Status: http.StatusCreated,
 			ContentTypes: []string{"text/plain", "image/png", "application/pdf"}, MaximumBytes: maximumAttachmentBytes,
 			Handle: todos.attach,
 		}),
 		// snippet:end upload
 		livewire.NewMutation("createKey", http.MethodPost, "/keys", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, api.KeyItem]{
-			Check: authorization.IsUser(), Status: http.StatusCreated,
+			Description: "Creates an API key of the caller, for the CLI and the Go client; the answer shows the key once.",
+			Check:       authorization.IsUser(), Status: http.StatusCreated,
 			Handle: accounts.createKey,
 		}),
 	)
@@ -104,6 +111,7 @@ type todoController struct {
 func (c *todoController) resource() *livewire.Resource {
 	// snippet:begin resource
 	return livewire.NewResource("todos", "/todos", &livewire.ResourceOptions[api.TodoItem]{
+		Description:  "The todos of the caller's workspace.",
 		Tables:       []string{"todos"},
 		Read:         authorization.IsUser(),
 		Fields:       c.todos.Fields(),

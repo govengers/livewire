@@ -181,13 +181,23 @@ type testApplication struct {
 
 func newTestApplication(t *testing.T) *testApplication {
 	t.Helper()
+	return newTestApplicationWith(t, nil)
+}
+
+// newTestApplicationWith is newTestApplication with the options change makes (the agents).
+func newTestApplicationWith(t *testing.T, change func(options *applicationOptions)) *testApplication {
+	t.Helper()
 	pool := newPool(t)
 	users := password.NewMemoryStorage()
 	events := &recordedEvents{}
-	application, err := newApplication(&applicationOptions{
+	options := &applicationOptions{
 		Pool: pool, Emitter: events, Metrics: prometheus.NewRegistry(), Traces: noop.NewTracerProvider(), Users: users,
 		SessionKey: sessionKey(t), InsecureCookie: true,
-	})
+	}
+	if change != nil {
+		change(options)
+	}
+	application, err := newApplication(options)
 	require.NoError(t, err)
 	for _, user := range []struct{ name, workspace string }{{"alice", "north"}, {"carol", "north"}, {"bob", "south"}} {
 		_, err := authentication.SeedUser(t.Context(), users, application.accounts, authentication.Seed{Username: user.name, Password: testPassword, Workspace: user.workspace})

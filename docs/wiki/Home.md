@@ -4,7 +4,7 @@ Declare an API once in Go; serve it as REST, as a live WebSocket and to generate
 
 ## Model
 
-A **registry** (`livewire.NewRegistry`) holds every **declaration** of an API by name. There are five kinds: a **resource** is a filterable list with item, distinct and history reads and an export; a **list** and an **object** are reads with typed parameters; a **mutation** is a write with a JSON body; an **upload** is a binary write. A read is **live** when it names the `Tables` its loader reads. The **engine** (`livewire.NewEngine`) runs every read and write for both transports: the REST adapter calls `Engine.Read`, `Call`, `Batch`, `Upload` and `Export`, the socket's ops run the same code, so a REST body is the socket's payload byte for byte. A **change feed** (the Postgres `Listener`) tells the engine which table changed; the engine re-runs the subscriptions of that table and pushes what changed. The **generator** turns the registry into the TypeScript client, the OpenAPI document, the Go client and the CLI.
+A **registry** (`livewire.NewRegistry`) holds every **declaration** of an API by name. There are five kinds: a **resource** is a filterable list with item, distinct and history reads and an export; a **list** and an **object** are reads with typed parameters; a **mutation** is a write with a JSON body; an **upload** is a binary write. A read is **live** when it names the `Tables` its loader reads. The **engine** (`livewire.NewEngine`) runs every read and write for both transports: the REST adapter calls `Engine.Read`, `Call`, `Batch`, `Upload` and `Export`, the socket's ops run the same code, so a REST body is the socket's payload byte for byte. A **change feed** (the Postgres `Listener`) tells the engine which table changed; the engine re-runs the subscriptions of that table and pushes what changed. The **generator** turns the registry into the TypeScript client, the OpenAPI document, the Go client and the CLI, and into the **tool catalogue** agents call through the same engine.
 
 Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `authorization.Check` the check type. livewire never logs; every outcome goes to the registry's `Observer`.
 
@@ -20,6 +20,9 @@ Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `auth
 | `generate` | the TypeScript, OpenAPI, Go client and CLI generators | the root, `query`, google/uuid | [Generated-Clients](Generated-Clients.md) |
 | `client` | the runtime of the generated Go client and CLI | the root, `query`, gorilla/websocket, google/uuid | [Generated-Clients](Generated-Clients.md) |
 | `livewiretest` | the contract gates | the root, `query`, `generate`, gorilla/websocket | [Testing](Testing.md) |
+| `toolset` | the operations as agent tools, run in process as the identity | the root, `generate`, govengers/auth, google/uuid | [Agent-Tools](Agent-Tools.md) |
+| `aikidoadapter` (module of its own) | a toolset as govengers/aikido tools | `toolset`, govengers/aikido | [Agent-Tools](Agent-Tools.md) |
+| `mcpadapter` (module of its own) | a toolset as a Model Context Protocol server | `toolset`, modelcontextprotocol/go-sdk | [Agent-Tools](Agent-Tools.md) |
 
 ## Wiring order in main
 
@@ -32,7 +35,8 @@ Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `auth
 5. `livewire.NewEngine` with the registry, the adapters, the `IdentitySource` (`session.Guard` for sessions, or one that also resolves API keys, as the todo app's `authentication` package does) and the allowed origins.
 6. The govengers/jobs worker with the maintenance schedules of the stores.
 7. The gin router: the authentication middleware, `ginadapter.RegisterRoutes`, `ginadapter.SocketHandler` behind the same middleware.
-8. Run `engine.Run`, the worker and the servers in one errgroup; on SIGTERM withdraw readiness, shut the server down, then `engine.Close(ctx)` ends every socket with 1001.
+8. Optionally the agents: `generate.NewCatalogue`, a `toolset.New` per agent, `mcpadapter.New` behind the authentication, `aikidoadapter.Register` for an in-process agent ([Agent-Tools](Agent-Tools.md)).
+9. Run `engine.Run`, the worker and the servers in one errgroup; on SIGTERM withdraw readiness, shut the server down, then `engine.Close(ctx)` ends every socket with 1001.
 
 ## Pages
 
@@ -42,6 +46,7 @@ Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `auth
 - [Postgres](Postgres.md): migrations and deploy order, the transactor, the stores and their sweeps, `ListPage` and friends, Row Level Security.
 - [REST-and-Metrics](REST-and-Metrics.md): the routes, uploads, the export trailer, wide events, Prometheus.
 - [Generated-Clients](Generated-Clients.md): `generate.Write`, TypeScript and Vue, OpenAPI, the Go client, the CLI.
+- [Agent-Tools](Agent-Tools.md): the tool catalogue, the toolset, aikido and MCP.
 - [Testing](Testing.md): the four gates and the end-to-end pattern.
 - [Migration](Migration.md): from `github.com/mxcd/livewire` v0.2.x.
 

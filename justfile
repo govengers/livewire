@@ -5,7 +5,9 @@ govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 sqlc := "go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1"
 oasdiff := "go run github.com/oasdiff/oasdiff@v1.35.0"
 coverage_threshold := "80"
-excluded := "/examples/|/test/|/generate/internal/fixture/"
+# The nested modules of the agent adapters (D87): each keeps its dependency (aikido, the MCP SDK) out of livewire's go.mod
+adapters := "aikidoadapter mcpadapter"
+excluded := "/examples/|/test/|/generate/internal/fixture/|/internal/toolfixture/"
 # CI (GitHub sets CI) has bun: the TypeScript parts of the e2e suite fail there instead of skipping
 require_typescript := if env_var_or_default("CI", "") != "" { "LIVEWIRE_REQUIRE_TYPESCRIPT=1" } else { "" }
 
@@ -19,9 +21,10 @@ lint: && openapi-breaking
     go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
     cd examples/todo && go vet ./... && golangci-lint run ./...
+    for module in {{adapters}}; do (cd "$module" && go vet ./... && golangci-lint run ./...); done
 
-# Unit tests with the race detector; fails below the coverage threshold (examples, the e2e suite and the generator's fixture with its generated clients excluded); then the example's tests
-test: && test-example
+# Unit tests with the race detector; fails below the coverage threshold (examples, the e2e suite and the generator's fixture with its generated clients excluded); then the example's and the adapters' tests
+test: && test-example test-adapters
     mkdir -p sandbox
     {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.raw.cover ./...
     grep -v -E '{{excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
@@ -31,6 +34,14 @@ test: && test-example
 # The example application's tests (a module of its own, examples/todo): the contract gates, the generated Go client and CLI against it, the frontend's type check
 test-example:
     cd examples/todo && {{require_typescript}} go test -race -count=1 ./...
+
+# The agent adapters' tests (modules of their own), cached by go test: they read nothing the cache cannot see
+test-adapters:
+    for module in {{adapters}}; do (cd "$module" && go test -race ./...); done
+
+# Before tagging the adapters (D87): each adapter in a copy without the replace, against the released livewire it is to require, so a tag never ships a go.mod whose livewire lacks the toolset; then set that require in the adapter's go.mod
+adapters-against version:
+    for module in {{adapters}}; do copy="$(mktemp -d)"; cp -R "$module/." "$copy"; (cd "$copy" && go mod edit -dropreplace=github.com/govengers/livewire -require=github.com/govengers/livewire@{{version}} && go mod tidy && go vet ./... && go test ./...) || { rm -rf "$copy"; echo "$module does not build against livewire {{version}}"; exit 1; }; rm -rf "$copy"; done
 
 # The TypeScript gates of the generator (tsc on the generated client, the runtime's bun tests), failing without bun
 test-typescript:
@@ -66,6 +77,7 @@ openapi-breaking ref="":
 vulncheck:
     {{govulncheck}} ./...
     cd examples/todo && {{govulncheck}} ./...
+    for module in {{adapters}}; do (cd "$module" && {{govulncheck}} ./...); done
 
 # Everything CI runs
 check: lint test test-e2e vulncheck

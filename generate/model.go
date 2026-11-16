@@ -49,6 +49,7 @@ type reservedModel struct {
 // or the object), which the Go client imports.
 type readModel struct {
 	declaration string
+	description string
 	kind        livewire.ReadKind
 	path        string
 	queryType   string
@@ -64,6 +65,7 @@ type readModel struct {
 // and response (nil for none), which the Go client imports.
 type mutationModel struct {
 	name           string
+	description    string
 	method         string
 	path           string
 	parametersType string
@@ -79,6 +81,7 @@ type mutationModel struct {
 
 type uploadModel struct {
 	name           string
+	description    string
 	path           string
 	parametersType string
 	parameters     []parameterModel
@@ -290,16 +293,16 @@ func (m *model) addResource(resource *livewire.Resource, filters *resourceModel,
 	if err != nil {
 		return err
 	}
-	name, live := resource.Name(), len(resource.Tables()) > 0
+	name, description, live := resource.Name(), resource.Description(), len(resource.Tables()) > 0
 	m.reads = append(m.reads, &readModel{
-		declaration: name, kind: livewire.ReadMain, path: resource.Path(), queryType: pascalCase(name) + "ListQuery",
+		declaration: name, description: description, kind: livewire.ReadMain, path: resource.Path(), queryType: pascalCase(name) + "ListQuery",
 		reserved: reservedModel{filters: filters, sort: true, page: true, after: resource.Cursor()},
 		data:     &shape{kind: shapeListResponse, element: item}, item: resource.ItemType(), list: true, live: live,
 	})
 	key := itemKeyParameter(resource)
 	if key != nil {
 		m.reads = append(m.reads, &readModel{
-			declaration: name, kind: livewire.ReadItem, path: resource.ItemPath(), queryType: pascalCase(name) + "ItemParameters",
+			declaration: name, description: description, kind: livewire.ReadItem, path: resource.ItemPath(), queryType: pascalCase(name) + "ItemParameters",
 			parameters: []parameterModel{*key}, data: item, item: resource.ItemType(), live: live,
 		})
 	}
@@ -309,20 +312,20 @@ func (m *model) addResource(resource *livewire.Resource, filters *resourceModel,
 			return err
 		}
 		m.reads = append(m.reads, &readModel{
-			declaration: name, kind: livewire.ReadDistinct, path: resource.DistinctPath(), queryType: pascalCase(name) + "DistinctQuery",
+			declaration: name, description: description, kind: livewire.ReadDistinct, path: resource.DistinctPath(), queryType: pascalCase(name) + "DistinctQuery",
 			reserved: reservedModel{filters: filters, page: true, field: true},
 			data:     &shape{kind: shapeArray, element: distinct}, item: reflect.TypeFor[livewire.DistinctValue](), live: live,
 		})
 	}
 	if resource.HistoryPath() != "" {
 		m.reads = append(m.reads, &readModel{
-			declaration: name, kind: livewire.ReadHistory, path: resource.HistoryPath(), queryType: pascalCase(name) + "HistoryQuery",
+			declaration: name, description: description, kind: livewire.ReadHistory, path: resource.HistoryPath(), queryType: pascalCase(name) + "HistoryQuery",
 			parameters: []parameterModel{*key}, reserved: reservedModel{filters: m.history, sort: true, page: true},
 			data: &shape{kind: shapeListResponse, element: &shape{kind: shapeVersion, element: item}}, item: resource.ItemType(), list: true, live: live,
 		})
 	}
 	if presence && key != nil {
-		if err := m.addPresence(name, resource.PresencePath(), nil); err != nil {
+		if err := m.addPresence(name, description, resource.PresencePath(), nil); err != nil {
 			return err
 		}
 	}
@@ -375,7 +378,7 @@ func (m *model) addList(list *livewire.List) error {
 		return err
 	}
 	m.reads = append(m.reads, &readModel{
-		declaration: list.Name(), kind: livewire.ReadMain, path: list.Path(), queryType: pascalCase(list.Name()) + "Parameters",
+		declaration: list.Name(), description: list.Description(), kind: livewire.ReadMain, path: list.Path(), queryType: pascalCase(list.Name()) + "Parameters",
 		parameters: parameters, data: &shape{kind: shapeListResponse, element: item}, item: list.ItemType(), list: true, live: len(list.Tables()) > 0,
 	})
 	return nil
@@ -387,20 +390,20 @@ func (m *model) addObject(object *livewire.Object, presence bool) error {
 		return err
 	}
 	m.reads = append(m.reads, &readModel{
-		declaration: object.Name(), kind: livewire.ReadMain, path: object.Path(), queryType: pascalCase(object.Name()) + "Parameters",
+		declaration: object.Name(), description: object.Description(), kind: livewire.ReadMain, path: object.Path(), queryType: pascalCase(object.Name()) + "Parameters",
 		parameters: parameters, data: item, item: object.ItemType(), live: len(object.Tables()) > 0,
 	})
 	if !presence {
 		return nil
 	}
-	return m.addPresence(object.Name(), object.PresencePath(), parameters)
+	return m.addPresence(object.Name(), object.Description(), object.PresencePath(), parameters)
 }
 
 // addPresence adds the presence read of a record (D37): the declaration's own parameters and
 // the key. It is always live: the presence table re-runs it. An object's own query parameter
 // `key` is the key, required here; a `key` of another kind could not be told from it and is
 // refused.
-func (m *model) addPresence(name, path string, parameters []parameterModel) error {
+func (m *model) addPresence(name, description, path string, parameters []parameterModel) error {
 	presence, err := m.types.shapeOf(reflect.TypeFor[livewire.PresenceItem](), use{})
 	if err != nil {
 		return err
@@ -417,7 +420,7 @@ func (m *model) addPresence(name, path string, parameters []parameterModel) erro
 		return fmt.Errorf("the parameter %q is the presence key (D37), so it must be a string query parameter", livewire.ParameterPresenceKey)
 	}
 	m.reads = append(m.reads, &readModel{
-		declaration: name, kind: livewire.ReadPresence, path: path, queryType: pascalCase(name) + "PresenceParameters",
+		declaration: name, description: description, kind: livewire.ReadPresence, path: path, queryType: pascalCase(name) + "PresenceParameters",
 		parameters: merged, data: &shape{kind: shapeListResponse, element: presence}, item: reflect.TypeFor[livewire.PresenceItem](), list: true, live: true,
 	})
 	return nil
@@ -425,7 +428,7 @@ func (m *model) addPresence(name, path string, parameters []parameterModel) erro
 
 func (m *model) addMutation(mutation *livewire.Mutation) error {
 	added := &mutationModel{
-		name: mutation.Name(), method: mutation.Method(), path: mutation.Path(), parametersType: pascalCase(mutation.Name()) + "Parameters",
+		name: mutation.Name(), description: mutation.Description(), method: mutation.Method(), path: mutation.Path(), parametersType: pascalCase(mutation.Name()) + "Parameters",
 		parameters: m.parametersOf(mutation.Parameters()), status: mutation.Status(), effect: mutation.Effect(), clientID: mutation.ClientID(),
 	}
 	var err error
@@ -451,7 +454,7 @@ func (m *model) addUpload(upload *livewire.Upload) error {
 		return err
 	}
 	m.uploads = append(m.uploads, &uploadModel{
-		name: upload.Name(), path: upload.Path(), parametersType: pascalCase(upload.Name()) + "Parameters",
+		name: upload.Name(), description: upload.Description(), path: upload.Path(), parametersType: pascalCase(upload.Name()) + "Parameters",
 		parameters: m.parametersOf(upload.Parameters()), response: response, responseType: upload.ResponseType(),
 		status: upload.Status(), contentTypes: upload.ContentTypes(), maximumBytes: upload.MaximumBytes(),
 	})

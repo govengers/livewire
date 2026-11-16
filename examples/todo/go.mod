@@ -2,9 +2,13 @@ module github.com/govengers/livewire/examples/todo
 
 go 1.26.0
 
-// The example builds against the livewire of this checkout, so it shows and tests the
-// library as it is; an application requires a released version instead.
-replace github.com/govengers/livewire => ../..
+// The example builds against the livewire (and its agent adapters) of this checkout, so it
+// shows and tests the library as it is; an application requires a released version instead.
+replace (
+	github.com/govengers/livewire => ../..
+	github.com/govengers/livewire/aikidoadapter => ../../aikidoadapter
+	github.com/govengers/livewire/mcpadapter => ../../mcpadapter
+)
 
 require (
 	github.com/exaring/otelpgx v0.13.0
@@ -12,23 +16,36 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/govengers/aikido v1.2.0
 	github.com/govengers/auth v1.3.0
 	github.com/govengers/config/v2 v2.0.0
 	github.com/govengers/jobs v1.1.0
-	github.com/govengers/livewire v0.0.0-00010101000000-000000000000
+	github.com/govengers/livewire v1.0.1
+	github.com/govengers/livewire/aikidoadapter v0.0.0-00010101000000-000000000000
+	github.com/govengers/livewire/mcpadapter v0.0.0-00010101000000-000000000000
 	github.com/govengers/telemetry v0.1.0
 	github.com/govengers/wide-event-logger v1.0.0
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/pressly/goose/v3 v3.29.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/stretchr/testify v1.12.1
-	github.com/urfave/cli/v3 v3.12.0
+	github.com/urfave/cli/v3 v3.14.0
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
 	go.uber.org/goleak v1.3.0
 	golang.org/x/sync v0.24.0
+)
+
+require (
+	github.com/google/jsonschema-go v0.4.3 // indirect
+	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/segmentio/asm v1.2.1 // indirect
+	github.com/segmentio/encoding v0.5.4 // indirect
+	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
+	golang.org/x/oauth2 v0.37.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 )
 
 require (

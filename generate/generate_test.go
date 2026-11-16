@@ -236,7 +236,7 @@ func TestOptionsAreValidated(t *testing.T) {
 		message string
 	}{
 		{"nil options", func() *generate.Options { return nil }, "needs options"},
-		{"no output", func() *generate.Options { return &generate.Options{} }, "a GoClient.Directory or a CommandLine.Directory"},
+		{"no output", func() *generate.Options { return &generate.Options{} }, "a CommandLine.Directory or a CatalogueFile"},
 		{"a JSON file", func() *generate.Options { options := valid(); options.OpenAPIFile = "openapi.json"; return options }, "name it .yaml"},
 		{"no title", func() *generate.Options { options := valid(); options.OpenAPI.Title = ""; return options }, "Title and a Version"},
 		{"a server without URL", func() *generate.Options {
