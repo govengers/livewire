@@ -468,26 +468,42 @@ func TestNullableSchemasCarryTheirType(t *testing.T) {
 	require.Greater(t, walk(root, ""), 5)
 }
 
-func TestTheListItemOfAPointerItemOmitsItsDetailFields(t *testing.T) {
+// detailRegistry has one list-only resource "notes" of Item whose field text is Detail: no
+// other read or mutation names Item.
+func detailRegistry[Item any](t *testing.T) *livewire.Registry {
+	t.Helper()
 	registry, err := livewire.NewRegistry(nil)
 	require.NoError(t, err)
-	require.NoError(t, registry.Add(livewire.NewResource("notes", "/notes", &livewire.ResourceOptions[*fixture.Note]{
+	require.NoError(t, registry.Add(livewire.NewResource("notes", "/notes", &livewire.ResourceOptions[Item]{
 		Read: authorization.IsUser(),
 		Fields: query.Fields{
 			{Name: "id", Type: query.TypeInteger, SQL: "notes.id", Filter: true},
 			{Name: "text", Type: query.TypeText, SQL: "notes.text", Search: true, Detail: true},
 		},
-		List: func(context.Context, *query.ListQuery) (*livewire.Page[*fixture.Note], error) {
-			return &livewire.Page[*fixture.Note]{}, nil
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[Item], error) {
+			return &livewire.Page[Item]{}, nil
 		},
 	})))
+	return registry
+}
+
+func TestTheListItemOfAPointerItemOmitsItsDetailFields(t *testing.T) {
 	directory := t.TempDir()
 	options := goOptions(directory)
 	options.TypeScriptDirectory = directory
-	require.NoError(t, generate.Write(registry, options))
+	require.NoError(t, generate.Write(detailRegistry[*fixture.Note](t), options))
 	require.Contains(t, readGenerated(t, directory, "api.ts"), "runtime.ListResponse<Omit<types.Note, 'text'> | null>",
 		"Omit applies to the item, the null stays outside: Omit of a union with null keeps no member")
 	goClient := readGenerated(t, directory, "client/client.go")
 	require.Contains(t, goClient, "type NotesListItem struct {\n\tID int `json:\"id\"`\n}", "the Go list item leaves the Detail field out")
 	require.Contains(t, goClient, "(*livewire.ListResponse[*NotesListItem], error)", "and keeps the item's pointer")
+	require.NotContains(t, goClient, "/generate/internal/fixture\"", "no declaration uses the item's package, so the file does not import it")
+}
+
+func TestTheListItemKeepsWhatAnUnnamedStructPromotes(t *testing.T) {
+	directory := t.TempDir()
+	require.NoError(t, generate.Write(detailRegistry[fixture.InlineNote](t), goOptions(directory)))
+	require.Contains(t, readGenerated(t, directory, "client/client.go"),
+		"Inline struct {\n\t\tHidden string `json:\"hidden\"`\n\t\tA      int    `json:\"a\"`\n\t} `json:\"inline\"`",
+		"encoding/json promotes the fields of an embedded unexported struct, so the list item declares them")
 }

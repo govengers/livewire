@@ -131,8 +131,10 @@ type PartsListItem struct {
 	Code        fixture.Code       `json:"code"`
 	ContentType string             `json:"content-type"`
 	Dash        string             `json:"-,"`
-	Inline      struct{ A int }    `json:"inline"`
-	Metadata    map[string]string  `json:"metadata,omitempty"`
+	Inline      struct {
+		A int `json:"A"`
+	} `json:"inline"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // GetParts reads GET /api/v1/parts, the socket target "parts".

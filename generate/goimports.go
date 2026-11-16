@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/govengers/livewire/internal/jsonfield"
 )
 
 // goFile collects the imports of one generated Go file and writes the type expressions of
@@ -161,28 +163,57 @@ func (f *goFile) typeExpression(goType reflect.Type, unnamedStructs bool) (strin
 	return "", fmt.Errorf("generate: the Go client cannot name the type %s: give it a name in an importable package", goType)
 }
 
-// structExpression is the expression of an unnamed struct: its exported fields with their
-// tags; encoding/json reads no other.
+// structExpression is the expression of an unnamed struct: its JSON fields as structFields
+// declares them.
 func (f *goFile) structExpression(goType reflect.Type) (string, error) {
-	var fields []string
-	for position := range goType.NumField() {
-		field := goType.Field(position)
-		if !field.IsExported() {
-			continue
-		}
-		expression, err := f.fieldExpression(field.Type)
-		if err != nil {
-			return "", err
-		}
-		if !field.Anonymous {
-			expression = field.Name + " " + expression
-		}
-		if field.Tag != "" {
-			expression += " " + strconv.Quote(string(field.Tag))
-		}
-		fields = append(fields, expression)
+	fields, err := f.structFields(goType, nil)
+	if err != nil {
+		return "", err
 	}
 	return "struct{ " + strings.Join(fields, "; ") + " }", nil
+}
+
+// structFields are the fields of a struct the generated code declares itself (a list item's,
+// D93): every JSON field of goType but those named in leave, flat (embedded structs' fields
+// promoted, an unexported one's too, as encoding/json reads them), each under its Go name,
+// type and json options. Two JSON fields of one Go name cannot be declared side by side.
+func (f *goFile) structFields(goType reflect.Type, leave []string) ([]string, error) {
+	var fields []string
+	declared := map[string]bool{}
+	for _, field := range jsonfield.Of(goType) {
+		if slices.Contains(leave, field.Name) {
+			continue
+		}
+		goName := field.StructField.Name
+		if declared[goName] {
+			return nil, fmt.Errorf("generate: %s has two JSON fields named %s in Go; the Go client cannot declare a struct of its fields: rename one of them", goType, goName)
+		}
+		declared[goName] = true
+		expression, err := f.fieldExpression(field.StructField.Type)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, fmt.Sprintf("%s %s `json:%q`", goName, expression, jsonTag(field)))
+	}
+	return fields, nil
+}
+
+// jsonTag is the json tag of a field as encoding/json reads it: its name and options.
+func jsonTag(field jsonfield.Field) string {
+	tag := field.Name
+	if tag == "-" {
+		tag = "-," // the name "-", not the field left out
+	}
+	if field.OmitEmpty {
+		tag += ",omitempty"
+	}
+	if field.OmitZero {
+		tag += ",omitzero"
+	}
+	if field.Quoted {
+		tag += ",string"
+	}
+	return tag
 }
 
 // named is the expression of a named type: a predeclared one as it is, another qualified

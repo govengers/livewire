@@ -305,3 +305,18 @@ type Note struct {
 	ID   int    `json:"id"`
 	Text string `json:"text"`
 }
+
+type noteBase struct {
+	Hidden string `json:"hidden"`
+}
+
+// InlineNote has an unnamed struct field that promotes a JSON field from an unexported
+// embedded struct, which a list item the Go client declares must keep.
+type InlineNote struct {
+	ID     int `json:"id"`
+	Inline struct {
+		noteBase
+		A int `json:"a"`
+	} `json:"inline"`
+	Text string `json:"text"`
+}
