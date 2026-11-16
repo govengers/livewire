@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/govengers/auth/authorization"
@@ -12,6 +13,7 @@ import (
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/generate"
 	"github.com/govengers/livewire/generate/internal/fixture"
+	"github.com/govengers/livewire/query"
 )
 
 // goOptions writes only the Go outputs of a registry whose types live in the fixture.
@@ -186,4 +188,46 @@ func TestCommandLineRefusesCollidingNames(t *testing.T) {
 			require.ErrorContains(t, generate.Write(registry, goOptions(t.TempDir())), testCase.message)
 		})
 	}
+}
+
+func TestGoIdentifiersSpellInitialismsInOneCase(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(
+		livewire.NewResource("apiKeys", "/api-keys", &livewire.ResourceOptions[fixture.Part]{
+			Read: authorization.IsUser(),
+			Fields: query.Fields{
+				{Name: "id", Type: query.TypeUUID, SQL: "keys.id", Filter: true},
+				{Name: "ownerId", Type: query.TypeUUID, SQL: "keys.owner_id", Filter: true, Sort: true},
+			},
+			Item: &livewire.ItemKey{Parameter: "keyId", Field: "id"},
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[fixture.Part], error) { return &livewire.Page[fixture.Part]{}, nil },
+			Get:  func(context.Context, *query.ListQuery) (*fixture.Part, error) { return &fixture.Part{}, nil },
+		}),
+		livewire.NewMutation("createApiKey", http.MethodPost, "/api-keys/{userId}", &livewire.MutationOptions[struct {
+			UserID string `path:"userId"`
+		}, livewire.NoBody, fixture.Part]{
+			Check:  authorization.IsUser(),
+			Handle: func(context.Context, *struct{ UserID string `path:"userId"` }, *livewire.NoBody) (*fixture.Part, error) { return &fixture.Part{}, nil },
+		}),
+	))
+	directory := t.TempDir()
+	options := goOptions(directory)
+	options.TypeScriptDirectory = filepath.Join(directory, "web")
+	require.NoError(t, generate.Write(registry, options))
+	goClient := readGenerated(t, directory, "client/client.go") + readGenerated(t, directory, "client/filters.go")
+	for _, name := range []string{
+		"func (c *Client) GetAPIKeys(", "func (c *Client) GetAPIKeysItem(", "type APIKeysListQuery struct", "type APIKeysItemParameters struct",
+		"KeyID uuid.UUID", "func (c *Client) CreateAPIKey(", "type CreateAPIKeyParameters struct", "UserID string", "func BatchCreateAPIKey(",
+		"type APIKeysFilter struct", "func APIKeysOwnerIDEqual(", "APIKeysSortOwnerIDDescending APIKeysSortTerm = \"-ownerId\"", "type APIKeysField string",
+	} {
+		require.Contains(t, goClient, name)
+	}
+	code := regexp.MustCompile(`"[^"\n]*"|//.*`).ReplaceAllString(goClient, "") // the identifiers, without wire names
+	require.NotRegexp(t, `(Api|Id)([A-Z]|\b)`, code, "no identifier spells an initialism in mixed case (NAM-002)")
+	command := readGenerated(t, directory, "command/command.go")
+	require.Contains(t, command, "func apiKeysListQuery() []parameter")
+	require.Contains(t, command, "func createAPIKeyParameters() []parameter")
+	require.Contains(t, command, `callCommand("create-api-key"`, "wire and command names stay as declared")
+	require.Contains(t, readGenerated(t, directory, "web/api.ts"), "export function getApiKeys(", "TypeScript keeps its own spelling")
 }

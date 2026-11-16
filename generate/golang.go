@@ -70,7 +70,7 @@ type goClient struct {
 }
 
 func renderGoClient(api *model, options GoClientOptions) ([]file, error) {
-	renderer := &goClient{api: api, options: options, identifiers: newGoIdentifiers("Client", "New", "SaveFilter", "ListFilters", "DeleteFilter", "Batch", "idempotencyKey")}
+	renderer := &goClient{api: goModel(api), options: options, identifiers: newGoIdentifiers("Client", "New", "SaveFilter", "ListFilters", "DeleteFilter", "Batch", "idempotencyKey")}
 	if err := renderer.declareIdentifiers(); err != nil {
 		return nil, err
 	}
@@ -85,6 +85,57 @@ func renderGoClient(api *model, options GoClientOptions) ([]file, error) {
 	return []file{{path: "client.go", content: clientSource}, {path: "filters.go", content: filtersSource}}, nil
 }
 
+// goModel is api with the names of the types the Go client declares spelled as Go
+// identifiers (goIdentifier, NAM-002): the reads' and exports' query types, the mutations'
+// and uploads' parameter types and the prefixes of the filter vocabularies. TypeScript keeps
+// the model's own spelling and the wire names (targets, members) stay as declared.
+func goModel(api *model) *model {
+	renamed := *api
+	resources := map[*resourceModel]*resourceModel{}
+	rename := func(resource *resourceModel) *resourceModel {
+		if resource == nil {
+			return nil
+		}
+		if copied, ok := resources[resource]; ok {
+			return copied
+		}
+		copied := *resource
+		copied.name = goIdentifier(resource.name)
+		resources[resource] = &copied
+		return &copied
+	}
+	renamed.resources = make([]*resourceModel, 0, len(api.resources))
+	for _, resource := range api.resources {
+		renamed.resources = append(renamed.resources, rename(resource))
+	}
+	renamed.history = rename(api.history)
+	renamed.reads = make([]*readModel, 0, len(api.reads))
+	for _, read := range api.reads {
+		copied := *read
+		copied.queryType, copied.reserved.filters = goIdentifier(read.queryType), rename(read.reserved.filters)
+		renamed.reads = append(renamed.reads, &copied)
+	}
+	renamed.mutations = make([]*mutationModel, 0, len(api.mutations))
+	for _, mutation := range api.mutations {
+		copied := *mutation
+		copied.parametersType = goIdentifier(mutation.parametersType)
+		renamed.mutations = append(renamed.mutations, &copied)
+	}
+	renamed.uploads = make([]*uploadModel, 0, len(api.uploads))
+	for _, upload := range api.uploads {
+		copied := *upload
+		copied.parametersType = goIdentifier(upload.parametersType)
+		renamed.uploads = append(renamed.uploads, &copied)
+	}
+	renamed.exports = make([]*exportModel, 0, len(api.exports))
+	for _, export := range api.exports {
+		copied := *export
+		copied.queryType, copied.reserved.filters = goIdentifier(export.queryType), rename(export.reserved.filters)
+		renamed.exports = append(renamed.exports, &copied)
+	}
+	return &renamed
+}
+
 // declareIdentifiers takes every top-level name before anything renders, so an import alias
 // takes none of them.
 func (g *goClient) declareIdentifiers() error {
@@ -97,7 +148,7 @@ func (g *goClient) declareIdentifiers() error {
 		owned = append(owned, ownedNames{names, "the read " + read.targetName()})
 	}
 	for _, mutation := range g.api.mutations {
-		name := pascalCase(mutation.name)
+		name := goIdentifier(mutation.name)
 		names := []string{mutation.parametersType, name, "Batch" + name}
 		if mutation.clientID != livewire.ClientIDNone {
 			names = append(names, "Prepare"+name, "with"+name+"ClientID")
@@ -105,10 +156,10 @@ func (g *goClient) declareIdentifiers() error {
 		owned = append(owned, ownedNames{names, "the mutation " + mutation.name})
 	}
 	for _, upload := range g.api.uploads {
-		owned = append(owned, ownedNames{[]string{upload.parametersType, pascalCase(upload.name)}, "the upload " + upload.name})
+		owned = append(owned, ownedNames{[]string{upload.parametersType, goIdentifier(upload.name)}, "the upload " + upload.name})
 	}
 	for _, export := range g.api.exports {
-		owned = append(owned, ownedNames{[]string{export.queryType, "Export" + pascalCase(export.declaration)}, "the export of " + export.declaration})
+		owned = append(owned, ownedNames{[]string{export.queryType, "Export" + goIdentifier(export.declaration)}, "the export of " + export.declaration})
 	}
 	for _, resource := range g.filterResources() {
 		owned = append(owned, ownedNames{filterNames(resource), "the filter types of " + resource.name})
@@ -153,7 +204,7 @@ func (g *goClient) filterResources() []*resourceModel {
 }
 
 func goReadName(prefix string, read *readModel) string {
-	return prefix + strings.TrimPrefix(read.functionName(), "get")
+	return prefix + goIdentifier(strings.TrimPrefix(read.functionName(), "get"))
 }
 
 // goSource is one generated Go file: its imports and its body.
@@ -418,7 +469,7 @@ func (g *goClient) read(source *goSource, read *readModel) error {
 }
 
 func (g *goClient) mutation(source *goSource, mutation *mutationModel) error {
-	name := pascalCase(mutation.name)
+	name := goIdentifier(mutation.name)
 	present, err := g.parametersStruct(source, mutation.parametersType, "are the parameters of "+name, wireParameters(mutation.parameters, reservedModel{}))
 	if err != nil {
 		return err
@@ -479,7 +530,7 @@ func clientIDVersion(version livewire.ClientIDVersion) int {
 
 // batchCall writes the function that makes a mutation one call of a batch.
 func (g *goClient) batchCall(source *goSource, mutation *mutationModel, present bool, bodyType string) error {
-	name := pascalCase(mutation.name)
+	name := goIdentifier(mutation.name)
 	livewireAlias := source.file.use(livewirePath, "livewire")
 	var arguments []string
 	var body strings.Builder
@@ -504,7 +555,7 @@ func (g *goClient) batchCall(source *goSource, mutation *mutationModel, present 
 // (D18): the body's JSON field "id" must be a uuid.UUID or of a string kind, or a pointer
 // to one, reached without an embedded pointer.
 func (g *goClient) clientID(source *goSource, mutation *mutationModel, bodyType string) error {
-	name := pascalCase(mutation.name)
+	name := goIdentifier(mutation.name)
 	field, selector, err := clientIDField(mutation.requestType)
 	if err != nil {
 		return fmt.Errorf("%w (the mutation %s)", err, mutation.name)
@@ -671,7 +722,7 @@ func undecodable(goType reflect.Type, path string, visited map[reflect.Type]bool
 }
 
 func (g *goClient) upload(source *goSource, upload *uploadModel) error {
-	name := pascalCase(upload.name)
+	name := goIdentifier(upload.name)
 	present, err := g.parametersStruct(source, upload.parametersType, "are the parameters of "+name, wireParameters(upload.parameters, reservedModel{}))
 	if err != nil {
 		return err
@@ -694,7 +745,7 @@ func (g *goClient) upload(source *goSource, upload *uploadModel) error {
 }
 
 func (g *goClient) export(source *goSource, export *exportModel) error {
-	name := "Export" + pascalCase(export.declaration)
+	name := "Export" + goIdentifier(export.declaration)
 	present, err := g.parametersStruct(source, export.queryType, "are the parameters of "+name, wireParameters(nil, export.reserved))
 	if err != nil {
 		return err

@@ -307,18 +307,57 @@ func formatGo(name string, source string) ([]byte, error) {
 	return formatted, nil
 }
 
-// goIdentifier is a name as a Go identifier: PascalCase with the initialisms of Go style
-// ("filterId" is FilterID).
-func goIdentifier(name string) string {
-	initialisms := map[string]string{"Id": "ID", "Ids": "IDs", "Url": "URL", "Uuid": "UUID", "Api": "API", "Http": "HTTP", "Json": "JSON", "Ip": "IP", "Csv": "CSV", "Html": "HTML"}
-	var builder strings.Builder
-	for _, word := range camelWords(pascalCase(name)) {
-		if initialism, ok := initialisms[word]; ok {
-			word = initialism
-		}
-		builder.WriteString(word)
+// goInitialisms are the words a Go identifier writes in one case (standards NAM-002): Go's
+// common initialisms and the protocol and product names the standards list, each also in
+// its plural where one is usual ("Ids" is IDs).
+var goInitialisms = func() map[string]string {
+	initialisms := map[string]string{}
+	for _, initialism := range []string{
+		"ACL", "API", "CPU", "CSS", "CSV", "DNS", "HTML", "HTTP", "ID", "IP", "JSON", "JWT", "NPM", "OIDC", "SQL", "SSH",
+		"TCP", "TLS", "TOTP", "TTL", "UDP", "UI", "URI", "URL", "UUID", "XML", "AWS",
+	} {
+		word := initialism[:1] + strings.ToLower(initialism[1:])
+		initialisms[word], initialisms[word+"s"] = initialism, initialism+"s"
 	}
-	return builder.String()
+	initialisms["Https"] = "HTTPS" // a word of its own, not a plural
+	return initialisms
+}()
+
+// goIdentifier is a name as an exported Go identifier: PascalCase with the initialisms in one
+// case ("filterId" is FilterID, "apiKeys" APIKeys). Wire names (targets, JSON members,
+// flags) stay as declared; only the identifiers of the generated Go code are spelled so.
+func goIdentifier(name string) string {
+	return strings.Join(goWords(name), "")
+}
+
+// unexportedGoIdentifier is goIdentifier with its first word in lower case, all of it for an
+// initialism: "apiKeys" is apiKeys, "TodoItems" todoItems.
+func unexportedGoIdentifier(name string) string {
+	words := goWords(name)
+	if len(words) == 0 {
+		return ""
+	}
+	if _, ok := goInitialisms[pascalCase(strings.ToLower(words[0]))]; ok {
+		words[0] = strings.ToLower(words[0])
+	} else {
+		words[0] = lowerFirst(words[0])
+	}
+	return strings.Join(words, "")
+}
+
+// goWords are the words of name, split at separators and case changes, each starting upper
+// case, an initialism in one case.
+func goWords(name string) []string {
+	var words []string
+	for _, part := range identifierCharacter.Split(name, -1) {
+		for _, word := range camelWords(pascalCase(part)) {
+			if initialism, ok := goInitialisms[word]; ok {
+				word = initialism
+			}
+			words = append(words, word)
+		}
+	}
+	return words
 }
 
 // camelWords splits a PascalCase identifier before every upper-case letter that follows a

@@ -197,7 +197,7 @@ func (c *commandLine) parameterList(typeName string, parameters []wireParameter,
 	if len(parameters) == 0 {
 		return "nil", nil
 	}
-	function := lowerFirst(typeName)
+	function := unexportedGoIdentifier(typeName)
 	if !c.written[function] {
 		c.written[function] = true
 		fmt.Fprintf(&c.functions, "\nfunc %s() []parameter {\n\treturn []parameter{\n%s\t}\n}\n", function, entries.String())
