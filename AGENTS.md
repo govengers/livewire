@@ -7,4 +7,4 @@ govengers/livewire: the API contract library of the govengers stack. Module `git
 - Names are spelled out (NAM-001); no logging (LIB-003); constructors `New...(options *...Options) (*X, error)` that validate and copy (DES-001); core packages on `net/http` and `context`, frameworks in `<name>adapter` packages (LIB-007).
 - Generated TypeScript in `generate/runtime` is tested under bun; keep `exactOptionalPropertyTypes` passing.
 - Commit messages carry no AI attribution.
-- The repository is public: docs, comments, test data and commits name no private projects, customers, employers, people or places (D96); examples use `example.com` and neutral domains (todo, orders, tasks).
+- The repository is public: docs, comments, test data and commits name no private projects, customers or employers, and no real people or places tied to the owner (D96). Public figures, placeholder people and places, and IANA zone names are fine; examples use `example.com` and neutral domains (todo, orders, tasks).
