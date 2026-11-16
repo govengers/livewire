@@ -22,6 +22,7 @@ import (
 	"github.com/govengers/livewire/generate"
 	"github.com/govengers/livewire/generate/internal/fixture"
 	"github.com/govengers/livewire/ginadapter"
+	"github.com/govengers/livewire/query"
 )
 
 func readGenerated(t *testing.T, directory, name string) string {
@@ -465,4 +466,23 @@ func TestNullableSchemasCarryTheirType(t *testing.T) {
 		return found
 	}
 	require.Greater(t, walk(root, ""), 5)
+}
+
+func TestTheListItemOfAPointerItemOmitsItsDetailFields(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(livewire.NewResource("notes", "/notes", &livewire.ResourceOptions[*fixture.Note]{
+		Read: authorization.IsUser(),
+		Fields: query.Fields{
+			{Name: "id", Type: query.TypeInteger, SQL: "notes.id", Filter: true},
+			{Name: "text", Type: query.TypeText, SQL: "notes.text", Search: true, Detail: true},
+		},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[*fixture.Note], error) {
+			return &livewire.Page[*fixture.Note]{}, nil
+		},
+	})))
+	directory := t.TempDir()
+	require.NoError(t, generate.Write(registry, &generate.Options{TypeScriptDirectory: directory}))
+	require.Contains(t, readGenerated(t, directory, "api.ts"), "runtime.ListResponse<Omit<types.Note, 'text'> | null>",
+		"Omit applies to the item, the null stays outside: Omit of a union with null keeps no member")
 }

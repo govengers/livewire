@@ -331,13 +331,14 @@ func goIdentifier(name string) string {
 }
 
 // unexportedGoIdentifier is goIdentifier with its first word in lower case, all of it for an
-// initialism: "apiKeys" is apiKeys, "TodoItems" todoItems.
+// initialism or another word in upper case: "apiKeys" is apiKeys, "APIKeysX" apiKeysX,
+// "TodoItems" todoItems.
 func unexportedGoIdentifier(name string) string {
 	words := goWords(name)
 	if len(words) == 0 {
 		return ""
 	}
-	if _, ok := goInitialisms[pascalCase(strings.ToLower(words[0]))]; ok {
+	if words[0] == strings.ToUpper(words[0]) || goInitialisms[pascalCase(strings.ToLower(words[0]))] != "" {
 		words[0] = strings.ToLower(words[0])
 	} else {
 		words[0] = lowerFirst(words[0])
@@ -345,19 +346,37 @@ func unexportedGoIdentifier(name string) string {
 	return strings.Join(words, "")
 }
 
-// goWords are the words of name, split at separators and case changes, each starting upper
-// case, an initialism in one case.
+// goWords are the words of name, split at separators, case changes and the end of an upper
+// case run before a word ("userIDUrl" is User, ID, URL), each starting upper case, an
+// initialism in one case.
 func goWords(name string) []string {
 	var words []string
 	for _, part := range identifierCharacter.Split(name, -1) {
-		for _, word := range camelWords(pascalCase(part)) {
-			if initialism, ok := goInitialisms[word]; ok {
-				word = initialism
+		for _, camelWord := range camelWords(pascalCase(part)) {
+			for _, word := range acronymWords(camelWord) {
+				if initialism, ok := goInitialisms[word]; ok {
+					word = initialism
+				}
+				words = append(words, word)
 			}
-			words = append(words, word)
 		}
 	}
 	return words
+}
+
+// acronymWords splits a word of camelWords, an upper case run and what follows it, before the
+// run's last letter when a lower case word follows ("IDUrl" is ID, Url; "APIKeys" API, Keys); a
+// plural initialism ("IDs") stays one word. Command and flag names keep camelWords alone.
+func acronymWords(word string) []string {
+	runes := []rune(word)
+	run := 0
+	for run < len(runes) && unicode.IsUpper(runes[run]) {
+		run++
+	}
+	if run < 2 || run == len(runes) || string(runes[run:]) == "s" || !unicode.IsLower(runes[run]) {
+		return []string{word}
+	}
+	return []string{string(runes[:run-1]), string(runes[run-1:])}
 }
 
 // camelWords splits a PascalCase identifier before every upper-case letter that follows a

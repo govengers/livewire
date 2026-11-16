@@ -237,3 +237,20 @@ func TestGoIdentifiersSpellInitialismsInOneCase(t *testing.T) {
 	require.Contains(t, command, `callCommand("create-api-key"`, "wire and command names stay as declared")
 	require.Contains(t, readGenerated(t, directory, "web/api.ts"), "export function getApiKeys(", "TypeScript keeps its own spelling")
 }
+
+func TestCommandLineRefusesParameterListsOfOneName(t *testing.T) {
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	handle := func(context.Context, *userParameters, *livewire.NoBody) (*livewire.NoContent, error) {
+		return &livewire.NoContent{}, nil
+	}
+	for _, name := range []string{"createApiKey", "createAPIKey"} {
+		require.NoError(t, registry.Add(livewire.NewMutation(name, http.MethodPost, "/"+name+"/{userId}", &livewire.MutationOptions[userParameters, livewire.NoBody, livewire.NoContent]{
+			Check: authorization.IsUser(), Handle: handle,
+		})))
+	}
+	directory := t.TempDir()
+	options := goOptions(directory)
+	options.GoClient = generate.GoClientOptions{} // the command line alone, without the Go client's own collision check
+	require.ErrorContains(t, generate.Write(registry, options), "the parameters CreateApiKeyParameters and CreateAPIKeyParameters are both createAPIKeyParameters() on the command line")
+}

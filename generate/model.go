@@ -326,7 +326,8 @@ func (m *model) addResource(resource *livewire.Resource, filters *resourceModel,
 	name, description, live := resource.Name(), resource.Description(), len(resource.Tables()) > 0
 	listItem := item
 	if details := m.details[name]; len(details) > 0 {
-		listItem = &shape{kind: shapeOmit, element: item, omitted: details, component: listItemName(name)}
+		// the item without its null: Omit of a union with null keeps no member at all
+		listItem = &shape{kind: shapeOmit, element: item.withNullable(false), nullable: item.nullable, omitted: details, component: listItemName(name)}
 	}
 	m.reads = append(m.reads, &readModel{
 		declaration: name, description: description, kind: livewire.ReadMain, path: resource.Path(), queryType: pascalCase(name) + "ListQuery",

@@ -72,11 +72,15 @@ func TestGoIdentifierSpellsInitialismsInOneCase(t *testing.T) {
 	exported := map[string]string{
 		"apiKeys": "APIKeys", "userIdUrl": "UserIDURL", "ids": "IDs", "httpsProxy": "HTTPSProxy", "uuid": "UUID",
 		"oidcLogin": "OIDCLogin", "ApiKeysListQuery": "APIKeysListQuery", "identity": "Identity", "x_api": "XAPI",
+		"userIDUrl": "UserIDURL", "APIKeysX": "APIKeysX", "createAPIKey": "CreateAPIKey", "HTMLParser": "HTMLParser", "ownerIDs": "OwnerIDs",
+		"APIsUrl": "APIsURL", "IDUrlHttp": "IDURLHTTP",
 	}
 	for name, expected := range exported {
 		require.Equal(t, expected, goIdentifier(name), name)
 	}
-	unexported := map[string]string{"apiKeys": "apiKeys", "ApiKeysListQuery": "apiKeysListQuery", "TodoItems": "todoItems", "CreateApiKeyParameters": "createAPIKeyParameters", "IdsQuery": "idsQuery"}
+	unexported := map[string]string{"apiKeys": "apiKeys", "ApiKeysListQuery": "apiKeysListQuery", "TodoItems": "todoItems", "CreateApiKeyParameters": "createAPIKeyParameters", "IdsQuery": "idsQuery",
+		"APIKeysX": "apiKeysX", "APIKeysXListQuery": "apiKeysXListQuery", "ABCDef": "abcDef", "IDUrl": "idURL", "X": "x", "IDsQuery": "idsQuery",
+	}
 	for name, expected := range unexported {
 		require.Equal(t, expected, unexportedGoIdentifier(name), name)
 	}
