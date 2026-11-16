@@ -79,13 +79,13 @@ func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: 
 type MutationOptions[Parameters, Request, Response any] struct {
 	Description    string
 	SecretResponse bool
-	Check       authorization.Check
-	Status      int
-	ClientID    ClientIDVersion
-	Resource    string
-	FieldChecks map[string]authorization.Check
-	Effect      Effect
-	Handle      func(ctx context.Context, parameters *Parameters, body *Request) (*Response, error)
+	Check          authorization.Check
+	Status         int
+	ClientID       ClientIDVersion
+	Resource       string
+	FieldChecks    map[string]authorization.Check
+	Effect         Effect
+	Handle         func(ctx context.Context, parameters *Parameters, body *Request) (*Response, error)
 }
 
 // Mutation is a write: a JSON body decoded with unknown fields refused (D40), checked field
