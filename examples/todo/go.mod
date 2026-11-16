@@ -23,7 +23,7 @@ require (
 	github.com/govengers/livewire v1.0.1
 	github.com/govengers/livewire/aikidoadapter v0.0.0-00010101000000-000000000000
 	github.com/govengers/livewire/mcpadapter v0.0.0-00010101000000-000000000000
-	github.com/govengers/postgrestest v0.0.0-20261116042556-e8a91e54648c
+	github.com/govengers/postgrestest v0.1.0
 	github.com/govengers/telemetry v0.1.0
 	github.com/govengers/wide-event-logger v1.0.0
 	github.com/jackc/pgx/v5 v5.12.0
