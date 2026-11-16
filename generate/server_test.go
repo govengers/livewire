@@ -224,8 +224,8 @@ type changeFeed struct {
 }
 
 func (f *changeFeed) Run(ctx context.Context, onChange func(livewire.Change), onResync func()) error {
+	onResync() // before running is closed: a subscription the test opens after it gets no resync snapshot
 	f.once.Do(func() { close(f.running) })
-	onResync()
 	for {
 		select {
 		case <-ctx.Done():
