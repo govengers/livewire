@@ -78,7 +78,8 @@ func TestGoIdentifierSpellsInitialismsInOneCase(t *testing.T) {
 	for name, expected := range exported {
 		require.Equal(t, expected, goIdentifier(name), name)
 	}
-	unexported := map[string]string{"apiKeys": "apiKeys", "ApiKeysListQuery": "apiKeysListQuery", "TodoItems": "todoItems", "CreateApiKeyParameters": "createAPIKeyParameters", "IdsQuery": "idsQuery",
+	unexported := map[string]string{
+		"apiKeys": "apiKeys", "ApiKeysListQuery": "apiKeysListQuery", "TodoItems": "todoItems", "CreateApiKeyParameters": "createAPIKeyParameters", "IdsQuery": "idsQuery",
 		"APIKeysX": "apiKeysX", "APIKeysXListQuery": "apiKeysXListQuery", "ABCDef": "abcDef", "IDUrl": "idURL", "X": "x", "IDsQuery": "idsQuery",
 	}
 	for name, expected := range unexported {

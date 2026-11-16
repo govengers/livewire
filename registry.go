@@ -123,11 +123,9 @@ func (r *Registry) startUnit(ctx context.Context, unit Unit) (context.Context, f
 	if r.options.StartUnit == nil {
 		return ctx, func() {}
 	}
-	var begun context.Context
-	var end func()
-	if err := recovering(func() error { begun, end = r.options.StartUnit(ctx, unit); return nil }); err != nil {
-		begun, end = nil, nil
-		r.reportStartUnit(ctx, unit, fmt.Errorf("livewire: StartUnit: %w", err))
+	begun, end, err := r.callStartUnit(ctx, unit)
+	if err != nil {
+		r.reportStartUnit(ctx, unit, err)
 	}
 	if begun == nil {
 		begun = ctx
@@ -136,6 +134,18 @@ func (r *Registry) startUnit(ctx context.Context, unit Unit) (context.Context, f
 		return begun, func() {}
 	}
 	return begun, func() { _ = recovering(func() error { end(); return nil }) }
+}
+
+// callStartUnit runs the StartUnit option; its panic answers neither a context nor a finish,
+// but the error.
+func (r *Registry) callStartUnit(ctx context.Context, unit Unit) (begun context.Context, end func(), err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			begun, end, err = nil, nil, fmt.Errorf("livewire: StartUnit panicked: %v", recovered)
+		}
+	}()
+	begun, end = r.options.StartUnit(ctx, unit)
+	return begun, end, nil
 }
 
 // reportStartUnit reports the failure of the StartUnit option on the context the unit came
