@@ -190,6 +190,10 @@ func TestCommandLineRefusesCollidingNames(t *testing.T) {
 	}
 }
 
+type userParameters struct {
+	UserID string `path:"userId"`
+}
+
 func TestGoIdentifiersSpellInitialismsInOneCase(t *testing.T) {
 	registry, err := livewire.NewRegistry(nil)
 	require.NoError(t, err)
@@ -206,13 +210,9 @@ func TestGoIdentifiersSpellInitialismsInOneCase(t *testing.T) {
 			},
 			Get: func(context.Context, *query.ListQuery) (*fixture.Part, error) { return &fixture.Part{}, nil },
 		}),
-		livewire.NewMutation("createApiKey", http.MethodPost, "/api-keys/{userId}", &livewire.MutationOptions[struct {
-			UserID string `path:"userId"`
-		}, livewire.NoBody, fixture.Part]{
-			Check: authorization.IsUser(),
-			Handle: func(context.Context, *struct {
-				UserID string `path:"userId"`
-			}, *livewire.NoBody) (*fixture.Part, error) { return &fixture.Part{}, nil },
+		livewire.NewMutation("createApiKey", http.MethodPost, "/api-keys/{userId}", &livewire.MutationOptions[userParameters, livewire.NoBody, fixture.Part]{
+			Check:  authorization.IsUser(),
+			Handle: func(context.Context, *userParameters, *livewire.NoBody) (*fixture.Part, error) { return &fixture.Part{}, nil },
 		}),
 	))
 	directory := t.TempDir()
