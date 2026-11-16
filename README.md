@@ -103,7 +103,7 @@ A client serves one identity for its whole life. The TypeScript `Client` (REST) 
 - [docs/design.md](docs/design.md): the binding design, decisions D1 onwards.
 - [pkg.go.dev](https://pkg.go.dev/github.com/govengers/livewire): the API.
 
-The repository follows [govengers/standards](https://github.com/govengers/standards), profile `library`. `just check` runs lint, the unit tests, the two-engine end-to-end suite and govulncheck.
+The repository follows [govengers/standards](https://github.com/govengers/standards), profile `library`. `just check` runs lint, the unit tests, the TypeScript gates (bun required), the two-engine end-to-end suite and govulncheck. `just test` is cached by go test and reruns only what a change reaches; the TypeScript gates, whose inputs the cache cannot see, run uncached in `just test-typescript` (D89).
 
 ## License
 

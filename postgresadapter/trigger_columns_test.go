@@ -50,10 +50,10 @@ CREATE TABLE settings (name text PRIMARY KEY, value json);
 	require.NoError(t, err)
 	listening := notifications(t, database)
 
-	var at string
+	var readAt string
 	require.NoError(t, database.pool.QueryRow(t.Context(),
-		"INSERT INTO readings VALUES (7, '2026-11-16 12:30:00.25+00', 1.5) RETURNING to_jsonb(readings)->>'at'").Scan(&at))
-	require.JSONEq(t, `{"table":"readings","op":"insert","id":"7","partition":"`+at+`"}`, nextPayload(t, listening, time.Second))
+		"INSERT INTO readings VALUES (7, '2026-11-16 12:30:00.25+00', 1.5) RETURNING to_jsonb(readings)->>'at'").Scan(&readAt))
+	require.JSONEq(t, `{"table":"readings","op":"insert","id":"7","partition":"`+readAt+`"}`, nextPayload(t, listening, time.Second))
 	_, err = database.pool.Exec(t.Context(), "INSERT INTO settings VALUES ('theme', $1)", refusedByJSONB)
 	require.NoError(t, err)
 	require.JSONEq(t, `{"table":"settings","op":"insert","id":"","partition":""}`, nextPayload(t, listening, time.Second),
@@ -90,6 +90,13 @@ func TestHistoryAppendsNothingForAnUpdateWhoseRowConvertsAsBefore(t *testing.T) 
 //go:embed testdata/v1.0.1-triggers.sql
 var earlierTriggersSQL string
 
+// snippet:begin trigger-upgrade
+// triggerUpgradeSQL is the application's migration of D88, in a goose migration of its own:
+// the trigger functions and the presence trigger in this release's form.
+const triggerUpgradeSQL = "SET LOCAL lock_timeout = '5s';\n" + postgresadapter.TriggerUpgradeSQL
+
+// snippet:end trigger-upgrade
+
 func TestTriggerUpgradeSQLUpgradesTheEarlierTriggersInAMigration(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
@@ -103,7 +110,7 @@ func TestTriggerUpgradeSQLUpgradesTheEarlierTriggersInAMigration(t *testing.T) {
 
 	for range 2 { // idempotent
 		require.NoError(t, pgx.BeginFunc(t.Context(), database.pool, func(transaction pgx.Tx) error { // as goose runs a migration
-			_, err := transaction.Exec(t.Context(), postgresadapter.TriggerUpgradeSQL)
+			_, err := transaction.Exec(t.Context(), triggerUpgradeSQL)
 			return err
 		}))
 	}

@@ -40,10 +40,25 @@ func livewireSchema(ctx context.Context, transaction *sql.Tx) error {
 | `IdempotencySQL` | `livewire_idempotency` | `EngineOptions.IdempotencyStore` |
 | `AuditSQL` | `livewire_audit`, partitioned by month, and `livewire_audit_maintain` | `EngineOptions.AuditStore` |
 | `PresenceSQL` | `livewire_presence` and its triggers | `EngineOptions.PresenceStore`; after `TriggerFunctionSQL` |
+| `TriggerUpgradeSQL` | replaces `livewire_notify()`, `livewire_history()` and the presence update trigger with this release's form | an installation that ran an earlier release's trigger SQL (D88); see below |
 
 - A trigger notifies `{table, op, id, partition}` on the channel `livewire` (`postgresadapter.Channel`), one per row. A TRUNCATE notifies one change without an id, which reaches every subscription of the table. Two applications on one database receive each other's changes; the engine ignores tables it does not subscribe.
 - A natively partitioned table reports its root table. A partition attached later notifies its own TRUNCATE only once `TriggerSQL` ran again; a DETACH notifies nothing.
-- Leave tables with large binary columns out of `HistorySQL`: every version stores the whole row as jsonb.
+- The notify trigger reads only the row's `id` and partition column (D88): a large column costs a write nothing extra, and a `json` value that jsonb refuses (a `\u0000` escape) fails no write. The history trigger does convert the row.
+- Leave tables with large binary columns out of `HistorySQL`: every version stores the whole row as jsonb, and a versioned table cannot hold a json value jsonb refuses.
+
+### A changed trigger SQL
+
+livewire v1.0.1 and earlier converted every changed row to jsonb in `livewire_notify()`, the history trigger and the presence update trigger (D88). A fresh installation gets the current form from the SQL above; an installation that ran the earlier one adds a goose migration with `TriggerUpgradeSQL`, from [postgresadapter/trigger_columns_test.go](../../postgresadapter/trigger_columns_test.go):
+
+<!-- snippet: postgresadapter/trigger_columns_test.go#trigger-upgrade -->
+```go
+// triggerUpgradeSQL is the application's migration of D88, in a goose migration of its own:
+// the trigger functions and the presence trigger in this release's form.
+const triggerUpgradeSQL = "SET LOCAL lock_timeout = '5s';\n" + postgresadapter.TriggerUpgradeSQL
+```
+
+It replaces both functions and, where `livewire_presence` exists, its update trigger; it changes no table and is idempotent. Replacing the presence trigger waits for that table's lock, hence the lock timeout. No restart is needed: every session runs the new functions from its next write on. A later release that changes the trigger SQL again says so, and the same constant in a new migration upgrades to it.
 
 ### Deploy order of a changed SQL
 
