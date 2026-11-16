@@ -34,17 +34,18 @@ func livewireSchema(ctx context.Context, transaction *sql.Tx) error {
 |---|---|---|
 | `TriggerFunctionSQL` | the function `livewire_notify()` | every trigger below; run it first |
 | `TriggerSQL(tables...)` | a row and a TRUNCATE trigger per table | every table a live declaration lists |
-| `PartitionedTriggerSQL(table, column)` | the same, carrying the column's value as the partition (D25) | a multi-tenant table: a change re-runs only its tenant's subscriptions |
+| `PartitionedTriggerSQL(table, column)` | the same, carrying the column's value as the partition (D25), and the function `livewire_notify_<column>()` | a multi-tenant table: a change re-runs only its tenant's subscriptions |
 | `HistorySQL(table)` | `<table>_history` and the trigger that appends a version on every write | a `Versioned` resource; the table needs a uuid column `id` |
 | `FiltersSQL` | `livewire_filters` | `EngineOptions.FilterStore` |
 | `IdempotencySQL` | `livewire_idempotency` | `EngineOptions.IdempotencyStore` |
 | `AuditSQL` | `livewire_audit`, partitioned by month, and `livewire_audit_maintain` | `EngineOptions.AuditStore` |
 | `PresenceSQL` | `livewire_presence` and its triggers | `EngineOptions.PresenceStore`; after `TriggerFunctionSQL` |
-| `TriggerUpgradeSQL` | replaces `livewire_notify()`, `livewire_history()` and the presence update trigger with this release's form | an installation that ran an earlier release's trigger SQL (D88); see below |
+| `TriggerUpgradeSQL` | replaces `livewire_notify()`, `livewire_history()` and the notify triggers of every live table and of `livewire_presence` with this release's form | an installation that ran an earlier release's trigger SQL (D88); see below |
 
 - A trigger notifies `{table, op, id, partition}` on the channel `livewire` (`postgresadapter.Channel`), one per row. A TRUNCATE notifies one change without an id, which reaches every subscription of the table. Two applications on one database receive each other's changes; the engine ignores tables it does not subscribe.
 - A natively partitioned table reports its root table. A partition attached later notifies its own TRUNCATE only once `TriggerSQL` ran again; a DETACH notifies nothing.
-- The notify trigger reads only the row's `id` and partition column (D88): a large column costs a write nothing extra, and a `json` value that jsonb refuses (a `\u0000` escape) fails no write. The history trigger does convert the row.
+- The notify trigger reads only the row's `id` and partition column, by name (D88): a large column costs a write nothing extra, and a `json` value that jsonb refuses (a `\u0000` escape) fails no write. The history trigger does convert the row.
+- Whether a table has an `id` column and the partition column is looked up when `TriggerSQL` or `PartitionedTriggerSQL` runs. A migration that adds, drops, renames or changes the type of a live table's `id` or partition column runs `TriggerUpgradeSQL` too: without it, a session that wrote the table before keeps the reads it compiled and fails its next writes (SQLSTATE 42804) until it disconnects.
 - Leave tables with large binary columns out of `HistorySQL`: every version stores the whole row as jsonb, and a versioned table cannot hold a json value jsonb refuses.
 
 ### A changed trigger SQL
@@ -58,7 +59,7 @@ livewire v1.0.1 and earlier converted every changed row to jsonb in `livewire_no
 const triggerUpgradeSQL = "SET LOCAL lock_timeout = '5s';\n" + postgresadapter.TriggerUpgradeSQL
 ```
 
-It replaces both functions and, where `livewire_presence` exists, its update trigger; it changes no table and is idempotent. Replacing the presence trigger waits for that table's lock, hence the lock timeout. No restart is needed: every session runs the new functions from its next write on. A later release that changes the trigger SQL again says so, and the same constant in a new migration upgrades to it.
+It replaces both functions and re-creates the notify triggers of every table `TriggerSQL` or `PartitionedTriggerSQL` ran for (it finds them by their row trigger `livewire_notify`) and, where `livewire_presence` exists, its triggers; it changes no table and is idempotent. Re-creating a trigger waits for its table's SHARE ROW EXCLUSIVE lock, hence the lock timeout. No restart is needed: every session runs the new functions from its next write on. A later release that changes the trigger SQL again says so, and the same constant in a new migration upgrades to it.
 
 ### Deploy order of a changed SQL
 
@@ -74,6 +75,7 @@ ALTER TABLE livewire_idempotency ALTER COLUMN response TYPE bytea USING convert_
 
 - The `ALTER` rewrites the table under an ACCESS EXCLUSIVE lock, so mutations wait for it; the table holds one `Window` of records (default 24 h), and the lock timeout keeps a busy table from stalling the deploy.
 - It changes the types the store's statements were prepared with. Every pooled connection that prepared them before fails two idempotent calls after it: the reservation's read with SQLSTATE 0A000 (`cached plan must not change result type`), then the record's UPDATE, whose parameter was prepared as jsonb, with 42804. pgx prepares each statement again after its failure, so a retry on the same connection can fail too (D74). **Restart every replica after the migration**; the restart is required.
+- An application's own migration that changes the type of a live table's `id` or partition column (or adds, drops or renames one) runs `TriggerUpgradeSQL` in the same migration (D88): the notify trigger reads those columns by name, a session that ran it compiled the reads for the old type, and only a replaced function makes every session compile it anew. Without it, those sessions fail every later write to the table (SQLSTATE 42804) until they disconnect.
 
 ## The transactor
 

@@ -70,15 +70,24 @@ func TestPartitionedTriggerCarriesThePartitionAndBothSidesOfAMove(t *testing.T) 
 
 func TestTriggerSQLQuotesIdentifiersAndLiterals(t *testing.T) {
 	t.Parallel()
-	require.Equal(t,
-		"CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON \"a\"\"b\" FOR EACH ROW EXECUTE FUNCTION livewire_notify();\n"+
-			"DO $livewire$ DECLARE relation regclass; BEGIN FOR relation IN SELECT '\"a\"\"b\"'::regclass UNION SELECT relid FROM pg_partition_tree('\"a\"\"b\"') LOOP\n"+
-			"\tEXECUTE format('CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(%s)', relation, '');\n"+
-			"END LOOP; END $livewire$;\n",
-		postgresadapter.TriggerSQL(`a"b`))
-	partitioned := postgresadapter.PartitionedTriggerSQL("gadgets", "it's")
-	require.Contains(t, partitioned, "livewire_notify('it''s')")
-	require.Contains(t, partitioned, "relation, quote_literal('it''s'))", "the truncate trigger carries the column too")
+	require.Contains(t, postgresadapter.TriggerSQL(`a"b`), `DO $livewire$ DECLARE relation regclass := '"a""b"'; partition_column text := '';`)
+	require.Contains(t, postgresadapter.PartitionedTriggerSQL("gadgets", "it's"), `relation regclass := '"gadgets"'; partition_column text := 'it''s';`)
+}
+
+func TestPartitionedTriggerSQLNamesTheFunctionOfALongColumnByItsHash(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	long := strings.Repeat("c", 63)
+	_, err := database.pool.Exec(t.Context(), `CREATE TABLE "it's" (id uuid PRIMARY KEY DEFAULT uuidv7(), "it's" text NOT NULL, `+long+` text NOT NULL);
+`+postgresadapter.PartitionedTriggerSQL("it's", "it's")+postgresadapter.PartitionedTriggerSQL("it's", long))
+	require.NoError(t, err)
+	var function, hashed string
+	require.NoError(t, database.pool.QueryRow(t.Context(), `SELECT tgfoid::regproc::text, 'livewire_notify_' || md5($1) FROM pg_trigger WHERE tgrelid = '"it''s"'::regclass AND tgname = 'livewire_notify'`, long).Scan(&function, &hashed))
+	require.Equal(t, hashed, function)
+	listening := notifications(t, database)
+	var id string
+	require.NoError(t, database.pool.QueryRow(t.Context(), `INSERT INTO "it's" ("it's", `+long+`) VALUES ('a', 'b') RETURNING id::text`).Scan(&id))
+	require.JSONEq(t, `{"table":"it's","op":"insert","id":"`+id+`","partition":"b"}`, nextPayload(t, listening, time.Second))
 }
 
 func TestTriggerNotifiesATruncateToEverySubscriptionOfTheTable(t *testing.T) {

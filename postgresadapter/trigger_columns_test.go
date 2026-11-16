@@ -1,7 +1,9 @@
 package postgresadapter_test
 
 import (
+	"context"
 	_ "embed"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,8 +14,9 @@ import (
 )
 
 // documentsSQL is a live table with a json and a large bytea column, partitioned by tenant.
-var documentsSQL = `CREATE TABLE documents (id uuid PRIMARY KEY DEFAULT uuidv7(), tenant text NOT NULL, body json NOT NULL, content bytea NOT NULL);
-` + postgresadapter.PartitionedTriggerSQL("documents", "tenant")
+var documentsSQL = documentsTableSQL + postgresadapter.PartitionedTriggerSQL("documents", "tenant")
+
+const documentsTableSQL = "CREATE TABLE documents (id uuid PRIMARY KEY DEFAULT uuidv7(), tenant text NOT NULL, body json NOT NULL, content bytea NOT NULL);\n"
 
 // refusedByJSONB is a json value that jsonb refuses: it holds the escape of the NUL character.
 const refusedByJSONB = `{"text": "\u0000"}`
@@ -100,13 +103,14 @@ const triggerUpgradeSQL = "SET LOCAL lock_timeout = '5s';\n" + postgresadapter.T
 func TestTriggerUpgradeSQLUpgradesTheEarlierTriggersInAMigration(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
-	_, err := database.pool.Exec(t.Context(), earlierTriggersSQL+documentsSQL)
+	_, err := database.pool.Exec(t.Context(), documentsTableSQL+earlierTriggersSQL)
 	require.NoError(t, err)
-	insert := func() error {
-		_, err := database.pool.Exec(t.Context(), "INSERT INTO documents (tenant, body, content) VALUES ('north', $1, '')", refusedByJSONB)
-		return err
+	insert := func() (id string, err error) {
+		err = database.pool.QueryRow(t.Context(), "INSERT INTO documents (tenant, body, content) VALUES ('north', $1, '') RETURNING id::text", refusedByJSONB).Scan(&id)
+		return id, err
 	}
-	require.ErrorContains(t, insert(), "unsupported Unicode escape sequence", "the earlier function converts the row")
+	_, err = insert()
+	require.ErrorContains(t, err, "unsupported Unicode escape sequence", "the earlier function converts the row")
 
 	for range 2 { // idempotent
 		require.NoError(t, pgx.BeginFunc(t.Context(), database.pool, func(transaction pgx.Tx) error { // as goose runs a migration
@@ -114,7 +118,26 @@ func TestTriggerUpgradeSQLUpgradesTheEarlierTriggersInAMigration(t *testing.T) {
 			return err
 		}))
 	}
-	require.NoError(t, insert())
+	rows, err := database.pool.Query(t.Context(), `SELECT tgrelid::regclass::text || ' ' || tgname || ' ' || substring(pg_get_triggerdef(oid) FROM 'EXECUTE FUNCTION (.*)$')
+		FROM pg_trigger WHERE tgname LIKE 'livewire_notify%' AND tgparentid = 0 AND tgtype & 1 = 1 ORDER BY 1`)
+	require.NoError(t, err)
+	triggers, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"documents livewire_notify livewire_notify_tenant('id', 'tenant')",
+		"gadgets livewire_notify livewire_notify_tenant_id('id', 'tenant_id')",
+		"livewire_presence livewire_notify livewire_notify_tenant('', 'tenant')",
+		"livewire_presence livewire_notify_update livewire_notify_tenant('', 'tenant')",
+		"orders livewire_notify livewire_notify('id', '')",
+		"parts livewire_notify livewire_notify('id', '')",
+	}, triggers, "every row trigger reads its table's columns by name")
+
+	listening := notifications(t, database)
+	id, err := insert()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"table":"documents","op":"insert","id":"`+id+`","partition":"north"}`, nextPayload(t, listening, time.Second))
+	require.NoError(t, database.pool.QueryRow(t.Context(), "INSERT INTO gadgets (tenant_id, name) VALUES ('south', 'lamp') RETURNING id::text").Scan(&id))
+	require.JSONEq(t, `{"table":"gadgets","op":"insert","id":"`+id+`","partition":"south"}`, nextPayload(t, listening, time.Second))
 	var definition string
 	require.NoError(t, database.pool.QueryRow(t.Context(),
 		"SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid = 'livewire_presence'::regclass AND tgname = 'livewire_notify_update'").Scan(&definition))
@@ -127,4 +150,57 @@ func TestTriggerUpgradeSQLUpgradesTheEarlierTriggersInAMigration(t *testing.T) {
 	require.NoError(t, err)
 	_, err = database.pool.Exec(t.Context(), postgresadapter.TriggerUpgradeSQL)
 	require.NoError(t, err, "an installation without presences upgrades too")
+}
+
+func TestTriggerUpgradeSQLLetsAWarmSessionWriteAfterTheIDsTypeChanged(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	_, err := database.pool.Exec(t.Context(), "CREATE TABLE counters (id integer PRIMARY KEY);\n"+postgresadapter.TriggerSQL("counters"))
+	require.NoError(t, err)
+	warm, err := pgx.Connect(t.Context(), database.dsn())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = warm.Close(context.Background()) }) // the database is dropped next; the close error carries nothing
+	insert := func(id int) error {
+		_, err := warm.Exec(t.Context(), "INSERT INTO counters VALUES ($1)", id)
+		return err
+	}
+	require.NoError(t, insert(1))
+
+	_, err = database.pool.Exec(t.Context(), "ALTER TABLE counters ALTER COLUMN id TYPE bigint")
+	require.NoError(t, err)
+	require.ErrorContains(t, insert(2), "does not match that when preparing the plan", "the session's plan of NEW.id has the earlier type")
+	_, err = database.pool.Exec(t.Context(), postgresadapter.TriggerUpgradeSQL)
+	require.NoError(t, err)
+	require.NoError(t, insert(3), "the replaced function is compiled anew")
+}
+
+func TestTriggerFetchesNoLargeColumnOfTheRow(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	// STORAGE EXTERNAL keeps the bytes uncompressed in the TOAST table, so reading them fetches its blocks.
+	_, err := database.pool.Exec(t.Context(), `CREATE TABLE files (id uuid PRIMARY KEY DEFAULT uuidv7(), tenant text NOT NULL, n integer NOT NULL DEFAULT 0, content bytea STORAGE EXTERNAL NOT NULL);
+CREATE TABLE blobs (id uuid PRIMARY KEY DEFAULT uuidv7(), n integer NOT NULL DEFAULT 0, content bytea STORAGE EXTERNAL NOT NULL);
+`+postgresadapter.PartitionedTriggerSQL("files", "tenant")+postgresadapter.TriggerSQL("blobs"))
+	require.NoError(t, err)
+	for _, insert := range []string{"INSERT INTO files (tenant, content) VALUES ('north', $1)", "INSERT INTO blobs (content) VALUES ($1)"} {
+		_, err = database.pool.Exec(t.Context(), insert, make([]byte, 1<<20))
+		require.NoError(t, err)
+	}
+
+	for _, update := range []string{"UPDATE files SET n = n + 1", "UPDATE files SET tenant = 'south'", "UPDATE blobs SET n = n + 1"} {
+		require.NoError(t, pgx.BeginFunc(t.Context(), database.pool, func(transaction pgx.Tx) error {
+			// The blocks this transaction fetched from the table's TOAST table so far.
+			fetched := func() (blocks int64) {
+				table := strings.Fields(update)[1]
+				require.NoError(t, transaction.QueryRow(t.Context(),
+					"SELECT pg_stat_get_xact_blocks_fetched(reltoastrelid) FROM pg_class WHERE oid = $1::regclass", table).Scan(&blocks))
+				return blocks
+			}
+			before := fetched()
+			_, err := transaction.Exec(t.Context(), update)
+			require.NoError(t, err)
+			require.Equal(t, before, fetched(), "%s fetches none of the row's out-of-line bytes", update)
+			return nil
+		}))
+	}
 }

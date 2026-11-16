@@ -16,59 +16,62 @@ import (
 // Channel is the NOTIFY channel the triggers send on and the Listener listens on.
 const Channel = "livewire"
 
-// TriggerFunctionSQL creates livewire_notify(), the trigger function of TriggerSQL,
-// PartitionedTriggerSQL and PresenceSQL. It sends one notification per row change on
-// Channel: `{"table", "op", "id", "partition"}` with the operation in lower case (insert,
-// update, delete), the row's id column as text ("" without one) and the partition column's
-// value ("" without one, D25). An update that changes the partition column notifies the new
-// and the old value. The table is the root of a natively partitioned table (PARTITION BY),
-// never the partition the row lives in, and its id must be unique across the partitions; an
-// update that moves a row to another native partition runs as a delete and an insert and
-// notifies those two. A TRUNCATE notifies one delete without id and partition, which reaches
-// every subscription of the table. An id or partition value longer than 500 bytes is sent as
-// "", so the payload stays below pg_notify's 8000 bytes: such a change reaches every
-// subscription of the table, never fewer than it should. It reads only the id and the
-// partition column of the row (D88), so a large column costs a write nothing extra and a
-// json value that jsonb refuses fails no write; an id or partition value is sent as to_jsonb
-// writes it as text. An installation that ran an earlier release's form runs
-// TriggerUpgradeSQL.
-const TriggerFunctionSQL = `CREATE OR REPLACE FUNCTION livewire_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+// TriggerFunctionSQL creates livewire_notify(), the trigger function of TriggerSQL's row
+// triggers and of every TRUNCATE trigger; PartitionedTriggerSQL and PresenceSQL create the
+// row trigger function of their partition column themselves. The triggers send one
+// notification per row change on Channel: `{"table", "op", "id", "partition"}` with the
+// operation in lower case (insert, update, delete), the row's id column as text ("" without
+// one) and the partition column's value ("" without one, D25). An update that changes the
+// partition column notifies the new and the old value. The table is the root of a natively
+// partitioned table (PARTITION BY), never the partition the row lives in, and its id must be
+// unique across the partitions; an update that moves a row to another native partition runs
+// as a delete and an insert and notifies those two. A TRUNCATE notifies one delete without id
+// and partition, which reaches every subscription of the table. An id or partition value
+// longer than 500 bytes is sent as "", so the payload stays below pg_notify's 8000 bytes:
+// such a change reaches every subscription of the table, never fewer than it should. The row
+// triggers read only the id and the partition column, by name in the function's text (D88),
+// so a large column costs a write nothing extra and a json value that jsonb refuses fails no
+// write; an id or partition value is sent as to_jsonb writes it as text. An installation that
+// ran an earlier release's form runs TriggerUpgradeSQL instead.
+const TriggerFunctionSQL = `CREATE OR REPLACE FUNCTION livewire_notify()` + notifyStartSQL + notifyEndSQL
+
+// The body of the notify trigger functions (D88), in pieces: livewire_notify() is start and
+// end, the function of a partition column (partitionFunctionSQL) has the partition's
+// reads between them. A row trigger's first argument is 'id' when its table has an id column
+// (the one TriggerSQL and PartitionedTriggerSQL saw), its second the partition column; a
+// TRUNCATE trigger's one argument is the partition column. Fields of OLD and NEW are read by
+// name, so the record is never copied whole and a large column is never fetched; a branch that
+// does not run reads nothing, which keeps a table without id working. The pieces hold no %, so
+// format() can take start and end as they are.
+const (
+	notifyStartSQL = ` RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-	partition_column text := CASE WHEN TG_NARGS > 0 THEN TG_ARGV[0] END;
 	table_name text := (SELECT relname FROM pg_class WHERE oid = coalesce(pg_partition_root(TG_RELID), TG_RELID));
 	operation text := CASE WHEN TG_OP = 'TRUNCATE' THEN 'delete' ELSE lower(TG_OP) END;
-	has_id boolean := false;
-	has_partition boolean := false;
 	row_id text := '';
 	old_id text := '';
 	row_partition text := '';
 	old_partition text := '';
 BEGIN
-	-- Only the id and the partition column are read, each converted on its own as to_jsonb
-	-- converts it in a row (D88): converting the whole row fails on a json value jsonb refuses
-	-- and pays for every large column.
-	IF TG_LEVEL = 'ROW' THEN
-		SELECT coalesce(bool_or(attname = 'id'), false), coalesce(bool_or(attname = partition_column), false)
-			INTO has_id, has_partition
-			FROM pg_attribute WHERE attrelid = TG_RELID AND attnum > 0 AND NOT attisdropped AND attname IN ('id', partition_column);
-		IF has_id AND TG_OP <> 'INSERT' THEN
+	IF TG_LEVEL = 'ROW' AND TG_NARGS > 0 AND TG_ARGV[0] = 'id' THEN
+		IF TG_OP <> 'INSERT' THEN
 			old_id := coalesce(to_jsonb(OLD.id) #>> '{}', '');
 		END IF;
-		IF has_partition AND TG_OP <> 'INSERT' THEN
-			EXECUTE format('SELECT to_jsonb(($1).%I) #>> ''{}''', partition_column) INTO old_partition USING OLD;
-			old_partition := coalesce(old_partition, '');
-		END IF;
 		row_id := old_id;
-		row_partition := old_partition;
-		IF has_id AND TG_OP <> 'DELETE' THEN
+		IF TG_OP <> 'DELETE' THEN
 			row_id := coalesce(to_jsonb(NEW.id) #>> '{}', '');
 		END IF;
-		IF has_partition AND TG_OP <> 'DELETE' THEN
-			EXECUTE format('SELECT to_jsonb(($1).%I) #>> ''{}''', partition_column) INTO row_partition USING NEW;
-			row_partition := coalesce(row_partition, '');
-		END IF;
 	END IF;
-	PERFORM pg_notify('` + Channel + `', json_build_object('table', table_name, 'op', operation,
+`
+	notifyPartitionFormatSQL = `	IF TG_OP <> 'INSERT' THEN
+		old_partition := coalesce(to_jsonb(OLD.%I) #>> '{}', '');
+	END IF;
+	row_partition := old_partition;
+	IF TG_OP <> 'DELETE' THEN
+		row_partition := coalesce(to_jsonb(NEW.%I) #>> '{}', '');
+	END IF;
+`
+	notifyEndSQL = `	PERFORM pg_notify('` + Channel + `', json_build_object('table', table_name, 'op', operation,
 		'id', CASE WHEN octet_length(row_id) <= 500 THEN row_id ELSE '' END,
 		'partition', CASE WHEN octet_length(row_partition) <= 500 THEN row_partition ELSE '' END)::text);
 	IF TG_OP = 'UPDATE' AND old_partition <> row_partition THEN
@@ -80,6 +83,38 @@ BEGIN
 END
 $$;
 `
+)
+
+// partitionFunctionSQL is a PL/pgSQL statement that creates or replaces the row trigger
+// function of the partition column in the variable partition_column, named as the variable
+// function_name says: livewire_notify_<column>, or livewire_notify_<md5 of the column> when
+// that would pass PostgreSQL's 63 bytes.
+const partitionFunctionSQL = `function_name := 'livewire_notify_' || CASE WHEN octet_length(partition_column) <= 47 THEN partition_column ELSE md5(partition_column) END;
+	EXECUTE format($function$CREATE OR REPLACE FUNCTION %I()` + notifyStartSQL + notifyPartitionFormatSQL + notifyEndSQL + `$function$,
+		function_name, partition_column, partition_column);
+`
+
+// notifyInstallSQL is the PL/pgSQL of TriggerSQL, PartitionedTriggerSQL and TriggerUpgradeSQL
+// for one table, in the variables relation and partition_column (empty for none): the row
+// trigger on the function that reads the table's columns, and the TRUNCATE trigger of the
+// table and of each of its present partitions (statement triggers are not cloned to
+// partitions). A partition column the table does not have sends "", as an id column it does
+// not have does; both are looked up now, so a migration that adds, drops, renames or retypes
+// either column runs the table's TriggerSQL or PartitionedTriggerSQL again, or
+// TriggerUpgradeSQL.
+const notifyInstallSQL = `	function_name := 'livewire_notify';
+	IF partition_column <> '' AND EXISTS (SELECT FROM pg_attribute WHERE attrelid = relation AND attname = partition_column AND attnum > 0 AND NOT attisdropped) THEN
+		` + partitionFunctionSQL + `	END IF;
+	EXECUTE format('CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %I(%L, %L)', relation, function_name,
+		CASE WHEN EXISTS (SELECT FROM pg_attribute WHERE attrelid = relation AND attname = 'id' AND attnum > 0 AND NOT attisdropped) THEN 'id' ELSE '' END, partition_column);
+	FOR part IN SELECT relation UNION SELECT relid FROM pg_partition_tree(relation) LOOP
+		EXECUTE format('CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(%L)', part, partition_column);
+	END LOOP;
+`
+
+// notifyVariablesSQL declares the variables notifyInstallSQL uses besides relation and
+// partition_column.
+const notifyVariablesSQL = ` function_name text; part regclass;`
 
 // TriggerSQL makes every table notify on each row change and on TRUNCATE (D22); the changes
 // carry no partition, so they reach the subscriptions of every partition. A table name is one
@@ -87,7 +122,7 @@ $$;
 // trigger reaches every partition and the changes name the table itself; the TRUNCATE
 // trigger is installed on the table and on the partitions it has now, so a partition
 // attached later notifies its own TRUNCATE only once TriggerSQL runs again, and a DETACH
-// PARTITION notifies nothing.
+// PARTITION notifies nothing. Whether the table has an id column is looked up when it runs.
 func TriggerSQL(tables ...string) string {
 	var statements strings.Builder
 	for _, table := range tables {
@@ -98,9 +133,10 @@ func TriggerSQL(tables ...string) string {
 
 // PartitionedTriggerSQL is TriggerSQL for one table whose changes carry the value of column
 // as their partition (D25), so a change re-runs only the subscriptions of that partition and
-// those without one.
+// those without one. It creates or replaces the row trigger function of column, which every
+// table partitioned by a column of that name shares.
 func PartitionedTriggerSQL(table, column string) string {
-	return notifyTriggersSQL(table, literal(column))
+	return notifyTriggersSQL(table, column)
 }
 
 // FiltersSQL creates livewire_filters, the stored filters of D13 (FilterStore). An unnamed
@@ -228,30 +264,52 @@ const PresenceSQL = `CREATE TABLE livewire_presence (
 );
 CREATE INDEX livewire_presence_socket ON livewire_presence (socket);
 CREATE INDEX livewire_presence_updated_at ON livewire_presence (updated_at);
-CREATE TRIGGER livewire_notify AFTER INSERT OR DELETE ON livewire_presence
-	FOR EACH ROW EXECUTE FUNCTION livewire_notify('tenant');
+DO $livewire$ DECLARE partition_column text := 'tenant'; function_name text; BEGIN
+	` + partitionFunctionSQL + `END $livewire$;
+` + presenceTriggerSQL + `;
 ` + presenceUpdateTriggerSQL + `;
 `
 
-// presenceUpdateTriggerSQL is the update trigger of livewire_presence: it compares the
-// columns by name, so a heartbeat converts nothing (D88). A column added to the table is
-// added here, or its changes notify nothing.
-const presenceUpdateTriggerSQL = `CREATE OR REPLACE TRIGGER livewire_notify_update AFTER UPDATE ON livewire_presence
+// presenceTriggerSQL and presenceUpdateTriggerSQL are the triggers of livewire_presence on
+// the function of its partition column tenant, which has no id. The update trigger compares
+// the columns by name, so a heartbeat converts nothing (D88). A column added to the table is
+// added to its list, or its changes notify nothing.
+const (
+	presenceTriggerSQL = `CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR DELETE ON livewire_presence
+	FOR EACH ROW EXECUTE FUNCTION livewire_notify_tenant('', 'tenant')`
+	presenceUpdateTriggerSQL = `CREATE OR REPLACE TRIGGER livewire_notify_update AFTER UPDATE ON livewire_presence
 	FOR EACH ROW WHEN ((OLD.tenant, OLD.target, OLD.key, OLD.socket, OLD.owner, OLD.display, OLD.state)
 		IS DISTINCT FROM (NEW.tenant, NEW.target, NEW.key, NEW.socket, NEW.owner, NEW.display, NEW.state))
-	EXECUTE FUNCTION livewire_notify('tenant')`
+	EXECUTE FUNCTION livewire_notify_tenant('', 'tenant')`
+)
 
 // TriggerUpgradeSQL brings the trigger functions and triggers of an installation that ran an
-// earlier release's TriggerFunctionSQL, HistorySQL or PresenceSQL to this release's form
-// (D88): it replaces livewire_notify() and livewire_history() (creating the latter if
-// HistorySQL never ran) and the update trigger of livewire_presence where that table exists.
-// It is idempotent and changes no table, so the application runs it in a goose migration of
-// its own, in the migration's transaction, whenever a release says its trigger SQL changed;
-// on an installation that already has this form it changes nothing. Replacing the presence
-// trigger waits for the SHARE ROW EXCLUSIVE lock on livewire_presence, so the migration sets
-// its own lock_timeout (DAT-006).
-const TriggerUpgradeSQL = TriggerFunctionSQL + historyFunctionSQL + `DO $livewire$ BEGIN
+// earlier release's TriggerFunctionSQL, TriggerSQL, PartitionedTriggerSQL, HistorySQL or
+// PresenceSQL to this release's form (D88): it replaces livewire_notify() and
+// livewire_history() (creating the latter if HistorySQL never ran), re-creates the triggers
+// of every table TriggerSQL or PartitionedTriggerSQL ran for (finding them by the row trigger
+// livewire_notify and its partition column argument) with the functions of their partition
+// columns, and the triggers of livewire_presence where that table exists. It is idempotent
+// and changes no table, so the application runs it in a goose migration of its own, in the
+// migration's transaction, whenever a release says its trigger SQL changed, and in the
+// migration that adds, drops, renames or changes the type of a live table's id or partition
+// column: a session that ran a trigger before such a change fails its next writes to that
+// table until the trigger's function is replaced (SQLSTATE 42804). Re-creating a trigger
+// waits for the SHARE ROW EXCLUSIVE lock on its table, so the migration sets its own
+// lock_timeout (DAT-006).
+const TriggerUpgradeSQL = TriggerFunctionSQL + historyFunctionSQL + `DO $livewire$ DECLARE relation regclass; partition_column text;` + notifyVariablesSQL + ` BEGIN
+	-- The row triggers of TriggerSQL and PartitionedTriggerSQL: an earlier release's have no
+	-- argument or the partition column, this release's 'id' or '' and the partition column.
+	FOR relation, partition_column IN SELECT tgrelid::regclass, CASE tgnargs
+			WHEN 1 THEN convert_from(substring(tgargs FROM 1 FOR position(decode('00', 'hex') IN tgargs) - 1), getdatabaseencoding())
+			WHEN 2 THEN convert_from(substring(tgargs FROM position(decode('00', 'hex') IN tgargs) + 1 FOR octet_length(tgargs) - position(decode('00', 'hex') IN tgargs) - 1), getdatabaseencoding())
+			ELSE '' END
+		FROM pg_trigger WHERE tgname = 'livewire_notify' AND tgparentid = 0 AND tgtype & 1 = 1 AND tgrelid IS DISTINCT FROM to_regclass('livewire_presence')
+	LOOP
+` + notifyInstallSQL + `	END LOOP;
 	IF to_regclass('livewire_presence') IS NOT NULL THEN
+		partition_column := 'tenant';
+		` + partitionFunctionSQL + `		EXECUTE $trigger$` + presenceTriggerSQL + `$trigger$;
 		EXECUTE $trigger$` + presenceUpdateTriggerSQL + `$trigger$;
 	END IF;
 END $livewire$;
@@ -368,24 +426,17 @@ const (
 	maximumIdentifierBytes = 63
 )
 
-// notifyTriggersSQL is the row trigger of table and the TRUNCATE trigger of table and of
-// each of its present partitions (statement triggers are not cloned to partitions);
-// argument is the partition column's literal or "". The DO block's dollar quote is one
-// neither name contains, so no name ends it early.
-func notifyTriggersSQL(table, argument string) string {
-	truncateArgument := "''"
-	if argument != "" {
-		truncateArgument = "quote_literal(" + argument + ")"
-	}
+// notifyTriggersSQL is notifyInstallSQL for table and the partition column column ("" for
+// none) in a DO block. Its dollar quote is one the block does not contain, so no name ends it
+// early.
+func notifyTriggersSQL(table, column string) string {
+	block := " DECLARE relation regclass := " + literal(identifier(table)) + "; partition_column text := " + literal(column) + ";" +
+		notifyVariablesSQL + " BEGIN\n" + notifyInstallSQL + "END "
 	quote := "$livewire$"
-	for strings.Contains(table+argument, quote) {
+	for strings.Contains(block, quote) {
 		quote = quote[:len(quote)-1] + "_$"
 	}
-	return "CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON " + identifier(table) +
-		" FOR EACH ROW EXECUTE FUNCTION livewire_notify(" + argument + ");\n" +
-		"DO " + quote + " DECLARE relation regclass; BEGIN FOR relation IN SELECT " + literal(identifier(table)) + "::regclass UNION SELECT relid FROM pg_partition_tree(" + literal(identifier(table)) + ") LOOP\n" +
-		"\tEXECUTE format('CREATE OR REPLACE TRIGGER livewire_notify_truncate AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION livewire_notify(%s)', relation, " +
-		truncateArgument + ");\nEND LOOP; END " + quote + ";\n"
+	return "DO " + quote + block + quote + ";\n"
 }
 
 func identifier(name string) string { return pgx.Identifier{name}.Sanitize() }

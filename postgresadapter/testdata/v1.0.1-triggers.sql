@@ -69,3 +69,10 @@ $$;
 CREATE OR REPLACE TRIGGER livewire_notify_update AFTER UPDATE ON livewire_presence
 	FOR EACH ROW WHEN ((to_jsonb(OLD) - 'updated_at') IS DISTINCT FROM (to_jsonb(NEW) - 'updated_at'))
 	EXECUTE FUNCTION livewire_notify('tenant');
+-- The row triggers v1.0.1's TriggerSQL, PartitionedTriggerSQL and PresenceSQL created on the
+-- test fixture's tables and the test's documents; their TRUNCATE triggers have this form.
+CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON parts FOR EACH ROW EXECUTE FUNCTION livewire_notify();
+CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON gadgets FOR EACH ROW EXECUTE FUNCTION livewire_notify('tenant_id');
+CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON orders FOR EACH ROW EXECUTE FUNCTION livewire_notify();
+CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON documents FOR EACH ROW EXECUTE FUNCTION livewire_notify('tenant');
+CREATE OR REPLACE TRIGGER livewire_notify AFTER INSERT OR DELETE ON livewire_presence FOR EACH ROW EXECUTE FUNCTION livewire_notify('tenant');
