@@ -31,7 +31,7 @@ Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `auth
 1. Open the pool and run the goose migrations, which execute livewire's SQL ([Postgres](Postgres.md#migrations)).
 2. Build the repositories: sqlc on the engine's transaction, the pool outside one.
 3. Build livewire's Postgres adapters: `Transactor`, `Listener` and the stores the features need.
-4. Build the services, then the registry with its `Tenant` function and its `Observer` (`prometheusadapter.Metrics.Observe` and one wide event per socket outcome).
+4. Build the services, then the registry with its `Tenant` function, its `Observer` (`prometheusadapter.Metrics.Observe`) and its `StartUnit` (one wide event per socket unit of work, D92).
 5. `livewire.NewEngine` with the registry, the adapters, the `IdentitySource` (`session.Guard` for sessions, or one that also resolves API keys, as the todo app's `authentication` package does) and the allowed origins.
 6. The govengers/jobs worker with the maintenance schedules of the stores.
 7. The gin router: the authentication middleware, `ginadapter.RegisterRoutes`, `ginadapter.SocketHandler` behind the same middleware.

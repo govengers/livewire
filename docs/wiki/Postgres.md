@@ -87,7 +87,7 @@ The engine owns the transaction of every unit of work (D31, D45). `postgresadapt
 - `livewire.tenant`: the tenant of the request (`""` with one tenant), on reads and writes;
 - `livewire.actor`: on writes, `{"actor", "realActor", "mutation", "requestId"}`, which the history trigger records.
 
-A mutation runs as: the checks and the body, `Begin`, the `Idempotency-Key` reserved (a finished key answers its recorded response, one in flight 409 `in_progress`), the handler, the audit row, the idempotency record, the commit, then `OutcomeAfterCommit`. A refused or failed call rolls everything back, and its key is free again.
+A mutation runs as: the checks and the body, `Begin`, the `Idempotency-Key` reserved (a finished key answers its recorded response, one in flight 409 `in_progress`, the repeat of a `SecretResponse` mutation, whose record keeps no response, 409 `not_replayable`, D91), the handler, the audit row, the idempotency record, the commit, then `OutcomeAfterCommit`. A refused or failed call rolls everything back, and its key is free again.
 
 The context of a loader or handler carries a query handle of that transaction, never its commit handle. A repository takes it and falls back to its pool outside an engine unit of work:
 

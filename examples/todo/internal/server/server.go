@@ -118,7 +118,7 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 	socket := ginadapter.SocketHandler(engine)
 	api.GET(SocketPath, func(ginContext *gin.Context) {
 		// The socket's units of work are not the upgrade request: they get events of their own
-		// (NewObserver), so nothing writes to the upgrade's event after it was emitted (LOG-008).
+		// (NewUnitStarter), so nothing writes to the upgrade's event after it was emitted (LOG-008).
 		ginContext.Request = ginContext.Request.WithContext(wideevent.NewContext(ginContext.Request.Context(), nil))
 		socket(ginContext)
 	})

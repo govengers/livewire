@@ -7,7 +7,7 @@ Every part of an API is a declaration in one registry. Constructors return the d
 registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: observer, StartUnit: startUnit})
 ```
 
-`BasePath` prefixes every REST route; `Tenant` resolves the tenant of a request ([Tenant](#tenant)); `Observer` receives every outcome ([Live-Engine](Live-Engine.md#the-observer)). `Add` refuses a duplicate name, two declarations on one method and route, the reserved names `batch` and `filters`, the library's own routes `/batch` and `/filters`, and a mutation whose `Resource` or `Effect` names a declaration that is not registered by the end of the call.
+`BasePath` prefixes every REST route; `Tenant` resolves the tenant of a request ([Tenant](#tenant)); `Observer` receives every outcome and `StartUnit` begins the units of work the engine runs on its own ([Live-Engine](Live-Engine.md#the-observer)). `Add` refuses a duplicate name, two declarations on one method and route, the reserved names `batch` and `filters`, the library's own routes `/batch` and `/filters`, and a mutation whose `Resource` or `Effect` names a declaration that is not registered by the end of the call.
 
 Paths use `{name}` placeholders. The name of a declaration is its socket target and the identifier of the generated clients.
 
@@ -88,6 +88,10 @@ func TodoFields() query.Fields {
 | `json` | none; neither filterable nor sortable |
 
 `Nullable` must be true whenever the SQL can yield NULL, or cursor pages skip rows; a field left false is derived from the item type (a pointer field is nullable). A numeric column is declared `float` over `t.amount::float8`.
+
+### Detail fields
+
+`Detail: true` marks a field the item read carries and every list read leaves out (D93): a task's long description travels with the task, not with every row of the board. The engine strips it from the REST list, the socket query and snapshot, every diff and the rows an `Upserts` effect puts into a live list; a change of it alone pushes nothing to a list, while the item subscription gets it. Filter, sort, search and distinct work on it as on any field (they run in SQL), so a board searches the descriptions it does not show. The history and the export keep it. A Detail field is a JSON field of the item and neither `id` nor the item key; a List loader may leave it empty and save the read. The generated TypeScript list read answers `ListResponse<Omit<Item, 'description'>>`.
 
 `Scope` is a `query.Predicate` that writes SQL with bound arguments; the todo app scopes by the tenant the engine resolved:
 
@@ -188,6 +192,8 @@ type TodoParameters struct {
 - The body is decoded strictly (D40): it must be an object, an unknown member at any depth and a repeated member are 400 `invalid_request` naming the member's path. Then the field checks run ([Column checks](#column-checks)), then the `validate` tags (go-playground/validator, D44), each failure named by its JSON path. A tag the validator cannot parse fails `Add`.
 - `Check` runs before the body is read, on REST too (D8).
 - The handler runs inside the engine's transaction, after the `Idempotency-Key` was reserved; `livewire.IdempotencyKeyFrom(ctx)` reads the key ([Postgres](Postgres.md#the-transactor)).
+- `SecretResponse: true` keeps the response out of the idempotency record, for a response that shows a secret once, such as a new API key (D91): a repeat of the key answers 409 `not_replayable` instead of the response, and the client knows the call ran.
+- A string, a member name or a parameter holding U+0000 is 400 `invalid_request` naming it (D95): PostgreSQL text cannot store it.
 
 ### Client ids
 
@@ -258,6 +264,7 @@ A loader or handler returns livewire's refusals or an `*auth.Error`; anything el
 | `livewire.NotFound()` | 404 `not_found` |
 | `livewire.Conflict()` | 409 `conflict` |
 | `livewire.InProgress()` | 409 `in_progress` |
+| `livewire.NotReplayable()` | 409 `not_replayable`: the repeat of a `SecretResponse` call (D91) |
 | `*auth.Error`, `auth.ErrUnauthenticated`, `auth.ErrForbidden` | 401 `unauthenticated`, 403 `forbidden`, ... |
 
 The filter, sort, page and cursor refusals of the `query` package answer 400 `invalid_filter`, `invalid_sort`, `invalid_page` and `invalid_cursor`. The body is always `{code, message, fields?}`; the code set is closed, so a client can switch on it. Map the domain's errors once:
