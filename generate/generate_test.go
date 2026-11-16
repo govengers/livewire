@@ -482,7 +482,12 @@ func TestTheListItemOfAPointerItemOmitsItsDetailFields(t *testing.T) {
 		},
 	})))
 	directory := t.TempDir()
-	require.NoError(t, generate.Write(registry, &generate.Options{TypeScriptDirectory: directory}))
+	options := goOptions(directory)
+	options.TypeScriptDirectory = directory
+	require.NoError(t, generate.Write(registry, options))
 	require.Contains(t, readGenerated(t, directory, "api.ts"), "runtime.ListResponse<Omit<types.Note, 'text'> | null>",
 		"Omit applies to the item, the null stays outside: Omit of a union with null keeps no member")
+	goClient := readGenerated(t, directory, "client/client.go")
+	require.Contains(t, goClient, "type NotesListItem struct {\n\tID int `json:\"id\"`\n}", "the Go list item leaves the Detail field out")
+	require.Contains(t, goClient, "(*livewire.ListResponse[*NotesListItem], error)", "and keeps the item's pointer")
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,8 @@ func TestGoClientServesEveryRouteKind(t *testing.T) {
 	require.Len(t, page.Items, 1)
 	require.Equal(t, 2, page.Total)
 	require.NotNil(t, page.Next, "cursor mode answers the next page's cursor (D38)")
+	_, carried := reflect.TypeFor[fixtureclient.PartsListItem]().FieldByName("Notes")
+	require.False(t, carried, "a list row has no field for the Detail field notes (D93), so no caller mistakes it for empty")
 	rest, err := user.GetParts(ctx, fixtureclient.PartsListQuery{Limit: 1, After: *page.Next})
 	require.NoError(t, err)
 	require.NotEqual(t, page.Items[0].ID, rest.Items[0].ID)
@@ -264,7 +267,7 @@ func TestGoClientSubscribes(t *testing.T) {
 	served.keys.revoke(userKey)
 	served.engine.RevalidateAll() // the identity is gone: the socket closes 4401
 	var ended *client.EndedError
-	for _, pushes := range []<-chan client.Push[livewire.ListResponse[fixture.Part]]{parts} {
+	for _, pushes := range []<-chan client.Push[livewire.ListResponse[fixtureclient.PartsListItem]]{parts} {
 		last := receivePush(t, pushes)
 		for last.Kind != livewire.PushError {
 			last = receivePush(t, pushes)
@@ -276,7 +279,7 @@ func TestGoClientSubscribes(t *testing.T) {
 	require.ErrorAs(t, err, &ended, "the live side ended for good")
 }
 
-func idsOf(parts []fixture.Part) []uuid.UUID {
+func idsOf(parts []fixtureclient.PartsListItem) []uuid.UUID {
 	ids := make([]uuid.UUID, 0, len(parts))
 	for _, part := range parts {
 		ids = append(ids, part.ID)

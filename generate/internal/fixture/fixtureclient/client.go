@@ -8,6 +8,7 @@ package fixtureclient
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"io"
 	"time"
 
@@ -95,13 +96,53 @@ func (parameters PartsListQuery) wire() (client.Parameters, error) {
 	return wire, nil
 }
 
+// PartsListItem is a row of GetParts: fixture.Part without the Detail fields notes (D93),
+// which only the item read carries.
+type PartsListItem struct {
+	CreatedAt   time.Time          `json:"createdAt"`
+	UpdatedAt   *time.Time         `json:"updatedAt"`
+	OwnerID     uuid.UUID          `json:"ownerId"`
+	Promoted    string             `json:"promoted"`
+	Dimensions  fixture.Dimensions `json:"dimensions"`
+	ID          uuid.UUID          `json:"id"`
+	Name        string             `json:"name"`
+	Kind        fixture.Kind       `json:"kind"`
+	Color       fixture.Color      `json:"color"`
+	Price       *float64           `json:"price"`
+	Secret      string             `json:"secret"`
+	Previous    *fixture.Kind      `json:"previous,omitempty"`
+	Tags        fixture.Tags       `json:"tags"`
+	Labels      []string           `json:"labels,omitempty"`
+	Sizes       []string           `json:"sizes"`
+	Grade       string             `json:"grade"`
+	Counts      map[string]int     `json:"counts"`
+	Names       map[int]string     `json:"names,omitzero"`
+	Children    []*fixture.Part    `json:"children"`
+	Matrix      [3]int             `json:"matrix"`
+	Checksum    []uint8            `json:"checksum"`
+	Total       fixture.Cents      `json:"total"`
+	Large       int64              `json:"large,string"`
+	Flag        *bool              `json:"flag,string"`
+	Version     int                `json:"version"`
+	Expires     time.Time          `json:"expires,omitzero"`
+	Started     time.Time          `json:"started,omitempty"`
+	Extra       jsontext.Value     `json:"extra"`
+	Anything    any                `json:"anything"`
+	Payload     fixture.Raw        `json:"payload"`
+	Code        fixture.Code       `json:"code"`
+	ContentType string             `json:"content-type"`
+	Dash        string             `json:"-,"`
+	Inline      struct{ A int }    `json:"inline"`
+	Metadata    map[string]string  `json:"metadata,omitempty"`
+}
+
 // GetParts reads GET /api/v1/parts, the socket target "parts".
-func (c *Client) GetParts(ctx context.Context, parameters PartsListQuery) (*livewire.ListResponse[fixture.Part], error) {
+func (c *Client) GetParts(ctx context.Context, parameters PartsListQuery) (*livewire.ListResponse[PartsListItem], error) {
 	wire, err := parameters.wire()
 	if err != nil {
 		return nil, err
 	}
-	var response livewire.ListResponse[fixture.Part]
+	var response livewire.ListResponse[PartsListItem]
 	if err := c.runtime.Read(ctx, "/parts", wire, &response); err != nil {
 		return nil, err
 	}
@@ -110,12 +151,12 @@ func (c *Client) GetParts(ctx context.Context, parameters PartsListQuery) (*live
 
 // SubscribeParts subscribes to the socket target "parts" (client.Subscribe): its pushes
 // arrive on the channel until ctx ends or one of kind error.
-func (c *Client) SubscribeParts(ctx context.Context, parameters PartsListQuery) (<-chan client.Push[livewire.ListResponse[fixture.Part]], error) {
+func (c *Client) SubscribeParts(ctx context.Context, parameters PartsListQuery) (<-chan client.Push[livewire.ListResponse[PartsListItem]], error) {
 	wire, err := parameters.wire()
 	if err != nil {
 		return nil, err
 	}
-	return client.Subscribe[livewire.ListResponse[fixture.Part]](ctx, c.runtime, "parts", wire)
+	return client.Subscribe[livewire.ListResponse[PartsListItem]](ctx, c.runtime, "parts", wire)
 }
 
 // PartsItemParameters are the parameters of GetPartsItem and SubscribePartsItem.

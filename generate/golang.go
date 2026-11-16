@@ -142,6 +142,9 @@ func (g *goClient) declareIdentifiers() error {
 	var owned []ownedNames
 	for _, read := range g.api.reads {
 		names := []string{read.queryType, goReadName("Get", read)}
+		if listItem := g.listItem(read); listItem != "" {
+			names = append(names, listItem)
+		}
 		if read.live {
 			names = append(names, goReadName("Subscribe", read))
 		}
@@ -399,11 +402,15 @@ func callOf(runtime, parametersType string, present bool, zero string) call {
 	return call{argument: ", parameters " + parametersType, prepare: "\twire, err := parameters.wire()\n\tif err != nil {\n\t\treturn " + failure + "\n\t}\n"}
 }
 
-// dataType is the Go type a read answers and whether its method returns a pointer to it.
-func dataType(file *goFile, read *readModel) (string, bool, error) {
+// dataType is the Go type a read answers and whether its method returns a pointer to it; a
+// list whose rows leave out Detail fields answers them as listItem (D93).
+func dataType(file *goFile, read *readModel, listItem string) (string, bool, error) {
 	item, err := file.expression(read.item)
 	if err != nil {
 		return "", false, err
+	}
+	if listItem != "" {
+		item = strings.TrimSuffix(item, strings.TrimLeft(item, "*")) + listItem // the item's pointer, if any
 	}
 	livewireAlias := file.use(livewirePath, "livewire")
 	switch {
@@ -451,7 +458,13 @@ func (g *goClient) read(source *goSource, read *readModel) error {
 	if err := refuseUndecodable(read.item); err != nil {
 		return fmt.Errorf("%w (the read %s)", err, read.targetName())
 	}
-	data, pointer, err := dataType(source.file, read)
+	listItem := g.listItem(read)
+	if listItem != "" {
+		if err := g.listItemStruct(source, read, listItem); err != nil {
+			return fmt.Errorf("%w (the read %s)", err, read.targetName())
+		}
+	}
+	data, pointer, err := dataType(source.file, read, listItem)
 	if err != nil {
 		return fmt.Errorf("%w (the read %s)", err, read.targetName())
 	}
@@ -719,6 +732,76 @@ func undecodable(goType reflect.Type, path string, visited map[reflect.Type]bool
 	default:
 	}
 	return nil
+}
+
+// listItem is the struct a resource's list read answers its rows as when they leave out
+// Detail fields (D93): the item's JSON fields without them, so a caller cannot mistake a field
+// the row does not carry for an empty one. It is "" for a read without Detail fields and for
+// an item that is no struct or decodes itself, whose rows are the item type.
+func (g *goClient) listItem(read *readModel) string {
+	if !read.list || read.kind != livewire.ReadMain || len(g.api.details[read.declaration]) == 0 {
+		return ""
+	}
+	itemType := read.item
+	if itemType.Kind() == reflect.Pointer {
+		itemType = itemType.Elem()
+	}
+	if decodes, _ := decodesItself(itemType, ""); decodes || itemType.Kind() != reflect.Struct {
+		return ""
+	}
+	return goIdentifier(read.declaration) + "ListItem"
+}
+
+// listItemStruct declares the list item of a read: every JSON field of the item but its
+// Detail fields, flat (embedded structs' fields promoted), under its Go name, type and options.
+func (g *goClient) listItemStruct(source *goSource, read *readModel, name string) error {
+	itemType := read.item
+	if itemType.Kind() == reflect.Pointer {
+		itemType = itemType.Elem()
+	}
+	itemExpression, err := source.file.expression(itemType)
+	if err != nil {
+		return err
+	}
+	details := g.api.details[read.declaration]
+	var fields strings.Builder
+	declared := map[string]bool{}
+	for _, field := range jsonfield.Of(itemType) {
+		if slices.Contains(details, field.Name) {
+			continue
+		}
+		expression, err := source.file.fieldExpression(field.StructField.Type)
+		if err != nil {
+			return err
+		}
+		goName := field.StructField.Name
+		if declared[goName] {
+			return fmt.Errorf("generate: %s has two JSON fields named %s in Go; the Go client cannot declare its list item %s", itemExpression, goName, name)
+		}
+		declared[goName] = true
+		fmt.Fprintf(&fields, "	%s %s `json:%q`\n", goName, expression, jsonTag(field))
+	}
+	fmt.Fprintf(&source.body, "\n// %s is a row of %s: %s without the Detail fields %s (D93),\n// which only the item read carries.\ntype %s struct {\n%s}\n",
+		name, goReadName("Get", read), itemExpression, strings.Join(details, ", "), name, fields.String())
+	return nil
+}
+
+// jsonTag is the json tag of a field as encoding/json reads it: its name and options.
+func jsonTag(field jsonfield.Field) string {
+	tag := field.Name
+	if tag == "-" {
+		tag = "-," // the name "-", not the field left out
+	}
+	if field.OmitEmpty {
+		tag += ",omitempty"
+	}
+	if field.OmitZero {
+		tag += ",omitzero"
+	}
+	if field.Quoted {
+		tag += ",string"
+	}
+	return tag
 }
 
 func (g *goClient) upload(source *goSource, upload *uploadModel) error {

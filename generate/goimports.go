@@ -113,35 +113,73 @@ func (f *goFile) importLine(path string) string {
 	return strconv.Quote(path)
 }
 
-// expression is the Go type expression of goType.
+// expression is the Go type expression of goType, which names every struct it reaches.
 func (f *goFile) expression(goType reflect.Type) (string, error) {
+	return f.typeExpression(goType, false)
+}
+
+// fieldExpression is expression for the type of a field the generated code declares itself
+// (a list item's, D93), where an unnamed struct is written out as the item declares it.
+func (f *goFile) fieldExpression(goType reflect.Type) (string, error) {
+	return f.typeExpression(goType, true)
+}
+
+func (f *goFile) typeExpression(goType reflect.Type, unnamedStructs bool) (string, error) {
 	if goType.Name() != "" {
 		return f.named(goType)
 	}
 	switch goType.Kind() {
 	case reflect.Pointer:
-		element, err := f.expression(goType.Elem())
+		element, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "*" + element, err
 	case reflect.Slice:
-		element, err := f.expression(goType.Elem())
+		element, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "[]" + element, err
 	case reflect.Array:
-		element, err := f.expression(goType.Elem())
+		element, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "[" + strconv.Itoa(goType.Len()) + "]" + element, err
 	case reflect.Map:
-		key, err := f.expression(goType.Key())
+		key, err := f.typeExpression(goType.Key(), unnamedStructs)
 		if err != nil {
 			return "", err
 		}
-		value, err := f.expression(goType.Elem())
+		value, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "map[" + key + "]" + value, err
 	case reflect.Interface:
 		if goType.NumMethod() == 0 {
 			return "any", nil
 		}
+	case reflect.Struct:
+		if unnamedStructs {
+			return f.structExpression(goType)
+		}
 	default:
 	}
 	return "", fmt.Errorf("generate: the Go client cannot name the type %s: give it a name in an importable package", goType)
+}
+
+// structExpression is the expression of an unnamed struct: its exported fields with their
+// tags; encoding/json reads no other.
+func (f *goFile) structExpression(goType reflect.Type) (string, error) {
+	var fields []string
+	for position := range goType.NumField() {
+		field := goType.Field(position)
+		if !field.IsExported() {
+			continue
+		}
+		expression, err := f.fieldExpression(field.Type)
+		if err != nil {
+			return "", err
+		}
+		if !field.Anonymous {
+			expression = field.Name + " " + expression
+		}
+		if field.Tag != "" {
+			expression += " " + strconv.Quote(string(field.Tag))
+		}
+		fields = append(fields, expression)
+	}
+	return "struct{ " + strings.Join(fields, "; ") + " }", nil
 }
 
 // named is the expression of a named type: a predeclared one as it is, another qualified

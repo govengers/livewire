@@ -91,7 +91,7 @@ func TodoFields() query.Fields {
 
 ### Detail fields
 
-`Detail: true` marks a field the item read carries and every list read leaves out (D93): a task's long description travels with the task, not with every row of the board. The engine strips it from the REST list, the socket query and snapshot, every diff and the rows an `Upserts` effect puts into a live list; a change of it alone pushes nothing to a list, while the item subscription gets it. Filter, sort, search and distinct work on it as on any field (they run in SQL), so a board searches the descriptions it does not show. The history and the export keep it. A Detail field is a JSON field of the item and neither `id` nor the item key; a List loader may leave it empty and save the read. The generated TypeScript list read answers `ListResponse<Omit<Item, 'description'>>`.
+`Detail: true` marks a field the item read carries and every list read leaves out (D93): a task's long description travels with the task, not with every row of the board. The engine strips it from the REST list, the socket query and snapshot, every diff and the rows an `Upserts` effect puts into a live list; a change of it alone pushes nothing to a list, while the item subscription gets it. Filter, sort, search and distinct work on it as on any field (they run in SQL), so a board searches the descriptions it does not show. The history and the export keep it. A Detail field is a JSON field of the item and neither `id` nor the item key; a List loader may leave it empty and save the read. The generated TypeScript list read answers `ListResponse<Omit<Item, 'description'>>`, the Go client's `ListResponse[ResourceListItem]`, a struct without the field.
 
 `Scope` is a `query.Predicate` that writes SQL with bound arguments; the todo app scopes by the tenant the engine resolved:
 
@@ -193,7 +193,7 @@ type TodoParameters struct {
 - `Check` runs before the body is read, on REST too (D8).
 - The handler runs inside the engine's transaction, after the `Idempotency-Key` was reserved; `livewire.IdempotencyKeyFrom(ctx)` reads the key ([Postgres](Postgres.md#the-transactor)).
 - `SecretResponse: true` keeps the response out of the idempotency record, for a response that shows a secret once, such as a new API key (D91): a repeat of the key answers 409 `conflict` whose field `idempotencyKey` is `not_replayable` (`livewire.NotReplayable`) instead of the response, so the client knows the call ran; `client.IsNotReplayable(err)` in Go and `isNotReplayable(error)` in the TypeScript runtime test for it.
-- A string, a member name or a parameter holding U+0000 is 400 `invalid_request` naming it (D95): PostgreSQL text cannot store it.
+- A string, a member name or a parameter holding U+0000 is 400 `invalid_request` naming it (D95): PostgreSQL text cannot store it. The same holds for a stored filter's `resource`, `context` and `name`, a presence join's state and key, and an upload's file name (`file`).
 
 ### Client ids
 
