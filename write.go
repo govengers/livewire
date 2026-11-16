@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -92,6 +93,7 @@ func (e *Engine) call(ctx context.Context, operation Operation, request CallRequ
 	}
 	ctx = WithTenant(ctx, prepared.tenant)
 	plan := callPlan(request.Target, prepared.parameters, request.IdempotencyKey, request.RequestID)
+	plan.secretResponse = prepared.mutation.SecretResponse()
 	answer, err := e.writeAudited(ctx, plan, unit.started, prepared.handle)
 	if err == nil && answer.replayed {
 		answer.payload, err = redactResponse(ctx, prepared.guards, answer.payload)
@@ -235,7 +237,10 @@ func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRe
 		return nil, err
 	}
 	ctx = WithTenant(ctx, prepared[0].tenant)
-	plan := writePlan{mutation: batchReservation(prepared), idempotencyKey: request.IdempotencyKey, requestID: requestIDOr(request.RequestID)}
+	plan := writePlan{
+		mutation: batchReservation(prepared), idempotencyKey: request.IdempotencyKey, requestID: requestIDOr(request.RequestID),
+		secretResponse: slices.ContainsFunc(prepared, func(call *preparedCall) bool { return call.mutation.SecretResponse() }),
+	}
 	run := &batchRun{engine: e, operation: operation, plan: plan, prepared: prepared}
 	answer, err := e.write(ctx, plan, run.run)
 	if err != nil && len(run.ran) > 0 {
@@ -500,13 +505,15 @@ func (e *Engine) observeWrite(ctx context.Context, unit unitOfWork, parameters a
 
 // writePlan is what a write's transaction records: the name the key is reserved under, the
 // mutation the transaction names ("" for a batch's outer transaction), the parameters, the
-// Idempotency-Key and the request id.
+// Idempotency-Key, the request id, and whether the answer carries a secret the idempotency
+// record must not keep (D91; a batch with one such call).
 type writePlan struct {
 	mutation            string
 	transactionMutation string
 	parameters          any
 	idempotencyKey      string
 	requestID           string
+	secretResponse      bool
 }
 
 // callPlan is the plan of one mutation or upload; an empty request id gets a fresh one.
@@ -626,7 +633,9 @@ func (e *Engine) write(ctx context.Context, plan writePlan, run writeRun) (*writ
 	return answer, nil
 }
 
-// runReserved reserves the key, runs and records the answer; a finished key replays.
+// runReserved reserves the key, runs and records the answer; a finished key replays, except
+// one whose answer carries a secret: its record keeps the status only and a repeat is 409
+// not_replayable (D91).
 func (e *Engine) runReserved(ctx context.Context, plan writePlan, run func(ctx context.Context) (int, json.RawMessage, error)) (*writeAnswer, error) {
 	store := e.options.IdempotencyStore
 	owner, hasOwner := OwnerOf(ctx)
@@ -642,7 +651,10 @@ func (e *Engine) runReserved(ctx context.Context, plan writePlan, run func(ctx c
 		if err != nil {
 			return nil, fmt.Errorf("livewire: reserve the Idempotency-Key of %q: %w", plan.mutation, err)
 		}
-		if replay {
+		switch {
+		case replay && plan.secretResponse:
+			return nil, NotReplayable()
+		case replay:
 			return &writeAnswer{status: record.Status, payload: record.Response, replayed: true}, nil
 		}
 	}
@@ -657,6 +669,9 @@ func (e *Engine) runReserved(ctx context.Context, plan writePlan, run func(ctx c
 	}
 	if reserved {
 		record := &IdempotencyRecord{Owner: owner, Key: plan.idempotencyKey, Mutation: plan.mutation, Status: answer.status, Response: answer.payload}
+		if plan.secretResponse {
+			record.Response = nil
+		}
 		if err := recovering(func() error { return store.Record(ctx, record) }); err != nil {
 			return nil, fmt.Errorf("livewire: record the answer of %q: %w", plan.mutation, err)
 		}

@@ -128,6 +128,32 @@ func TestAnAPIKeyFollowsItsMembershipAndDiesWithIt(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, status, "the membership's keys went with it")
 }
 
+func TestANewKeyIsShownOnceAndNeverRecorded(t *testing.T) {
+	t.Parallel()
+	application := newTestApplication(t)
+	browser := application.login(t, "alice")
+	key := uuid.NewString()
+	mint := func() (int, livewire.ErrorBody) {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, application.baseURL()+"/keys", nil)
+		require.NoError(t, err)
+		request.Header.Set("Idempotency-Key", key)
+		response, err := browser.Do(request)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, response.Body.Close()) }()
+		var body livewire.ErrorBody
+		_ = json.NewDecoder(response.Body).Decode(&body)
+		return response.StatusCode, body
+	}
+	status, _ := mint()
+	require.Equal(t, http.StatusCreated, status)
+	status, body := mint()
+	require.Equal(t, http.StatusConflict, status, "a repeat cannot show the key again (D91)")
+	require.Equal(t, livewire.CodeNotReplayable, body.Code)
+	var recorded bool
+	require.NoError(t, application.pool.QueryRow(t.Context(), "SELECT response IS NOT NULL FROM livewire_idempotency WHERE key = $1", key).Scan(&recorded))
+	require.False(t, recorded, "the key's secret never reaches the idempotency table")
+}
+
 func TestOtherWorkspacesAndStrangersAreRefused(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)

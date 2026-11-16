@@ -29,6 +29,7 @@ const (
 	CodeNotFound        Code = "not_found"
 	CodeConflict        Code = "conflict"
 	CodeInProgress      Code = "in_progress"
+	CodeNotReplayable   Code = "not_replayable"
 	CodeInternal        Code = "internal"
 )
 
@@ -83,6 +84,14 @@ func Conflict() *Error {
 // (D16).
 func InProgress() *Error {
 	return newError(http.StatusConflict, CodeInProgress, nil)
+}
+
+// NotReplayable is the 409 of a repeated idempotency key whose call finished but whose
+// answer was not kept, because the mutation's response carries a secret shown once
+// (MutationOptions.SecretResponse, D91): the call ran, so the client must not send it again
+// under a new key without knowing that.
+func NotReplayable() *Error {
+	return newError(http.StatusConflict, CodeNotReplayable, nil)
 }
 
 // Invalid is the 400 of a request whose parameters or body are wrong; fields maps each
@@ -225,6 +234,7 @@ var messages = map[Code]string{
 	CodeNotFound:       "not found",
 	CodeConflict:       "the request conflicts with the current state",
 	CodeInProgress:     "the same request is still in progress",
+	CodeNotReplayable:  "the same request ran already and its answer is not kept",
 }
 
 func newError(status int, code Code, fields map[string]string) *Error {

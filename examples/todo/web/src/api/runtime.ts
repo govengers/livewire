@@ -17,6 +17,7 @@ export type ErrorCode =
   | 'not_found'
   | 'conflict'
   | 'in_progress'
+  | 'not_replayable'
   | 'internal'
 
 /** The one error body of every REST response and socket error. */
@@ -231,12 +232,12 @@ export function exportTarget<Query>(descriptor: Omit<ExportTarget<Query>, 'types
 
 const errorCodes: readonly ErrorCode[] = [
   'invalid_request', 'invalid_filter', 'invalid_sort', 'invalid_page', 'invalid_cursor', 'forbidden_field',
-  'unauthenticated', 'forbidden', 'not_found', 'conflict', 'in_progress', 'internal',
+  'unauthenticated', 'forbidden', 'not_found', 'conflict', 'in_progress', 'not_replayable', 'internal',
 ]
 
 const statusOfCode: Readonly<Record<ErrorCode, number>> = {
   invalid_request: 400, invalid_filter: 400, invalid_sort: 400, invalid_page: 400, invalid_cursor: 400,
-  forbidden_field: 403, unauthenticated: 401, forbidden: 403, not_found: 404, conflict: 409, in_progress: 409, internal: 500,
+  forbidden_field: 403, unauthenticated: 401, forbidden: 403, not_found: 404, conflict: 409, in_progress: 409, not_replayable: 409, internal: 500,
 }
 
 function codeOfStatus(status: number): ErrorCode {

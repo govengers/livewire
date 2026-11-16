@@ -73,6 +73,8 @@ type testbed struct {
 	release chan struct{}
 	// anonymousRuns counts the handler runs of "anonymousGadget".
 	anonymousRuns atomic.Int64
+	// secretRuns counts the handler runs of "mintSecret".
+	secretRuns atomic.Int64
 	// cancelCall, when set, is what "cancelGadget" calls before it fails: its caller went away.
 	cancelCall atomic.Pointer[context.CancelFunc]
 	// versions are the versions of the documents, by id; historyQueries what the History
@@ -149,7 +151,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget(), b.mintSecret()))
 	return registry
 }
 
@@ -341,6 +343,19 @@ func (b *testbed) team() *livewire.Object {
 		Partition: func(_ context.Context, parameters any) string { return "board-" + parameters.(*teamParameters).Team },
 		Load: func(_ context.Context, parameters *teamParameters) (*teamItem, error) {
 			return &teamItem{Team: parameters.Team}, nil
+		},
+	})
+}
+
+// mintSecret answers a secret shown once (D91), so its idempotency record keeps no response;
+// secretRuns counts its handler runs.
+func (b *testbed) mintSecret() *livewire.Mutation {
+	return livewire.NewMutation("mintSecret", http.MethodPost, "/secrets", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, countItem]{
+		Check:          authorization.HasRole(roleWriter),
+		Status:         http.StatusCreated,
+		SecretResponse: true,
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*countItem, error) {
+			return &countItem{Count: int(b.secretRuns.Add(1))}, nil
 		},
 	})
 }

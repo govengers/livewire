@@ -107,7 +107,7 @@ var (
 	jsonMarshalerType   = reflect.TypeFor[json.Marshaler]()
 	textMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
 	isZeroerType        = reflect.TypeFor[interface{ IsZero() bool }]()
-	errorCodes          = []livewire.Code{livewire.CodeInvalidRequest, livewire.CodeInvalidFilter, livewire.CodeInvalidSort, livewire.CodeInvalidPage, livewire.CodeInvalidCursor, livewire.CodeForbiddenField, livewire.CodeUnauthenticated, livewire.CodeForbidden, livewire.CodeNotFound, livewire.CodeConflict, livewire.CodeInProgress, livewire.CodeInternal}
+	errorCodes          = []livewire.Code{livewire.CodeInvalidRequest, livewire.CodeInvalidFilter, livewire.CodeInvalidSort, livewire.CodeInvalidPage, livewire.CodeInvalidCursor, livewire.CodeForbiddenField, livewire.CodeUnauthenticated, livewire.CodeForbidden, livewire.CodeNotFound, livewire.CodeConflict, livewire.CodeInProgress, livewire.CodeNotReplayable, livewire.CodeInternal}
 	changeOperations    = []livewire.ChangeOperation{livewire.ChangeInsert, livewire.ChangeUpdate, livewire.ChangeDelete}
 	typeScriptGlobals   = []string{"Array", "Blob", "Boolean", "Date", "Error", "Exclude", "Extract", "File", "FormData", "Function", "Map", "Number", "Object", "Omit", "Partial", "Pick", "Promise", "Readonly", "ReadonlyArray", "Record", "Required", "Response", "Set", "String", "Symbol", "URL"}
 	qualifiedNamePart   = regexp.MustCompile(`[A-Za-z0-9_./\-]+`)

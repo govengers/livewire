@@ -72,9 +72,13 @@ func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: 
 // (go-playground/validator, D44) after the structural checks; a tag the validator cannot
 // parse, on any struct reachable from Request, is a declaration error. Description says
 // what the mutation does, for people and agents (D85); "" leaves the OpenAPI operation
-// without one and the tool catalogue with a description of its own.
+// without one and the tool catalogue with a description of its own. SecretResponse keeps
+// the response out of the idempotency record because it carries a secret shown once (a new
+// API key, D91): the record keeps only the status, and a repeat of the key answers 409
+// not_replayable instead of the response.
 type MutationOptions[Parameters, Request, Response any] struct {
-	Description string
+	Description    string
+	SecretResponse bool
 	Check       authorization.Check
 	Status      int
 	ClientID    ClientIDVersion
@@ -97,6 +101,7 @@ type Mutation struct {
 	fieldChecks    map[string]authorization.Check
 	writeChecks    map[string]authorization.Check
 	effect         Effect
+	secretResponse bool
 	validate       *validator.Validate
 	fields         fieldIndex
 	handle         func(ctx context.Context, parameters, body any) (any, error)
@@ -120,6 +125,7 @@ func NewMutation[Parameters, Request, Response any](name, method, path string, o
 		fieldChecks:    maps.Clone(options.FieldChecks),
 		writeChecks:    maps.Clone(options.FieldChecks),
 		effect:         options.Effect,
+		secretResponse: options.SecretResponse,
 	}
 	mutation.description = options.Description
 	fallback := http.StatusOK
@@ -174,6 +180,9 @@ func (m *Mutation) Resource() string { return m.resource }
 
 // Effect is the optimistic effect (D36); the zero value is none.
 func (m *Mutation) Effect() Effect { return m.effect }
+
+// SecretResponse reports whether the response stays out of the idempotency record (D91).
+func (m *Mutation) SecretResponse() bool { return m.secretResponse }
 
 // DecodeBody decodes raw into a new body value (a *Request) under the identity in ctx. The
 // body is read once as a token stream alongside the request type: a body that is not a JSON

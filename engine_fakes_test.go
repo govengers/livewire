@@ -482,6 +482,13 @@ func (f *fakeIdempotency) Reserve(ctx context.Context, owner livewire.Owner, key
 	return nil, false, nil
 }
 
+// recorded is the record of the owner's key as the store keeps it.
+func (f *fakeIdempotency) recorded(owner, key string) livewire.IdempotencyRecord {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return f.records[livewire.Owner{Key: owner}][key].record
+}
+
 func (f *fakeIdempotency) Record(_ context.Context, record *livewire.IdempotencyRecord) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
