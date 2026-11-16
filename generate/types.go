@@ -36,6 +36,9 @@ const (
 	shapeVersion
 	// shapeTimeValue is the operand of a condition on a time field: RFC 3339 or a relative time (D12).
 	shapeTimeValue
+	// shapeOmit is element without the members omitted: a resource's list item without its
+	// Detail fields (D93), the OpenAPI component named component.
+	shapeOmit
 )
 
 // shape is the language-neutral model of one JSON value both emitters render: TypeScript
@@ -55,6 +58,8 @@ type shape struct {
 	maximumLength int
 	minimumItems  int
 	maximumItems  int
+	omitted       []string
+	component     string
 }
 
 // property is one member of an object: optional when encoding/json may omit it or the

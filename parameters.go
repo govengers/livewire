@@ -291,8 +291,11 @@ func isPlaceholder(segment string) bool {
 func readValues(source ParameterSource, parameter Parameter) ([]string, error) {
 	if parameter.In == InPath {
 		value, ok := source.Path(parameter.Name)
-		if !ok || value == "" {
+		switch {
+		case !ok || value == "":
 			return nil, invalidParameter(parameter.Name, "required")
+		case strings.ContainsRune(value, 0):
+			return nil, invalidParameter(parameter.Name, noNULValue)
 		}
 		return []string{value}, nil
 	}
@@ -309,6 +312,8 @@ func readQueryValues(source ParameterSource, name string, list bool) ([]string, 
 		return nil, nil
 	case !list && len(values) > 1:
 		return nil, invalidParameter(name, "must not repeat")
+	case slices.ContainsFunc(values, func(value string) bool { return strings.ContainsRune(value, 0) }):
+		return nil, invalidParameter(name, noNULValue) // PostgreSQL text holds no U+0000
 	}
 	return values, nil
 }

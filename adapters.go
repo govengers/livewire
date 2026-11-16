@@ -292,3 +292,32 @@ type Outcome struct {
 // Observer receives outcomes synchronously with the context of the unit of work. It must
 // not block and must be safe for concurrent use; a nil Observer means no reporting.
 type Observer func(ctx context.Context, outcome Outcome)
+
+// Unit is a unit of work the engine runs on its own (D92), as StartUnit is told of it before
+// the work: Kind is the kind of work, as the outcome of the work reports it (OutcomeRequest
+// for a socket query, join or leave, OutcomeSubscribe, OutcomeCall and OutcomeBatch for those
+// frames, OutcomeRerun, OutcomeAfterCommit, ...; a frame refused before its op ran reports
+// OutcomeRequest), Operation the socket op ("" off the socket), Target and Subscription as
+// the Outcome names them (Subscription is set for a re-run and an end).
+type Unit struct {
+	Kind         OutcomeKind
+	Operation    Operation
+	Target       string
+	Subscription string
+}
+
+// UnitStarter begins a unit of work the engine runs on its own, outside a transport's request
+// (D92): every socket frame, subscription re-run and end, identity re-validation, socket open
+// and close, each presence leave at a socket's end, presence heartbeat, change feed failure,
+// and each OutcomeAfterCommit report, on REST too. It answers the context the unit runs on,
+// the loaders, handlers, stores and the Observer included, where the application puts its own
+// unit (a wide event its database tracer records db.* on, LOG-004), and a finish the engine
+// calls once after the unit's last outcome (nil for none), where the application ends it
+// (emits the event). A unit may end without any outcome: a re-run whose socket or
+// subscription ended, or whose identity is gone, during its work reports nothing (the socket's
+// close or the subscription's end does), so the application states the outcome of such a unit
+// itself. A StartUnit that panics is reported as a 500 outcome of the unit's kind, and the
+// unit runs on the context it came with. A transport's request (REST, a toolset call) is no
+// such unit: Engine.Read, Call, Batch, Upload, Export and the stored filter methods run on the
+// context they are given. It must not block and must be safe for concurrent use.
+type UnitStarter func(ctx context.Context, unit Unit) (context.Context, func())

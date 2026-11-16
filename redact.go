@@ -19,6 +19,12 @@ func RedactItems(ctx context.Context, fields query.Fields, raw json.RawMessage) 
 	if len(hidden) == 0 {
 		return raw, nil
 	}
+	return stripItems(raw, hidden)
+}
+
+// stripItems deletes the members hidden names from every item of raw, a marshaled JSON array
+// of objects, re-marshaled with its keys sorted; anything but an array of objects is an error.
+func stripItems(raw json.RawMessage, hidden map[string]bool) (json.RawMessage, error) {
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil || items == nil {
 		return nil, errors.New("livewire: redact: the value is not a JSON array of objects")

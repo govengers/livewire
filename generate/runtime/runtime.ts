@@ -163,10 +163,11 @@ export interface LiveTarget<Parameters, Data> extends ReadTarget<Parameters, Dat
   readonly live: true
 }
 
-/** The optimistic effect of a mutation on the live lists of a target (D36). */
+/** The optimistic effect of a mutation on the live lists of a target (D36); omit names the target's Detail fields, which an upserted row leaves out as the list's rows do (D93). */
 export interface Effect {
   readonly kind: 'upserts' | 'removes'
   readonly target: string
+  readonly omit?: readonly string[]
 }
 
 export interface MutationTarget<Parameters, Body, Response> {
@@ -273,6 +274,18 @@ export class ApiError extends Error {
     this.fields = isStringRecord(candidate.fields) ? candidate.fields : {}
     this.body = body
   }
+}
+
+/** The value of the idempotencyKey field of the 409 conflict that answers the repeat of a call whose answer shows a secret once (D91). */
+export const notReplayable = 'not_replayable'
+
+/**
+ * Whether error is the 409 conflict of a repeated Idempotency-Key whose call ran but whose answer
+ * the server does not keep (a secret shown once, D91): sending it again under a new key would run
+ * it twice, so offer to revoke and create instead.
+ */
+export function isNotReplayable(error: unknown): boolean {
+  return error instanceof ApiError && error.code === 'conflict' && error.fields['idempotencyKey'] === notReplayable
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -422,6 +435,14 @@ export function batchCall<Parameters extends object, Body, Response>(
 /** The id an item is diffed by: a string or a number, compared as text. */
 export function itemID(item: unknown): string {
   return String((item as { id?: unknown } | null)?.id)
+}
+
+/** The item without the members omit names (an upsert into a list whose rows leave out the Detail fields, D93); the item itself when it has none of them. */
+function withoutMembers<Item>(item: Item, omit: readonly string[] | undefined): Item {
+  if (omit === undefined || item === null || typeof item !== 'object' || !omit.some((name) => name in item)) return item
+  const kept: Record<string, unknown> = { ...(item as Record<string, unknown>) }
+  for (const name of omit) delete kept[name]
+  return kept as Item
 }
 
 /** Applies a diff push to the list it was taken against (section 4). */
@@ -1221,7 +1242,7 @@ export class LiveConnection {
     }
     if (effect?.kind === 'removes' && wire['id'] !== undefined) this.applyEffect(starts, { call, id: wire['id'], pending: true })
     if (effect?.kind === 'upserts' && options.optimistic !== undefined) {
-      this.applyEffect(starts, { call, id: itemID(options.optimistic), item: options.optimistic, pending: true })
+      this.applyEffect(starts, { call, id: itemID(options.optimistic), item: withoutMembers(options.optimistic, effect.omit), pending: true })
     }
     const prepared = prepareCall(target, body, options)
     const frame: Omit<RequestFrame, 'id'> = { op: 'call', target: target.name, params: wire, idempotencyKey: prepared.idempotencyKey }
@@ -1646,7 +1667,7 @@ export class LiveConnection {
       const id = effect.kind === 'upserts' ? itemID(response) : removedID
       if (!pushed && id !== undefined) {
         const settled: OverlayEntry = { call, id, pending: false }
-        if (effect.kind === 'upserts') settled.item = response
+        if (effect.kind === 'upserts') settled.item = withoutMembers(response, effect.omit)
         const later = subscription.overlay.findIndex((entry) => entry.call > call)
         subscription.overlay.splice(later < 0 ? subscription.overlay.length : later, 0, settled)
         this.clock.setTimeout(() => {

@@ -15,7 +15,7 @@ if err := ginadapter.RegisterRoutes(api, &ginadapter.Options{Engine: engine}); e
 socket := ginadapter.SocketHandler(engine)
 api.GET(SocketPath, func(ginContext *gin.Context) {
     // The socket's units of work are not the upgrade request: they get events of their own
-    // (NewObserver), so nothing writes to the upgrade's event after it was emitted (LOG-008).
+    // (NewUnitStarter), so nothing writes to the upgrade's event after it was emitted (LOG-008).
     ginContext.Request = ginContext.Request.WithContext(wideevent.NewContext(ginContext.Request.Context(), nil))
     socket(ginContext)
 })
@@ -81,7 +81,7 @@ Behind a writer wrapper without `Unwrap` (a gzip middleware embedding `gin.Respo
 
 ## Wide events
 
-With the wide-event-logger's gin middleware in front, every REST outcome is recorded on the request's event: `livewire.target`, `livewire.kind`, `livewire.read` for a read kind, `livewire.status`, `livewire.code` on a refusal, `livewire.rows` for an export, and the event's success or failure. The socket's units of work are not the upgrade request: the application's [Observer](Live-Engine.md#the-observer) emits an event per socket outcome, and the socket route takes the upgrade's event out of the context so nothing writes to it after it was emitted (the routes snippet above does).
+With the wide-event-logger's gin middleware in front, every REST outcome is recorded on the request's event: `livewire.target`, `livewire.kind`, `livewire.read` for a read kind, `livewire.status`, `livewire.code` on a refusal, `livewire.rows` for an export, and the event's success or failure. The socket's units of work are not the upgrade request: the application's [StartUnit](Live-Engine.md#the-observer) begins an event per socket unit before its work, so its queries are recorded on it, and the socket route takes the upgrade's event out of the context so nothing writes to it after it was emitted (the routes snippet above does).
 
 ## Prometheus
 

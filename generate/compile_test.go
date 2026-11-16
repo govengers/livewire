@@ -65,6 +65,14 @@ func TestGeneratedGoCompilesInAnApplicationModule(t *testing.T) {
 	require.NoError(t, generate.Write(createRegistry[fixture.CreateHidden](t), &generate.Options{
 		GoClient: generate.GoClientOptions{Directory: filepath.Join(directory, "hiddenclient"), ImportPath: compiledModule + "/hiddenclient"},
 	}))
+	// A list-only resource with a Detail field: only the list item names the item type, so the
+	// client must not import the item's package. And a list item with an unnamed struct field.
+	require.NoError(t, generate.Write(detailRegistry[fixture.Note](t), &generate.Options{
+		GoClient: generate.GoClientOptions{Directory: filepath.Join(directory, "listonlyclient"), ImportPath: compiledModule + "/listonlyclient"},
+	}))
+	require.NoError(t, generate.Write(detailRegistry[fixture.InlineNote](t), &generate.Options{
+		GoClient: generate.GoClientOptions{Directory: filepath.Join(directory, "inlineclient"), ImportPath: compiledModule + "/inlineclient"},
+	}))
 	module := "module " + compiledModule + "\n\ngo 1.26.0\n\nrequire github.com/govengers/livewire v0.0.0\n\nreplace github.com/govengers/livewire => " + root + "\n"
 	writeFile(t, filepath.Join(directory, "go.mod"), []byte(module))
 	writeFile(t, filepath.Join(directory, "go.sum"), readFile(t, filepath.Join(root, "go.sum")))

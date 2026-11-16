@@ -11,6 +11,7 @@ import (
 	"io/fs"
 
 	"github.com/exaring/otelpgx"
+	"github.com/jackc/pgx/v5/multitracer"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -25,14 +26,18 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// NewPool opens the pool with an explicit size (DAT-020); every query is a span of traces.
+// NewPool opens the pool with an explicit size (DAT-020); every query is a span of traces and
+// counts on the QueryCount of its context.
 func NewPool(ctx context.Context, url string, maximumConnections int32, traces trace.TracerProvider) (*pgxpool.Pool, error) {
 	configuration, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("parse the database URL: %w", err)
 	}
 	configuration.MaxConns = maximumConnections
-	configuration.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTracerProvider(traces)) // SQL text, never its parameters (TRC-006)
+	configuration.ConnConfig.Tracer = multitracer.New(
+		otelpgx.NewTracer(otelpgx.WithTracerProvider(traces)), // SQL text, never its parameters (TRC-006)
+		queryTracer{}, // the db.* fields of the unit's wide event (CountQueries)
+	)
 	pool, err := pgxpool.NewWithConfig(ctx, configuration)
 	if err != nil {
 		return nil, fmt.Errorf("open the database: %w", err)

@@ -11,6 +11,7 @@ import {
   applyListChange,
   batchCall,
   exportTarget,
+  isNotReplayable,
   liveRead,
   mutation,
   prepareCall,
@@ -148,6 +149,13 @@ describe('wire helpers', () => {
     expect(new ApiError(401, { error: 'nope' }).code).toBe('unauthenticated')
     expect(new ApiError(0, notFound).status).toBe(404)
     expect(new ApiError(409, { code: 'something_else' }).code).toBe('conflict')
+  })
+
+  test('isNotReplayable tells the repeat of a call whose answer is not kept from another conflict', () => {
+    expect(isNotReplayable(new ApiError(409, { code: 'conflict', message: 'm', fields: { idempotencyKey: 'not_replayable' } }))).toBe(true)
+    expect(isNotReplayable(new ApiError(409, { code: 'conflict', message: 'm' }))).toBe(false)
+    expect(isNotReplayable(new ApiError(400, { code: 'invalid_request', message: 'm', fields: { idempotencyKey: 'not_replayable' } }))).toBe(false)
+    expect(isNotReplayable(new Error('not_replayable'))).toBe(false)
   })
 
   test('the constructors validate their options', () => {
@@ -648,6 +656,19 @@ describe('LiveConnection', () => {
     current().receive({ sub: 's1', seq: 2, kind: 'diff', payload: { upserts: [{ id: 'a', name: 'A2' }], removes: [] } })
     expect(received.last()?.data.items).toEqual([{ id: 'a', name: 'A2' }])
     expect(item.states).toEqual([])
+  })
+
+  test('an upsert leaves the Detail fields the effect omits out of the list row, never out of the answer (D93)', async () => {
+    const { connection, current, received } = subscribedList([{ id: 'a', name: 'A' }])
+    const describePart = mutation<Record<string, never>, { id?: string; name: string }, Part & { description: string }>({
+      name: 'describePart', method: 'POST', path: '/parts/describe', pathParameters: [], body: true, content: true,
+      effect: { kind: 'upserts', target: 'parts', omit: ['description'] },
+    })
+    const call = connection.call(describePart, {}, { id: 'n', name: 'new' }, { optimistic: { id: 'n', name: 'new', description: 'long' } })
+    expect(received.last()?.data.items).toEqual([{ id: 'a', name: 'A' }, { id: 'n', name: 'new' }])
+    current().answer('call', { status: 201, payload: { id: 'n', name: 'stored', description: 'long' } })
+    expect(await call).toEqual({ id: 'n', name: 'stored', description: 'long' })
+    expect(received.last()?.data.items).toEqual([{ id: 'a', name: 'A' }, { id: 'n', name: 'stored' }])
   })
 
   test('a settled upsert of a row the list does not hold ends with the reconcile window: an unchanged list pushes nothing (D36)', async () => {

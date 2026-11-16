@@ -21,6 +21,8 @@ type model struct {
 	mutations []*mutationModel
 	uploads   []*uploadModel
 	exports   []*exportModel
+	// details are the Detail fields of each resource that has some (D93), by its name.
+	details map[string][]string
 }
 
 // parameterModel is one parameter of a read, mutation or upload on the wire; pointer says
@@ -209,7 +211,7 @@ const historyPrefix = "History"
 
 func newModel(registry *livewire.Registry, options Options) (*model, error) {
 	types := newTypeSet(options.Enums)
-	built := &model{basePath: registry.BasePath(), types: types}
+	built := &model{basePath: registry.BasePath(), types: types, details: map[string][]string{}}
 	declarations := registry.Declarations()
 	// The guarded fields first: a type is described once, on first sight.
 	for _, declaration := range declarations {
@@ -218,16 +220,7 @@ func newModel(registry *livewire.Registry, options Options) (*model, error) {
 	if err := types.describeLibrary(); err != nil {
 		return nil, err
 	}
-	filters := map[string]*resourceModel{}
-	for _, declaration := range declarations {
-		if resource, ok := declaration.(*livewire.Resource); ok {
-			filters[resource.Name()] = &resourceModel{name: pascalCase(resource.Name()), target: resource.Name(), fields: resource.Fields()}
-			built.resources = append(built.resources, filters[resource.Name()])
-			if resource.HistoryPath() != "" && built.history == nil {
-				built.history = &resourceModel{name: historyPrefix, fields: livewire.HistoryFields(), history: true}
-			}
-		}
-	}
+	filters := built.addResourceModels(declarations)
 	for _, resource := range slices.Concat(built.resources, []*resourceModel{built.history}) {
 		if resource != nil {
 			for _, name := range []string{resource.filterType(), resource.nodeType(), resource.conditionType()} {
@@ -245,6 +238,43 @@ func newModel(registry *livewire.Registry, options Options) (*model, error) {
 	}
 	return built, nil
 }
+
+// addResourceModels adds the filter vocabulary of every resource, the history's once, and the
+// Detail fields of each (D93), whose list item component name it reserves; it answers the
+// vocabularies by resource name.
+func (m *model) addResourceModels(declarations []livewire.Declaration) map[string]*resourceModel {
+	filters := map[string]*resourceModel{}
+	for _, declaration := range declarations {
+		resource, ok := declaration.(*livewire.Resource)
+		if !ok {
+			continue
+		}
+		filters[resource.Name()] = &resourceModel{name: pascalCase(resource.Name()), target: resource.Name(), fields: resource.Fields()}
+		m.resources = append(m.resources, filters[resource.Name()])
+		if details := detailNames(resource.Fields()); len(details) > 0 {
+			m.details[resource.Name()] = details
+			m.types.reserved[listItemName(resource.Name())] = true
+		}
+		if resource.HistoryPath() != "" && m.history == nil {
+			m.history = &resourceModel{name: historyPrefix, fields: livewire.HistoryFields(), history: true}
+		}
+	}
+	return filters
+}
+
+// detailNames are the fields marked Detail, which a list read leaves out (D93).
+func detailNames(fields query.Fields) []string {
+	var names []string
+	for _, field := range fields {
+		if field.Detail {
+			names = append(names, field.Name)
+		}
+	}
+	return names
+}
+
+// listItemName is the OpenAPI component of a resource's list item without its Detail fields.
+func listItemName(resource string) string { return pascalCase(resource) + "ListItem" }
 
 func guardDeclaration(types *typeSet, declaration livewire.Declaration) {
 	switch typed := declaration.(type) {
@@ -294,10 +324,15 @@ func (m *model) addResource(resource *livewire.Resource, filters *resourceModel,
 		return err
 	}
 	name, description, live := resource.Name(), resource.Description(), len(resource.Tables()) > 0
+	listItem := item
+	if details := m.details[name]; len(details) > 0 {
+		// the item without its null: Omit of a union with null keeps no member at all
+		listItem = &shape{kind: shapeOmit, element: item.withNullable(false), nullable: item.nullable, omitted: details, component: listItemName(name)}
+	}
 	m.reads = append(m.reads, &readModel{
 		declaration: name, description: description, kind: livewire.ReadMain, path: resource.Path(), queryType: pascalCase(name) + "ListQuery",
 		reserved: reservedModel{filters: filters, sort: true, page: true, after: resource.Cursor()},
-		data:     &shape{kind: shapeListResponse, element: item}, item: resource.ItemType(), list: true, live: live,
+		data:     &shape{kind: shapeListResponse, element: listItem}, item: resource.ItemType(), list: true, live: live,
 	})
 	key := itemKeyParameter(resource)
 	if key != nil {

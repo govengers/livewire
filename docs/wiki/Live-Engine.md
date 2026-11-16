@@ -117,21 +117,64 @@ livewire never logs. The registry's `Observer` gets one `Outcome` per unit of wo
 | `open`, `close` | a socket upgraded, ended (the status is the close code) |
 | `revalidate`, `feed`, `heartbeat` | the background work: a re-validation, a change feed failure, the presence tick |
 
-The todo app feeds Prometheus and writes one wide event per outcome that has no request event of its own:
+Most of the engine's work has no request of its own: a socket frame, a re-run, a re-validation, the heartbeat. `RegistryOptions.StartUnit` begins each such unit before its work runs (D92): it gets a `Unit{Kind, Operation, Target, Subscription}` and answers the context the identity check, the loaders, handlers and stores and the Observer of that unit run on, plus a finish the engine calls after the unit's last outcome. An application puts its wide event into that context, so its database tracer records `db.*` on socket work as on an HTTP request (LOG-004), and emits the event in the finish. A unit can finish without an outcome (a re-run whose socket ended during its read), so the finish states one for such a unit; a StartUnit that panics is reported as a 500 outcome of the unit's kind. Each presence leave at a socket's end is a unit of its own. A transport's request (REST, a toolset or MCP call) runs on the transport's context and is no such unit; only its `after_commit` report is begun. Without `StartUnit` every unit runs on the context it came with.
+
+The todo app feeds Prometheus, gives every unit without a request event an event of its own that counts its queries, and emits it when the unit finishes:
 
 <!-- snippet: examples/todo/internal/server/server.go#observer -->
 ```go
-// NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome
+// unitEventKey carries the unitEvent NewUnitStarter began for a unit of work.
+type unitEventKey struct{}
+
+// unitEvent is the wide event of a unit of work and whether an outcome was recorded on it.
+type unitEvent struct {
+    we       *wideevent.Event
+    observed atomic.Bool
+}
+
+// NewUnitStarter is the registry's StartUnit (D92): a unit of work the engine runs on its own
 // without a request's wide event (a socket frame, a re-run, the feed, a heartbeat: the socket
-// route takes the upgrade's event out of their context) is a unit of work of its own and gets
-// one event. A REST outcome is on the request's event already, which the REST adapter recorded.
-func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) livewire.Observer {
+// route takes the upgrade's event out of their context) gets an event of its own before its
+// work runs, so its queries count on it (db.*, LOG-004), and the event is emitted when the
+// unit finishes. It carries the unit's livewire.* fields from the start; a unit that ended
+// without an outcome (a re-run whose socket ended during its read) states success with
+// livewire.unanswered, so every event states its outcome (LOG-011). A unit inside a request
+// or frame (the after-commit report of a mutation) stays on its event: this application has
+// no after-commit reaction whose work would need one of its own.
+func NewUnitStarter(emitter wideevent.Emitter) livewire.UnitStarter {
+    return func(ctx context.Context, unit livewire.Unit) (context.Context, func()) {
+        if wideevent.FromContext(ctx) != nil {
+            return ctx, nil
+        }
+        event := &unitEvent{we: wideevent.Begin(emitter, "livewire."+string(unit.Kind))}
+        event.we.String("livewire.kind", string(unit.Kind)).
+            String("livewire.operation", string(unit.Operation)).
+            String("livewire.target", unit.Target).
+            String("livewire.subscription", unit.Subscription)
+        ctx, queries := database.CountQueries(wideevent.NewContext(ctx, event.we))
+        return context.WithValue(ctx, unitEventKey{}, event), func() {
+            queries.Record(event.we)
+            if !event.observed.Load() {
+                event.we.Bool("livewire.unanswered", true).Success()
+            }
+            event.we.Emit()
+        }
+    }
+}
+
+// NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome of
+// a unit NewUnitStarter began is recorded on the unit's event, an after-commit report aside,
+// whose call's outcome said everything. A REST outcome is on the request's event already,
+// which the REST adapter recorded.
+func NewObserver(metrics *prometheusadapter.Metrics) livewire.Observer {
     return func(ctx context.Context, outcome livewire.Outcome) {
         metrics.Observe(ctx, outcome)
-        if wideevent.FromContext(ctx) != nil {
+        event, ok := ctx.Value(unitEventKey{}).(*unitEvent)
+        if !ok || outcome.Kind == livewire.OutcomeAfterCommit {
             return
         }
-        we := wideevent.Begin(emitter, "livewire."+string(outcome.Kind))
+        event.observed.Store(true)
+        we := event.we
         we.String("livewire.kind", string(outcome.Kind)).
             String("livewire.operation", string(outcome.Operation)).
             String("livewire.target", outcome.Target).
@@ -146,10 +189,9 @@ func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) 
         recordIdentifiers(we, outcome.Parameters)
         if outcome.Err != nil {
             we.Failure(outcome.Err)
-        } else {
+        } else if !we.HasError() { // a failed call of a batch fails the batch's unit
             we.Success()
         }
-        we.Emit()
     }
 }
 ```

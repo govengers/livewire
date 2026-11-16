@@ -37,6 +37,7 @@ document, err := query.Parse(fields, []byte(`{
 - A condition names a field declared `Filter`, with an operator of its type ([Fields](Declarations.md#fields)) and a value of that type: a list for `in` and `notIn`, a bool for `isNull` and `isEmpty`.
 - A time is an RFC 3339 string or a time relative to the database clock, `{"relative": "-7d"}` (units `s`, `m`, `h`, `d`, `w`, combinable: `-1h30m`). A live read with a relative time re-runs on the engine's safety tick (default 30 s), since its result moves without a write.
 - `search` matches every visible field declared `Search`, case-insensitive, as a substring.
+- A Detail field (D93) filters, sorts and searches like any other; the list rows only leave its value out ([Declarations](Declarations.md#detail-fields)).
 - `ne` and `notIn` include the rows whose value is NULL, exactly like `not` around `eq` and `in`.
 - Limits (D12): depth 8, 200 nodes, 500 values in a list, strings of 1 KiB, documents of 16 KiB.
 

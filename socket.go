@@ -363,9 +363,10 @@ func (s *socket) closeWithin(code int, reason string, deadline time.Time) {
 		if connection != nil {
 			s.writeClose(code, reason, deadline)
 		}
-		outcome := startUnit(OutcomeClose, "", "").outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), failure)
+		unit := startUnit(OutcomeClose, "", "")
+		outcome := unit.outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), failure)
 		outcome.Status = code
-		s.engine.observe(s.ctx, outcome)
+		s.engine.observeAlone(s.ctx, unit, outcome)
 	})
 }
 
@@ -393,12 +394,20 @@ func (s *socket) revalidate() {
 		case <-s.ctx.Done():
 			return
 		case <-s.revalidation:
-			unit := startUnit(OutcomeRevalidate, "", "")
-			metered := withQueryWait(s.ctx)
-			identity, err := s.freshIdentity(metered)
-			s.engine.observe(s.ctx, unit.outcome(auth.WithIdentity(metered, identity), err))
+			s.revalidateOnce()
 		}
 	}
+}
+
+// revalidateOnce is one re-validation, a unit of its own (D92): the IdentitySource may read
+// the database.
+func (s *socket) revalidateOnce() {
+	unit := startUnit(OutcomeRevalidate, "", "")
+	ctx, finish := s.engine.begin(s.ctx, unit)
+	defer finish()
+	metered := withQueryWait(ctx)
+	identity, err := s.freshIdentity(metered)
+	s.engine.observe(ctx, unit.outcome(auth.WithIdentity(metered, identity), err))
 }
 
 // rerunIdentity is the identity a re-run acts as: the one validated within
@@ -511,8 +520,10 @@ func (s *socket) send(frame ResponseFrame) {
 	s.enqueue(encoded)
 }
 
+// observe reports a unit of the socket that is done once it is reported, on a unit of its
+// own (D92).
 func (s *socket) observe(unit unitOfWork, err error) {
-	s.engine.observe(s.ctx, unit.outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), err))
+	s.engine.observeAlone(s.ctx, unit, unit.outcome(auth.WithIdentity(s.ctx, s.lastIdentity()), err))
 }
 
 // writeError answers a refused upgrade with the one error body.

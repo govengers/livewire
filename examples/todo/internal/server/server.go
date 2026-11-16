@@ -1,8 +1,8 @@
 // Package server builds the example's HTTP side: the gin router with its recovery, the request's
 // span, the wide-event middleware and the request metrics, the auth routes, the API behind
 // authentication with livewire's REST routes and socket, the health routes, and the livewire
-// Observer that turns the engine's outcomes into metrics and one wide event per socket or
-// background outcome (D30, LOG-001).
+// Observer and StartUnit that turn the engine's outcomes into metrics and one wide event per
+// socket or background unit of work, its queries counted (D30, D92, LOG-001, LOG-004).
 package server
 
 import (
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 	"github.com/govengers/auth"
@@ -32,6 +33,7 @@ import (
 	"github.com/govengers/livewire/examples/todo/internal/assistant"
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
 	"github.com/govengers/livewire/examples/todo/internal/controller"
+	"github.com/govengers/livewire/examples/todo/internal/database"
 )
 
 // SocketPath is the route of the live socket.
@@ -96,7 +98,7 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 		return nil, err
 	}
 	router := gin.New()
-	router.Use(spans, recovery(), wideEvents, requestMetrics) // the span outside the recovery, so it sees the 500 of a panic
+	router.Use(spans, recovery(), wideEvents, countQueries, requestMetrics) // the span outside the recovery, so it sees the 500 of a panic
 	router.NoRoute(func(ginContext *gin.Context) { writeError(ginContext, livewire.NotFound()) })
 	router.GET("/healthz", func(ginContext *gin.Context) { ginContext.Status(http.StatusNoContent) })
 	router.GET("/readyz", func(ginContext *gin.Context) {
@@ -117,7 +119,7 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 	socket := ginadapter.SocketHandler(engine)
 	api.GET(SocketPath, func(ginContext *gin.Context) {
 		// The socket's units of work are not the upgrade request: they get events of their own
-		// (NewObserver), so nothing writes to the upgrade's event after it was emitted (LOG-008).
+		// (NewUnitStarter), so nothing writes to the upgrade's event after it was emitted (LOG-008).
 		ginContext.Request = ginContext.Request.WithContext(wideevent.NewContext(ginContext.Request.Context(), nil))
 		socket(ginContext)
 	})
@@ -194,6 +196,20 @@ func writeError(ginContext *gin.Context, err error) {
 	ginContext.AbortWithStatusJSON(status, body)
 }
 
+// countQueries records the queries of a request on its wide event (db.*, LOG-004); the
+// socket's upgrade has none, its units count on their own events (NewUnitStarter).
+func countQueries(ginContext *gin.Context) {
+	we := wideevent.FromContext(ginContext.Request.Context())
+	if we == nil {
+		ginContext.Next()
+		return
+	}
+	ctx, queries := database.CountQueries(ginContext.Request.Context())
+	ginContext.Request = ginContext.Request.WithContext(ctx)
+	ginContext.Next()
+	queries.Record(we)
+}
+
 // recordIdentifiers puts the business identifiers of a socket unit's decoded parameters on its
 // event (LOG-003): the services record them on a REST request's event, a socket unit has none
 // for them to write to. A create's id travels in its body, which an outcome does not carry.
@@ -211,17 +227,58 @@ func recordIdentifiers(we *wideevent.Event, parameters any) {
 
 // snippet:begin observer
 
-// NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome
+// unitEventKey carries the unitEvent NewUnitStarter began for a unit of work.
+type unitEventKey struct{}
+
+// unitEvent is the wide event of a unit of work and whether an outcome was recorded on it.
+type unitEvent struct {
+	we       *wideevent.Event
+	observed atomic.Bool
+}
+
+// NewUnitStarter is the registry's StartUnit (D92): a unit of work the engine runs on its own
 // without a request's wide event (a socket frame, a re-run, the feed, a heartbeat: the socket
-// route takes the upgrade's event out of their context) is a unit of work of its own and gets
-// one event. A REST outcome is on the request's event already, which the REST adapter recorded.
-func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) livewire.Observer {
+// route takes the upgrade's event out of their context) gets an event of its own before its
+// work runs, so its queries count on it (db.*, LOG-004), and the event is emitted when the
+// unit finishes. It carries the unit's livewire.* fields from the start; a unit that ended
+// without an outcome (a re-run whose socket ended during its read) states success with
+// livewire.unanswered, so every event states its outcome (LOG-011). A unit inside a request
+// or frame (the after-commit report of a mutation) stays on its event: this application has
+// no after-commit reaction whose work would need one of its own.
+func NewUnitStarter(emitter wideevent.Emitter) livewire.UnitStarter {
+	return func(ctx context.Context, unit livewire.Unit) (context.Context, func()) {
+		if wideevent.FromContext(ctx) != nil {
+			return ctx, nil
+		}
+		event := &unitEvent{we: wideevent.Begin(emitter, "livewire."+string(unit.Kind))}
+		event.we.String("livewire.kind", string(unit.Kind)).
+			String("livewire.operation", string(unit.Operation)).
+			String("livewire.target", unit.Target).
+			String("livewire.subscription", unit.Subscription)
+		ctx, queries := database.CountQueries(wideevent.NewContext(ctx, event.we))
+		return context.WithValue(ctx, unitEventKey{}, event), func() {
+			queries.Record(event.we)
+			if !event.observed.Load() {
+				event.we.Bool("livewire.unanswered", true).Success()
+			}
+			event.we.Emit()
+		}
+	}
+}
+
+// NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome of
+// a unit NewUnitStarter began is recorded on the unit's event, an after-commit report aside,
+// whose call's outcome said everything. A REST outcome is on the request's event already,
+// which the REST adapter recorded.
+func NewObserver(metrics *prometheusadapter.Metrics) livewire.Observer {
 	return func(ctx context.Context, outcome livewire.Outcome) {
 		metrics.Observe(ctx, outcome)
-		if wideevent.FromContext(ctx) != nil {
+		event, ok := ctx.Value(unitEventKey{}).(*unitEvent)
+		if !ok || outcome.Kind == livewire.OutcomeAfterCommit {
 			return
 		}
-		we := wideevent.Begin(emitter, "livewire."+string(outcome.Kind))
+		event.observed.Store(true)
+		we := event.we
 		we.String("livewire.kind", string(outcome.Kind)).
 			String("livewire.operation", string(outcome.Operation)).
 			String("livewire.target", outcome.Target).
@@ -236,10 +293,9 @@ func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) 
 		recordIdentifiers(we, outcome.Parameters)
 		if outcome.Err != nil {
 			we.Failure(outcome.Err)
-		} else {
+		} else if !we.HasError() { // a failed call of a batch fails the batch's unit
 			we.Success()
 		}
-		we.Emit()
 	}
 }
 

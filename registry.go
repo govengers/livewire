@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"reflect"
 	"slices"
 	"strings"
 
+	"github.com/govengers/auth"
 	"github.com/govengers/auth/authorization"
 )
 
@@ -16,11 +18,14 @@ import (
 // ("/api/v1"; empty for none) and must start with a slash and not end with one. Tenant
 // resolves the tenant of a request from the decoded parameters (a *Parameters, nil for a
 // resource read) and the identity in ctx (D42); nil means one tenant. Observer receives the
-// outcomes of the engine and the adapters; nil means none.
+// outcomes of the engine and the adapters; nil means none. StartUnit begins each unit of
+// work the engine runs on its own, outside a transport's request (D92): a socket frame, a
+// subscription re-run, an after-commit report; nil runs them on the context they come with.
 type RegistryOptions struct {
-	BasePath string
-	Tenant   func(ctx context.Context, parameters any) (string, error)
-	Observer Observer
+	BasePath  string
+	Tenant    func(ctx context.Context, parameters any) (string, error)
+	Observer  Observer
+	StartUnit UnitStarter
 }
 
 // Registry is the single source of truth of an API: every declaration by name, in
@@ -107,6 +112,50 @@ func (r *Registry) Tenant(ctx context.Context, parameters any) (string, error) {
 		return "", errors.New("livewire: the Tenant function returned no tenant and no error")
 	}
 	return tenant, nil
+}
+
+// startUnit begins a unit of work through the StartUnit option (Engine.begin): the context
+// the unit runs on and the finish to call after its last outcome. Without the option, and
+// when it panics or answers no context, it answers ctx and a finish that does nothing; a
+// panic is reported to the Observer as a 500 outcome of the unit's kind, so an application
+// whose StartUnit fails learns of it. A panicking finish costs that finish and nothing else.
+func (r *Registry) startUnit(ctx context.Context, unit Unit) (context.Context, func()) {
+	if r.options.StartUnit == nil {
+		return ctx, func() {}
+	}
+	begun, end, err := r.callStartUnit(ctx, unit)
+	if err != nil {
+		r.reportStartUnit(ctx, unit, err)
+	}
+	if begun == nil {
+		begun = ctx
+	}
+	if end == nil {
+		return begun, func() {}
+	}
+	return begun, func() { _ = recovering(func() error { end(); return nil }) }
+}
+
+// callStartUnit runs the StartUnit option; its panic answers neither a context nor a finish,
+// but the error.
+func (r *Registry) callStartUnit(ctx context.Context, unit Unit) (begun context.Context, end func(), err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			begun, end, err = nil, nil, fmt.Errorf("livewire: StartUnit panicked: %v", recovered)
+		}
+	}()
+	begun, end = r.options.StartUnit(ctx, unit)
+	return begun, end, nil
+}
+
+// reportStartUnit reports the failure of the StartUnit option on the context the unit came
+// with; a panicking Observer loses that outcome only.
+func (r *Registry) reportStartUnit(ctx context.Context, unit Unit, err error) {
+	outcome := Outcome{
+		Kind: unit.Kind, Operation: unit.Operation, Target: unit.Target, Subscription: unit.Subscription,
+		Identity: auth.IdentityFrom(ctx), Tenant: TenantFrom(ctx), Status: http.StatusInternalServerError, Err: err,
+	}
+	_ = recovering(func() error { r.Observe(ctx, outcome); return nil })
 }
 
 // Observe reports an outcome to the Observer; it does nothing without one.

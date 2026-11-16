@@ -128,6 +128,33 @@ func TestAnAPIKeyFollowsItsMembershipAndDiesWithIt(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, status, "the membership's keys went with it")
 }
 
+func TestANewKeyIsShownOnceAndNeverRecorded(t *testing.T) {
+	t.Parallel()
+	application := newTestApplication(t)
+	browser := application.login(t, "alice")
+	key := uuid.NewString()
+	mint := func() (int, livewire.ErrorBody) {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, application.baseURL()+"/keys", nil)
+		require.NoError(t, err)
+		request.Header.Set("Idempotency-Key", key)
+		response, err := browser.Do(request)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, response.Body.Close()) }()
+		var body livewire.ErrorBody
+		_ = json.NewDecoder(response.Body).Decode(&body)
+		return response.StatusCode, body
+	}
+	status, _ := mint()
+	require.Equal(t, http.StatusCreated, status)
+	status, body := mint()
+	require.Equal(t, http.StatusConflict, status, "a repeat cannot show the key again (D91)")
+	require.Equal(t, livewire.CodeConflict, body.Code)
+	require.Equal(t, livewire.NotReplayable, body.Fields["idempotencyKey"])
+	var recorded bool
+	require.NoError(t, application.pool.QueryRow(t.Context(), "SELECT response IS NOT NULL FROM livewire_idempotency WHERE key = $1", key).Scan(&recorded))
+	require.False(t, recorded, "the key's secret never reaches the idempotency table")
+}
+
 func TestOtherWorkspacesAndStrangersAreRefused(t *testing.T) {
 	t.Parallel()
 	application := newTestApplication(t)
@@ -185,10 +212,13 @@ func TestEverySocketOutcomeHasAWideEventOfItsOwn(t *testing.T) {
 	require.True(t, queried.OK)
 	refused, _ := socket.request(t, livewire.RequestFrame{Operation: livewire.OperationQuery, Target: "todos.item", Parameters: map[string]string{"id": uuid.NewString()}})
 	require.False(t, refused.OK)
+	// the unit's event is emitted when the unit finishes, after its answer went out (D92)
+	require.Eventually(t, func() bool { return len(application.events.named("livewire.request")) == 2 }, 5*time.Second, time.Millisecond,
+		"one event per socket query (LOG-001), none lost on the upgrade's emitted event")
 	events := application.events.named("livewire.request")
-	require.Len(t, events, 2, "one event per socket query (LOG-001), none lost on the upgrade's emitted event")
 	require.Equal(t, "todos", nested(events[0], "livewire", "target"))
 	require.Equal(t, "success", events[0]["outcome"])
+	require.Positive(t, nested(events[0], "db", "queries"), "the socket query's queries count on its own event (LOG-004)")
 	require.Equal(t, "todos.item", nested(events[1], "livewire", "target"))
 	require.Equal(t, "failure", events[1]["outcome"])
 
@@ -197,7 +227,18 @@ func TestEverySocketOutcomeHasAWideEventOfItsOwn(t *testing.T) {
 		Operation: livewire.OperationCall, Target: "updateTodo", Parameters: map[string]string{"id": todo.ID.String()}, Body: []byte(`{"title":"renamed"}`),
 	})
 	require.True(t, called.OK, "%+v", called.Error)
+	require.Eventually(t, func() bool { return len(application.events.named("livewire.call")) == 1 }, 5*time.Second, time.Millisecond)
 	calls := application.events.named("livewire.call")
-	require.Len(t, calls, 1)
 	require.Equal(t, todo.ID.String(), nested(calls[0], "todo", "id"), "a socket mutation's event names its todo (LOG-003)")
+	require.Positive(t, nested(calls[0], "db", "queries"), "the handler's queries count on the call's event")
+	require.Empty(t, application.events.named("livewire.after_commit"), "the after-commit report stays on the call's event")
+	require.Equal(t, "call", nested(calls[0], "livewire", "kind"), "and leaves the call's fields as they are")
+	created := 0
+	for _, request := range application.events.named("http.request") {
+		if nested(request, "request", "method") == http.MethodPost && nested(request, "request", "path") == "/api/v1/todos" {
+			created++
+			require.Positive(t, nested(request, "db", "queries"), "a REST request counts its queries the same way")
+		}
+	}
+	require.Equal(t, 1, created, "the fixture's create went over REST")
 }

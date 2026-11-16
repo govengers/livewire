@@ -73,6 +73,8 @@ type testbed struct {
 	release chan struct{}
 	// anonymousRuns counts the handler runs of "anonymousGadget".
 	anonymousRuns atomic.Int64
+	// secretRuns counts the handler runs of "mintSecret".
+	secretRuns atomic.Int64
 	// cancelCall, when set, is what "cancelGadget" calls before it fails: its caller went away.
 	cancelCall atomic.Pointer[context.CancelFunc]
 	// versions are the versions of the documents, by id; historyQueries what the History
@@ -149,7 +151,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget(), b.mintSecret(), b.gadgetCards()))
 	return registry
 }
 
@@ -345,6 +347,19 @@ func (b *testbed) team() *livewire.Object {
 	})
 }
 
+// mintSecret answers a secret shown once (D91), so its idempotency record keeps no response;
+// secretRuns counts its handler runs.
+func (b *testbed) mintSecret() *livewire.Mutation {
+	return livewire.NewMutation("mintSecret", http.MethodPost, "/secrets", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, countItem]{
+		Check:          authorization.HasRole(roleWriter),
+		Status:         http.StatusCreated,
+		SecretResponse: true,
+		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*countItem, error) {
+			return &countItem{Count: int(b.secretRuns.Add(1))}, nil
+		},
+	})
+}
+
 // revealGadget is bound to the resource gadgets, so its response passes its field guards.
 func (b *testbed) revealGadget() *livewire.Mutation {
 	return livewire.NewMutation("revealGadget", http.MethodPost, "/gadgets/reveal", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, gadget]{
@@ -354,6 +369,26 @@ func (b *testbed) revealGadget() *livewire.Mutation {
 		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*gadget, error) {
 			return &gadget{ID: "r", Name: "Revealed", Secret: "s3cret"}, nil
 		},
+	})
+}
+
+// gadgetCards lists the gadgets without their name, a Detail field (D93) that the item read
+// carries; the name stays filterable and searchable.
+func (b *testbed) gadgetCards() *livewire.Resource {
+	fields := gadgetFields()
+	for position := range fields {
+		fields[position].Detail = fields[position].Name == "name"
+	}
+	return livewire.NewResource("gadgetCards", "/gadget-cards", &livewire.ResourceOptions[gadget]{
+		Tables: []string{"gadgets"},
+		Read:   authorization.HasRole(roleReader),
+		Fields: fields,
+		Item:   &livewire.ItemKey{Parameter: "id", Field: "id"},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[gadget], error) {
+			items := b.world.sorted("")
+			return &livewire.Page[gadget]{Items: items, Total: len(items)}, nil
+		},
+		Get: b.getGadget,
 	})
 }
 

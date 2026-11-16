@@ -485,7 +485,9 @@ func (s *subscription) rerunWith(marks rerunMarks) {
 	}
 	unit := startUnit(OutcomeRerun, "", s.request.target())
 	unit.subscription = s.id
-	ctx := withQueryWait(s.ctx)
+	ctx, finish := s.socket.engine.begin(s.ctx, unit)
+	defer finish()
+	ctx = withQueryWait(ctx)
 	identity, err := s.socket.rerunIdentity(ctx)
 	if errors.Is(err, errIdentityGone) {
 		return
@@ -742,7 +744,9 @@ func (s *subscription) markEndedLocked() func() {
 			s.socket.releaseFilter(filterHash)
 		}
 		if published {
-			s.socket.engine.observe(s.socket.ctx, s.endOutcome())
+			unit := startUnit(OutcomeEnd, OperationSubscribe, s.request.target())
+			unit.subscription = s.id
+			s.socket.engine.observeAlone(s.socket.ctx, unit, s.endOutcome())
 		}
 	}
 }

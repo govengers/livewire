@@ -526,39 +526,6 @@
         ],
         "type": "object"
       },
-      "FixturePartListResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/FixturePart"
-            },
-            "type": "array"
-          },
-          "limit": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "next": {
-            "description": "The cursor of the next page (cursor mode, D38); absent at the end.",
-            "type": "string"
-          },
-          "offset": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "total": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "limit",
-          "offset",
-          "total",
-          "items"
-        ],
-        "type": "object"
-      },
       "FixturePartVersion": {
         "properties": {
           "actor": {
@@ -2586,6 +2553,244 @@
           }
         ]
       },
+      "PartsListItem": {
+        "properties": {
+          "-": {
+            "type": "string"
+          },
+          "anything": {},
+          "checksum": {
+            "format": "byte",
+            "nullable": true,
+            "type": "string"
+          },
+          "children": {
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/FixturePart"
+                }
+              ],
+              "nullable": true,
+              "type": "object"
+            },
+            "nullable": true,
+            "type": "array"
+          },
+          "code": {
+            "type": "string"
+          },
+          "color": {
+            "$ref": "#/components/schemas/Color"
+          },
+          "content-type": {
+            "type": "string"
+          },
+          "counts": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "nullable": true,
+            "type": "object"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dimensions": {
+            "$ref": "#/components/schemas/Dimensions"
+          },
+          "expires": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "extra": {},
+          "flag": {
+            "nullable": true,
+            "type": "string"
+          },
+          "grade": {
+            "enum": [
+              "a",
+              "b"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inline": {
+            "properties": {
+              "A": {
+                "format": "int64",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "A"
+            ],
+            "type": "object"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/Kind"
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "large": {
+            "type": "string"
+          },
+          "matrix": {
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "ownerId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "payload": {},
+          "previous": {
+            "$ref": "#/components/schemas/Kind"
+          },
+          "price": {
+            "format": "double",
+            "nullable": true,
+            "type": "number"
+          },
+          "promoted": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string",
+            "x-livewire-guarded": true
+          },
+          "sizes": {
+            "items": {
+              "enum": [
+                "s",
+                "m",
+                "l"
+              ],
+              "type": "string"
+            },
+            "nullable": true,
+            "type": "array"
+          },
+          "started": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "tags": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Tags"
+              }
+            ],
+            "items": {},
+            "nullable": true,
+            "type": "array"
+          },
+          "total": {
+            "$ref": "#/components/schemas/Cents"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "createdAt",
+          "updatedAt",
+          "promoted",
+          "dimensions",
+          "id",
+          "name",
+          "kind",
+          "color",
+          "price",
+          "tags",
+          "sizes",
+          "grade",
+          "counts",
+          "children",
+          "matrix",
+          "checksum",
+          "total",
+          "large",
+          "flag",
+          "version",
+          "started",
+          "extra",
+          "anything",
+          "payload",
+          "code",
+          "content-type",
+          "-",
+          "inline"
+        ],
+        "type": "object"
+      },
+      "PartsListItemListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PartsListItem"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "next": {
+            "description": "The cursor of the next page (cursor mode, D38); absent at the end.",
+            "type": "string"
+          },
+          "offset": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "limit",
+          "offset",
+          "total",
+          "items"
+        ],
+        "type": "object"
+      },
       "PresenceItem": {
         "properties": {
           "display": {
@@ -3492,7 +3697,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/FixturePartListResponse"
+                  "$ref": "#/components/schemas/PartsListItemListResponse"
                 }
               }
             },

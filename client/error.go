@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -37,6 +38,15 @@ type EndedError struct {
 // Error says that the live side ended.
 func (e *EndedError) Error() string {
 	return fmt.Sprintf("livewire: the live side of the client ended (%d): the identity is gone", e.CloseCode)
+}
+
+// IsNotReplayable reports whether err is the 409 conflict that answers the repeat of an
+// Idempotency-Key whose call ran but whose answer the server does not keep, since it shows a
+// secret once (livewire.NotReplayable, D91): sending the call again under a new key would run
+// it twice, so the caller revokes and creates instead.
+func IsNotReplayable(err error) bool {
+	var refusal *Error
+	return errors.As(err, &refusal) && refusal.Code == livewire.CodeConflict && refusal.Fields["idempotencyKey"] == livewire.NotReplayable
 }
 
 var errorCodes = []livewire.Code{

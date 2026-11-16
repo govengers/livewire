@@ -16,8 +16,9 @@ import (
 // body's top-level members by name with their raw text. An unknown member at any depth
 // (struct fields, array elements, map values), a member that repeats within one object
 // (skipped subtrees included) and a body that is not one JSON object are refused with fixed
-// texts naming the member's path. The path is kept as a stack of segments and written only
-// for the refusal, so a deep body costs memory in proportion to its size.
+// texts naming the member's path, and so is a string or member name holding U+0000, which
+// PostgreSQL text and jsonb cannot store. The path is kept as a stack of segments and
+// written only for the refusal, so a deep body costs memory in proportion to its size.
 func inspectBody(raw []byte, requestType reflect.Type, fields fieldIndex) (map[string]json.RawMessage, error) {
 	walker := newBodyWalker(raw, fields)
 	if err := walker.walkBody(requestType); err != nil {
@@ -153,6 +154,32 @@ func (w *bodyWalker) refuse(message string) error {
 	return invalidParameter(writePath(w.segments), message)
 }
 
+// refuseHere refuses at the current path, "body" at the top level.
+func (w *bodyWalker) refuseHere(message string) error {
+	if len(w.segments) == 0 {
+		return invalidParameter("body", message)
+	}
+	return w.refuse(message)
+}
+
+// The texts of a refused U+0000 (PostgreSQL text holds none, so it would fail in the database).
+const (
+	noNULValue = "must not contain U+0000"
+	noNULName  = "a member name must not contain U+0000"
+)
+
+// next reads the next token; a string holding U+0000 is refused at the current path.
+func (w *bodyWalker) next() (json.Token, error) {
+	token, err := w.decoder.Token()
+	if err != nil {
+		return nil, invalidParameter("body", "must be valid JSON")
+	}
+	if text, ok := token.(string); ok && strings.ContainsRune(text, 0) {
+		return nil, w.refuseHere(noNULValue)
+	}
+	return token, nil
+}
+
 func (w *bodyWalker) push(segment pathSegment) { w.segments = append(w.segments, segment) }
 
 func (w *bodyWalker) pop() { w.segments = w.segments[:len(w.segments)-1] }
@@ -170,6 +197,9 @@ func (w *bodyWalker) nextMember(seen map[string]bool, index bool) (key string, d
 		return "", true, nil
 	}
 	key, _ = token.(string)
+	if strings.ContainsRune(key, 0) {
+		return "", false, w.refuseHere(noNULName)
+	}
 	w.push(pathSegment{text: key, index: index})
 	if seen[key] {
 		return "", false, w.refuse("duplicate member")
@@ -196,11 +226,51 @@ func (w *bodyWalker) walkObject(structType reflect.Type, top bool) error {
 		if err := w.walkValue(field.Type, start); err != nil {
 			return err
 		}
+		if quotesString(field) && quotedNUL(bytes.TrimLeft(w.raw[start:w.decoder.InputOffset()], " \t\r\n:")) {
+			return w.refuse(noNULValue)
+		}
 		if top {
 			w.topLevel[key] = bytes.TrimLeft(w.raw[start:w.decoder.InputOffset()], " \t\r\n:")
 		}
 		w.pop()
 	}
+}
+
+// quotesString reports whether encoding/json reads the string field from inside a JSON
+// string (the `string` option), where an escaped U+0000 is no U+0000 of the outer token.
+func quotesString(field reflect.StructField) bool {
+	_, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+	fieldType := field.Type
+	if fieldType.Name() == "" && fieldType.Kind() == reflect.Pointer {
+		fieldType = fieldType.Elem()
+	}
+	return fieldType.Kind() == reflect.String && slices.Contains(strings.Split(options, ","), "string")
+}
+
+// quotedNUL reports whether value, a JSON string holding a JSON string, holds U+0000 inside.
+func quotedNUL(value []byte) bool {
+	var outer, inner string
+	if json.Unmarshal(value, &outer) != nil || json.Unmarshal([]byte(outer), &inner) != nil {
+		return false // the decoder names a value of another shape
+	}
+	return strings.ContainsRune(inner, 0)
+}
+
+// inspectValue refuses a JSON value holding U+0000 in a string or member name, at the path
+// of the member, "body" at the top; an empty value passes. It reads a value livewire stores
+// without a request type, such as a presence's state.
+func inspectValue(raw json.RawMessage) error {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	walker := newBodyWalker(raw, nil)
+	if err := walker.skipValue(); err != nil {
+		return err
+	}
+	if _, err := walker.decoder.Token(); !errors.Is(err, io.EOF) {
+		return invalidParameter("body", "must be valid JSON")
+	}
+	return nil
 }
 
 // walkValue consumes one value of the type; a walk that locates a target offset ends at the
@@ -224,9 +294,9 @@ func (w *bodyWalker) walkValue(fieldType reflect.Type, start int64) error {
 // expects is left to the decoder, which names it.
 func (w *bodyWalker) consumeValue(fieldType reflect.Type) error {
 	fieldType = unwrapPointer(fieldType)
-	token, err := w.decoder.Token()
+	token, err := w.next()
 	if err != nil {
-		return invalidParameter("body", "must be valid JSON")
+		return err
 	}
 	switch {
 	case hasOwnUnmarshaler(fieldType):
@@ -314,9 +384,9 @@ func (w *bodyWalker) skipArray() error {
 }
 
 func (w *bodyWalker) skipValue() error {
-	token, err := w.decoder.Token()
+	token, err := w.next()
 	if err != nil {
-		return invalidParameter("body", "must be valid JSON")
+		return err
 	}
 	return w.skipAfter(token)
 }

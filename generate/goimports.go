@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/format"
 	"go/token"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/govengers/livewire/internal/jsonfield"
 )
 
 // goFile collects the imports of one generated Go file and writes the type expressions of
@@ -113,43 +116,128 @@ func (f *goFile) importLine(path string) string {
 	return strconv.Quote(path)
 }
 
-// expression is the Go type expression of goType.
+var rawMessageType = reflect.TypeFor[json.RawMessage]()
+
+// expression is the Go type expression of goType, which names every struct it reaches.
 func (f *goFile) expression(goType reflect.Type) (string, error) {
+	return f.typeExpression(goType, false)
+}
+
+// fieldExpression is expression for the type of a field the generated code declares itself
+// (a list item's, D93), where an unnamed struct is written out as the item declares it.
+func (f *goFile) fieldExpression(goType reflect.Type) (string, error) {
+	return f.typeExpression(goType, true)
+}
+
+func (f *goFile) typeExpression(goType reflect.Type, unnamedStructs bool) (string, error) {
 	if goType.Name() != "" {
 		return f.named(goType)
 	}
 	switch goType.Kind() {
 	case reflect.Pointer:
-		element, err := f.expression(goType.Elem())
+		element, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "*" + element, err
 	case reflect.Slice:
-		element, err := f.expression(goType.Elem())
+		element, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "[]" + element, err
 	case reflect.Array:
-		element, err := f.expression(goType.Elem())
+		element, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "[" + strconv.Itoa(goType.Len()) + "]" + element, err
 	case reflect.Map:
-		key, err := f.expression(goType.Key())
+		key, err := f.typeExpression(goType.Key(), unnamedStructs)
 		if err != nil {
 			return "", err
 		}
-		value, err := f.expression(goType.Elem())
+		value, err := f.typeExpression(goType.Elem(), unnamedStructs)
 		return "map[" + key + "]" + value, err
 	case reflect.Interface:
 		if goType.NumMethod() == 0 {
 			return "any", nil
+		}
+	case reflect.Struct:
+		if unnamedStructs {
+			return f.structExpression(goType)
 		}
 	default:
 	}
 	return "", fmt.Errorf("generate: the Go client cannot name the type %s: give it a name in an importable package", goType)
 }
 
+// structExpression is the expression of an unnamed struct: its JSON fields as structFields
+// declares them. One that encodes or decodes itself through an embedded type's methods is
+// refused, since its fields written out would drop those methods.
+func (f *goFile) structExpression(goType reflect.Type) (string, error) {
+	pointer := reflect.PointerTo(goType)
+	for _, method := range []reflect.Type{jsonMarshalerType, jsonUnmarshalerType, textMarshalerType, textUnmarshalerType} {
+		if pointer.Implements(method) {
+			return "", fmt.Errorf("generate: the Go client cannot declare the unnamed struct %s: it has %s, which its fields written out would lose; give it a name in an importable package", goType, method.Method(0).Name)
+		}
+	}
+	fields, err := f.structFields(goType, nil)
+	if err != nil {
+		return "", err
+	}
+	return "struct{ " + strings.Join(fields, "; ") + " }", nil
+}
+
+// structFields are the fields of a struct the generated code declares itself (a list item's,
+// D93): every JSON field of goType but those named in leave, flat (embedded structs' fields
+// promoted, an unexported one's too, as encoding/json reads them), each under its Go name,
+// type and json options. Two JSON fields of one Go name cannot be declared side by side,
+// nor one under an unexported Go name (a tagged embedded unexported alias), which encoding/json
+// would leave out.
+func (f *goFile) structFields(goType reflect.Type, leave []string) ([]string, error) {
+	var fields []string
+	declared := map[string]bool{}
+	for _, field := range jsonfield.Of(goType) {
+		if slices.Contains(leave, field.Name) {
+			continue
+		}
+		goName := field.StructField.Name
+		if !token.IsExported(goName) {
+			return nil, fmt.Errorf("generate: %s has the JSON field %q under the unexported Go name %s, which the Go client cannot declare: export the name", goType, field.Name, goName)
+		}
+		if declared[goName] {
+			return nil, fmt.Errorf("generate: %s has two JSON fields named %s in Go; the Go client cannot declare a struct of its fields: rename one of them", goType, goName)
+		}
+		declared[goName] = true
+		expression, err := f.fieldExpression(field.StructField.Type)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, fmt.Sprintf("%s %s `json:%q`", goName, expression, jsonTag(field)))
+	}
+	return fields, nil
+}
+
+// jsonTag is the json tag of a field as encoding/json reads it: its name and options.
+func jsonTag(field jsonfield.Field) string {
+	tag := field.Name
+	if tag == "-" {
+		tag = "-," // the name "-", not the field left out
+	}
+	if field.OmitEmpty {
+		tag += ",omitempty"
+	}
+	if field.OmitZero {
+		tag += ",omitzero"
+	}
+	if field.Quoted {
+		tag += ",string"
+	}
+	return tag
+}
+
 // named is the expression of a named type: a predeclared one as it is, another qualified
 // with the alias of its package, a generic instance with its type arguments, which reflect
 // knows only by their text.
 func (f *goFile) named(goType reflect.Type) (string, error) {
-	if goType.PkgPath() == "" {
+	switch {
+	case goType.PkgPath() == "":
 		return goType.Name(), nil
+	case goType == rawMessageType:
+		// since Go 1.27 an alias of jsontext.Value, which Go 1.26 builds only with GOEXPERIMENT=jsonv2
+		return f.use("encoding/json", "json") + ".RawMessage", nil
 	}
 	if err := f.importable(goType.PkgPath(), goType.Name(), goType.String()); err != nil {
 		return "", err
@@ -307,18 +395,76 @@ func formatGo(name string, source string) ([]byte, error) {
 	return formatted, nil
 }
 
-// goIdentifier is a name as a Go identifier: PascalCase with the initialisms of Go style
-// ("filterId" is FilterID).
-func goIdentifier(name string) string {
-	initialisms := map[string]string{"Id": "ID", "Ids": "IDs", "Url": "URL", "Uuid": "UUID", "Api": "API", "Http": "HTTP", "Json": "JSON", "Ip": "IP", "Csv": "CSV", "Html": "HTML"}
-	var builder strings.Builder
-	for _, word := range camelWords(pascalCase(name)) {
-		if initialism, ok := initialisms[word]; ok {
-			word = initialism
-		}
-		builder.WriteString(word)
+// goInitialisms are the words a Go identifier writes in one case (standards NAM-002): Go's
+// common initialisms and the protocol and product names the standards list, each also in
+// its plural where one is usual ("Ids" is IDs).
+var goInitialisms = func() map[string]string {
+	initialisms := map[string]string{}
+	for _, initialism := range []string{
+		"ACL", "API", "CPU", "CSS", "CSV", "DNS", "HTML", "HTTP", "ID", "IP", "JSON", "JWT", "NPM", "OIDC", "SQL", "SSH",
+		"TCP", "TLS", "TOTP", "TTL", "UDP", "UI", "URI", "URL", "UUID", "XML", "AWS",
+	} {
+		word := initialism[:1] + strings.ToLower(initialism[1:])
+		initialisms[word], initialisms[word+"s"] = initialism, initialism+"s"
 	}
-	return builder.String()
+	initialisms["Https"] = "HTTPS" // a word of its own, not a plural
+	return initialisms
+}()
+
+// goIdentifier is a name as an exported Go identifier: PascalCase with the initialisms in one
+// case ("filterId" is FilterID, "apiKeys" APIKeys). Wire names (targets, JSON members,
+// flags) stay as declared; only the identifiers of the generated Go code are spelled so.
+func goIdentifier(name string) string {
+	return strings.Join(goWords(name), "")
+}
+
+// unexportedGoIdentifier is goIdentifier with its first word in lower case, all of it for an
+// initialism or another word in upper case: "apiKeys" is apiKeys, "APIKeysX" apiKeysX,
+// "TodoItems" todoItems.
+func unexportedGoIdentifier(name string) string {
+	words := goWords(name)
+	if len(words) == 0 {
+		return ""
+	}
+	if words[0] == strings.ToUpper(words[0]) || goInitialisms[pascalCase(strings.ToLower(words[0]))] != "" {
+		words[0] = strings.ToLower(words[0])
+	} else {
+		words[0] = lowerFirst(words[0])
+	}
+	return strings.Join(words, "")
+}
+
+// goWords are the words of name, split at separators, case changes and the end of an upper
+// case run before a word ("userIDUrl" is User, ID, URL), each starting upper case, an
+// initialism in one case.
+func goWords(name string) []string {
+	var words []string
+	for _, part := range identifierCharacter.Split(name, -1) {
+		for _, camelWord := range camelWords(pascalCase(part)) {
+			for _, word := range acronymWords(camelWord) {
+				if initialism, ok := goInitialisms[word]; ok {
+					word = initialism
+				}
+				words = append(words, word)
+			}
+		}
+	}
+	return words
+}
+
+// acronymWords splits a word of camelWords, an upper case run and what follows it, before the
+// run's last letter when a lower case word follows ("IDUrl" is ID, Url; "APIKeys" API, Keys); a
+// plural initialism ("IDs") stays one word. Command and flag names keep camelWords alone.
+func acronymWords(word string) []string {
+	runes := []rune(word)
+	run := 0
+	for run < len(runes) && unicode.IsUpper(runes[run]) {
+		run++
+	}
+	if run < 2 || run == len(runes) || string(runes[run:]) == "s" || !unicode.IsLower(runes[run]) {
+		return []string{word}
+	}
+	return []string{string(runes[:run-1]), string(runes[run-1:])}
 }
 
 // camelWords splits a PascalCase identifier before every upper-case letter that follows a

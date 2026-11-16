@@ -181,6 +181,8 @@ func (o *openAPI) schema(value *shape) object {
 		schema = o.wrapper(value)
 	case shapeTimeValue:
 		schema = object{"oneOf": []object{{"type": "string", "format": "date-time"}, reference(relativeTimeName)}}
+	case shapeOmit:
+		schema = o.omission(value)
 	}
 	setText(schema, "format", value.format)
 	for key, bound := range map[string]int{"maxLength": value.maximumLength, "minItems": value.minimumItems, "maxItems": value.maximumItems} {
@@ -221,7 +223,7 @@ func schemaType(value *shape) string {
 		return "boolean"
 	case shapeArray:
 		return "array"
-	case shapeMap, shapeObject, shapeListResponse, shapeVersion:
+	case shapeMap, shapeObject, shapeListResponse, shapeVersion, shapeOmit:
 		return "object"
 	case shapeReference:
 		return schemaType(value.reference.definition)
@@ -247,6 +249,21 @@ func (o *openAPI) objectSchema(properties []property) object {
 		schema["required"] = required
 	}
 	return schema
+}
+
+// omission is the component of a resource's list item (D93): its item's object without the
+// Detail fields, named after the resource.
+func (o *openAPI) omission(value *shape) object {
+	definition := value.element
+	if definition.kind == shapeReference {
+		definition = definition.reference.definition
+	}
+	kept := slices.DeleteFunc(slices.Clone(definition.properties), func(member property) bool { return slices.Contains(value.omitted, member.name) })
+	if _, taken := o.schemas[value.component]; taken && !o.wrappers[value.component] {
+		o.err = fmt.Errorf("generate: the OpenAPI schema %s of a list item and a type of the same name collide; rename the type", value.component)
+	}
+	o.schemas[value.component], o.wrappers[value.component] = o.objectSchema(kept), true
+	return reference(value.component)
 }
 
 // wrapper is the schema of a ListResponse or Version of an item: a named component
@@ -292,6 +309,8 @@ func wrapperName(value *shape) string {
 		return ""
 	case element.kind == shapeReference:
 		return element.reference.name + suffix
+	case element.kind == shapeOmit:
+		return element.component + suffix
 	case element.kind == shapeVersion:
 		if inner := wrapperName(element); inner != "" {
 			return inner + suffix

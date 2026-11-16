@@ -94,6 +94,8 @@ func (n typescriptNames) expression(value *shape) string {
 		expression = n.runtime + "Version<" + n.expression(value.element) + ">"
 	case shapeTimeValue:
 		expression = "TimeValue"
+	case shapeOmit:
+		expression = "Omit<" + n.expression(value.element) + ", " + literalUnion(value.omitted) + ">"
 	}
 	if value.nullable {
 		return expression + " | null"

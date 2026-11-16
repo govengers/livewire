@@ -279,9 +279,11 @@ type fakeTransactor struct {
 	// described are the calls of batches described to their transaction (CallDescriber).
 	described    []livewire.TransactionDetails
 	failDescribe atomic.Bool
+	// units holds, per Begin, the unit of work its context carried (unitKey).
+	units []any
 }
 
-func (f *fakeTransactor) Begin(_ context.Context, details livewire.TransactionDetails) (livewire.Transaction, error) {
+func (f *fakeTransactor) Begin(ctx context.Context, details livewire.TransactionDetails) (livewire.Transaction, error) {
 	if f.failBegin.Load() {
 		return nil, errors.New("the pool is exhausted")
 	}
@@ -290,6 +292,7 @@ func (f *fakeTransactor) Begin(_ context.Context, details livewire.TransactionDe
 	}
 	f.mutex.Lock()
 	f.details = append(f.details, details)
+	f.units = append(f.units, ctx.Value(unitKey{}))
 	f.mutex.Unlock()
 	return &fakeTransaction{transactor: f}, nil
 }
@@ -482,6 +485,13 @@ func (f *fakeIdempotency) Reserve(ctx context.Context, owner livewire.Owner, key
 	return nil, false, nil
 }
 
+// recorded is the record of the owner's key as the store keeps it.
+func (f *fakeIdempotency) recorded(owner, key string) livewire.IdempotencyRecord {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return f.records[livewire.Owner{Key: owner}][key].record
+}
+
 func (f *fakeIdempotency) Record(_ context.Context, record *livewire.IdempotencyRecord) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -542,6 +552,8 @@ type fakePresences struct {
 	heartbeats atomic.Int64
 	failLeave  atomic.Bool
 	failJoin   atomic.Bool
+	// leftIn are the units of work (unitKey) each Leave ran in, nil outside one.
+	leftIn []any
 	// blockSweep makes a Sweep wait for its context; sweepBlocked reports one waiting.
 	blockSweep   atomic.Bool
 	sweepBlocked chan struct{}
@@ -575,7 +587,10 @@ func (f *fakePresences) Join(_ context.Context, presence *livewire.Presence) err
 	return nil
 }
 
-func (f *fakePresences) Leave(_ context.Context, tenant, socket, target, key string) error {
+func (f *fakePresences) Leave(ctx context.Context, tenant, socket, target, key string) error {
+	f.mutex.Lock()
+	f.leftIn = append(f.leftIn, ctx.Value(unitKey{}))
+	f.mutex.Unlock()
 	if f.failLeave.Load() {
 		return errTestConnectionLost
 	}
@@ -661,15 +676,18 @@ func compareText(left, right string) int {
 type outcomes struct {
 	mutex    sync.Mutex
 	received []livewire.Outcome
+	// units holds, per received outcome, the unit of work its context carried (unitKey).
+	units []any
 	// panics makes the Observer panic after it recorded the outcome.
 	panics atomic.Bool
 	// holdSubscribe, when set, holds every OutcomeSubscribe until it is closed.
 	holdSubscribe atomic.Pointer[chan struct{}]
 }
 
-func (o *outcomes) observe(_ context.Context, outcome livewire.Outcome) {
+func (o *outcomes) observe(ctx context.Context, outcome livewire.Outcome) {
 	o.mutex.Lock()
 	o.received = append(o.received, outcome)
+	o.units = append(o.units, ctx.Value(unitKey{}))
 	o.mutex.Unlock()
 	if hold := o.holdSubscribe.Load(); hold != nil && outcome.Kind == livewire.OutcomeSubscribe {
 		<-*hold

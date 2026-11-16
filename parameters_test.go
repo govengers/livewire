@@ -117,6 +117,9 @@ func TestDecodeParametersRefusals(t *testing.T) {
 		{name: "int overflow", values: with(valid, "offset", "300"), wantField: "offset", wantText: "must be an integer"},
 		{name: "enum", values: with(valid, "status", "late"), wantField: "status", wantText: "must be one of open, closed"},
 		{name: "enum in list", values: with(valid, "statuses", "open,late"), wantField: "statuses", wantText: "must be one of open, closed"},
+		{name: "U+0000 in a path parameter", values: map[string]string{"id": uuid.Nil.String(), "name": "a\x00"}, wantField: "name", wantText: "must not contain U+0000"},
+		{name: "U+0000 in a query parameter", values: with(valid, "note", "\x00"), wantField: "note", wantText: "must not contain U+0000"},
+		{name: "U+0000 in a list parameter", values: with(valid, "tags", "a,b\x00"), wantField: "tags", wantText: "must not contain U+0000"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 	"github.com/govengers/livewire/generate"
 	"github.com/govengers/livewire/generate/internal/fixture"
 	"github.com/govengers/livewire/ginadapter"
+	"github.com/govengers/livewire/query"
 )
 
 func readGenerated(t *testing.T, directory, name string) string {
@@ -88,7 +89,11 @@ func TestOpenAPIDocumentValidates(t *testing.T) {
 	}
 	parts := document.Paths.Find("/api/v1/parts")
 	require.Equal(t, map[string]any{"target": "parts", "ops": []any{"query", "subscribe"}}, parts.Get.Extensions["x-websocket"])
-	require.Equal(t, "#/components/schemas/FixturePartListResponse", parts.Get.Responses.Status(http.StatusOK).Value.Content["application/json"].Schema.Ref)
+	require.Equal(t, "#/components/schemas/PartsListItemListResponse", parts.Get.Responses.Status(http.StatusOK).Value.Content["application/json"].Schema.Ref)
+	listItem, item := document.Components.Schemas["PartsListItem"].Value, document.Components.Schemas["FixturePart"].Value
+	require.Contains(t, item.Properties, "notes", "the item read carries the Detail field")
+	require.NotContains(t, listItem.Properties, "notes", "a list row does not (D93)")
+	require.Len(t, listItem.Properties, len(item.Properties)-1)
 	require.Equal(t, map[string]any{"target": "createPart", "ops": []any{"call"}}, parts.Post.Extensions["x-websocket"])
 	require.NotNil(t, parts.Post.Responses.Status(http.StatusCreated).Value.Content["application/json"])
 	require.Equal(t, "#/components/schemas/PartsFilter", parts.Get.Parameters.GetByInAndName("query", "filter").Content["application/json"].Schema.Ref)
@@ -461,4 +466,63 @@ func TestNullableSchemasCarryTheirType(t *testing.T) {
 		return found
 	}
 	require.Greater(t, walk(root, ""), 5)
+}
+
+// detailRegistry has one list-only resource "notes" of Item whose field text is Detail: no
+// other read or mutation names Item.
+func detailRegistry[Item any](t *testing.T) *livewire.Registry {
+	t.Helper()
+	registry, err := livewire.NewRegistry(nil)
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(livewire.NewResource("notes", "/notes", &livewire.ResourceOptions[Item]{
+		Read: authorization.IsUser(),
+		Fields: query.Fields{
+			{Name: "id", Type: query.TypeInteger, SQL: "notes.id", Filter: true},
+			{Name: "text", Type: query.TypeText, SQL: "notes.text", Search: true, Detail: true},
+		},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[Item], error) {
+			return &livewire.Page[Item]{}, nil
+		},
+	})))
+	return registry
+}
+
+func TestTheListItemOfAPointerItemOmitsItsDetailFields(t *testing.T) {
+	directory := t.TempDir()
+	options := goOptions(directory)
+	options.TypeScriptDirectory = directory
+	require.NoError(t, generate.Write(detailRegistry[*fixture.Note](t), options))
+	require.Contains(t, readGenerated(t, directory, "api.ts"), "runtime.ListResponse<Omit<types.Note, 'text'> | null>",
+		"Omit applies to the item, the null stays outside: Omit of a union with null keeps no member")
+	goClient := readGenerated(t, directory, "client/client.go")
+	require.Contains(t, goClient, "type NotesListItem struct {\n\tID int `json:\"id\"`\n}", "the Go list item leaves the Detail field out")
+	require.Contains(t, goClient, "(*livewire.ListResponse[*NotesListItem], error)", "and keeps the item's pointer")
+	require.NotContains(t, goClient, "/generate/internal/fixture\"", "no declaration uses the item's package, so the file does not import it")
+}
+
+func TestTheListItemKeepsWhatAnUnnamedStructPromotes(t *testing.T) {
+	directory := t.TempDir()
+	require.NoError(t, generate.Write(detailRegistry[fixture.InlineNote](t), goOptions(directory)))
+	require.Contains(t, readGenerated(t, directory, "client/client.go"),
+		"Inline struct {\n\t\tHidden string `json:\"hidden\"`\n\t\tA      int    `json:\"a\"`\n\t} `json:\"inline\"`",
+		"encoding/json promotes the fields of an embedded unexported struct, so the list item declares them")
+}
+
+func TestTheListItemRefusesFieldsItCannotDeclare(t *testing.T) {
+	testCases := []struct {
+		name     string
+		registry func(t *testing.T) *livewire.Registry
+		message  string
+	}{
+		{"two JSON fields of one Go name", detailRegistry[fixture.TwiceNote], "two JSON fields named ID"},
+		{"an unnamed struct that marshals itself", detailRegistry[fixture.TimedNote], "has MarshalJSON"},
+		{"a field under an unexported Go name", detailRegistry[fixture.AliasNote], "unexported Go name statAlias"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := generate.Write(testCase.registry(t), goOptions(t.TempDir()))
+			require.ErrorContains(t, err, testCase.message)
+			require.ErrorContains(t, err, "its list item NotesListItem")
+		})
+	}
 }

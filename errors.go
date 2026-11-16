@@ -235,6 +235,23 @@ func newError(status int, code Code, fields map[string]string) *Error {
 	return &Error{status: status, body: body}
 }
 
+// notReplayable is the 409 of a repeated idempotency key whose call finished but whose answer
+// was not kept, because the mutation's response carries a secret shown once (D91): the code
+// is conflict, and the field idempotencyKey says the call ran, so the client does not send it
+// again under a new key without knowing that.
+func notReplayable() *Error {
+	return newError(http.StatusConflict, CodeConflict, map[string]string{idempotencyKeyField: NotReplayable})
+}
+
+// idempotencyKeyField is the field a refusal of the Idempotency-Key names.
+const idempotencyKeyField = "idempotencyKey"
+
+// NotReplayable is the value of the idempotencyKey field of the 409 conflict that answers the
+// repeat of a SecretResponse call (D91): the call ran and its answer is not kept. It is a
+// stable token, not a text, so a client tells this conflict from another by comparing it
+// (client.IsNotReplayable, isNotReplayable in the TypeScript runtime).
+const NotReplayable = "not_replayable"
+
 func invalidParameter(name, message string) *Error {
 	return Invalid(map[string]string{name: message})
 }

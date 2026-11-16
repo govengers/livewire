@@ -45,11 +45,12 @@ type commandLine struct {
 	api       *model
 	options   CommandLineOptions
 	functions strings.Builder
-	written   map[string]bool
+	// written are the parameter list functions written, by name, with the type each lists.
+	written map[string]string
 }
 
 func renderCommandLine(api *model, options CommandLineOptions) ([]byte, error) {
-	renderer := &commandLine{api: api, options: options, written: map[string]bool{}}
+	renderer := &commandLine{api: api, options: options, written: map[string]string{}}
 	commands, err := renderer.rootCommands()
 	if err != nil {
 		return nil, err
@@ -197,9 +198,12 @@ func (c *commandLine) parameterList(typeName string, parameters []wireParameter,
 	if len(parameters) == 0 {
 		return "nil", nil
 	}
-	function := lowerFirst(typeName)
-	if !c.written[function] {
-		c.written[function] = true
+	function := unexportedGoIdentifier(typeName)
+	switch earlier, written := c.written[function]; {
+	case written && earlier != typeName:
+		return "", fmt.Errorf("generate: the parameters %s and %s are both %s() on the command line; rename one", earlier, typeName, function)
+	case !written:
+		c.written[function] = typeName
 		fmt.Fprintf(&c.functions, "\nfunc %s() []parameter {\n\treturn []parameter{\n%s\t}\n}\n", function, entries.String())
 	}
 	return function + "()", nil

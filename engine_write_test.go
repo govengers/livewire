@@ -69,6 +69,32 @@ func TestCallRunsInTheEngineTransactionAndReplaysItsKey(t *testing.T) {
 	require.Empty(t, removed.Payload)
 }
 
+func TestASecretResponseIsAnsweredOnceAndNeverRecorded(t *testing.T) {
+	bed := newTestbed(t, nil)
+	socket := bed.dial("ada")
+	minted := socket.call("mintSecret", nil, nil, firstKey)
+	require.Equal(t, http.StatusCreated, minted.Status, "%+v", minted.Error)
+	require.JSONEq(t, `{"count":1}`, string(minted.Payload))
+	record := bed.idempotency.recorded("test:ada", firstKey)
+	require.Equal(t, http.StatusCreated, record.Status, "the record keeps the status")
+	require.Empty(t, record.Response, "the record keeps no secret (D91)")
+
+	again := socket.call("mintSecret", nil, nil, firstKey)
+	require.Equal(t, http.StatusConflict, again.Status)
+	require.Equal(t, livewire.CodeConflict, again.Error.Code)
+	require.Equal(t, map[string]string{"idempotencyKey": livewire.NotReplayable}, again.Error.Fields, "the field tells it from another conflict")
+	require.Equal(t, int64(1), bed.secretRuns.Load(), "a repeat runs nothing")
+	require.Len(t, bed.outcomes.of(livewire.OutcomeAfterCommit), 1, "the repeat committed nothing")
+
+	batch := []livewire.BatchCall{{Target: "createGadget", Body: mustJSON(map[string]string{"name": "Anchor"})}, {Target: "mintSecret"}}
+	require.True(t, socket.batch(batch, secondKey).OK)
+	repeated := socket.batch(batch, secondKey)
+	require.Equal(t, http.StatusConflict, repeated.Status, "a batch with a secret call keeps no answer either")
+	require.Equal(t, livewire.NotReplayable, repeated.Error.Fields["idempotencyKey"])
+	require.Empty(t, bed.idempotency.recorded("test:ada", secondKey).Response)
+	require.Equal(t, int64(2), bed.secretRuns.Load())
+}
+
 func TestCallInFlightKeyAnswersInProgress(t *testing.T) {
 	bed := newTestbed(t, nil)
 	socket := bed.dial("ada")
