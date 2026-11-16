@@ -100,7 +100,7 @@ func newRegistry(todos *todoController, accounts *accountController, observer li
 		livewire.NewMutation("createKey", http.MethodPost, "/keys", &livewire.MutationOptions[livewire.NoParameters, livewire.NoBody, api.KeyItem]{
 			Description: "Creates an API key of the caller, for the CLI and the Go client; the answer shows the key once.",
 			Check:       authorization.IsUser(), Status: http.StatusCreated,
-			SecretResponse: true, // the key is shown once: a repeat answers 409 not_replayable (D91)
+			SecretResponse: true, // the key is shown once: a repeat answers 409 conflict (D91)
 			Handle:         accounts.createKey,
 		}),
 	)

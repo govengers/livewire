@@ -81,7 +81,8 @@ func TestASecretResponseIsAnsweredOnceAndNeverRecorded(t *testing.T) {
 
 	again := socket.call("mintSecret", nil, nil, firstKey)
 	require.Equal(t, http.StatusConflict, again.Status)
-	require.Equal(t, livewire.CodeNotReplayable, again.Error.Code)
+	require.Equal(t, livewire.CodeConflict, again.Error.Code)
+	require.Equal(t, map[string]string{"idempotencyKey": livewire.NotReplayableText}, again.Error.Fields, "the field tells it from another conflict")
 	require.Equal(t, int64(1), bed.secretRuns.Load(), "a repeat runs nothing")
 	require.Len(t, bed.outcomes.of(livewire.OutcomeAfterCommit), 1, "the repeat committed nothing")
 
@@ -89,7 +90,7 @@ func TestASecretResponseIsAnsweredOnceAndNeverRecorded(t *testing.T) {
 	require.True(t, socket.batch(batch, secondKey).OK)
 	repeated := socket.batch(batch, secondKey)
 	require.Equal(t, http.StatusConflict, repeated.Status, "a batch with a secret call keeps no answer either")
-	require.Equal(t, livewire.CodeNotReplayable, repeated.Error.Code)
+	require.Equal(t, livewire.NotReplayableText, repeated.Error.Fields["idempotencyKey"])
 	require.Empty(t, bed.idempotency.recorded("test:ada", secondKey).Response)
 	require.Equal(t, int64(2), bed.secretRuns.Load())
 }

@@ -148,7 +148,8 @@ func TestANewKeyIsShownOnceAndNeverRecorded(t *testing.T) {
 	require.Equal(t, http.StatusCreated, status)
 	status, body := mint()
 	require.Equal(t, http.StatusConflict, status, "a repeat cannot show the key again (D91)")
-	require.Equal(t, livewire.CodeNotReplayable, body.Code)
+	require.Equal(t, livewire.CodeConflict, body.Code)
+	require.Equal(t, livewire.NotReplayableText, body.Fields["idempotencyKey"])
 	var recorded bool
 	require.NoError(t, application.pool.QueryRow(t.Context(), "SELECT response IS NOT NULL FROM livewire_idempotency WHERE key = $1", key).Scan(&recorded))
 	require.False(t, recorded, "the key's secret never reaches the idempotency table")

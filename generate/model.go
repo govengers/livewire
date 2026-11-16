@@ -220,20 +220,7 @@ func newModel(registry *livewire.Registry, options Options) (*model, error) {
 	if err := types.describeLibrary(); err != nil {
 		return nil, err
 	}
-	filters := map[string]*resourceModel{}
-	for _, declaration := range declarations {
-		if resource, ok := declaration.(*livewire.Resource); ok {
-			filters[resource.Name()] = &resourceModel{name: pascalCase(resource.Name()), target: resource.Name(), fields: resource.Fields()}
-			built.resources = append(built.resources, filters[resource.Name()])
-			if details := detailNames(resource.Fields()); len(details) > 0 {
-				built.details[resource.Name()] = details
-				types.reserved[listItemName(resource.Name())] = true
-			}
-			if resource.HistoryPath() != "" && built.history == nil {
-				built.history = &resourceModel{name: historyPrefix, fields: livewire.HistoryFields(), history: true}
-			}
-		}
-	}
+	filters := built.addResourceModels(declarations)
 	for _, resource := range slices.Concat(built.resources, []*resourceModel{built.history}) {
 		if resource != nil {
 			for _, name := range []string{resource.filterType(), resource.nodeType(), resource.conditionType()} {
@@ -250,6 +237,29 @@ func newModel(registry *livewire.Registry, options Options) (*model, error) {
 		return nil, err
 	}
 	return built, nil
+}
+
+// addResourceModels adds the filter vocabulary of every resource, the history's once, and the
+// Detail fields of each (D93), whose list item component name it reserves; it answers the
+// vocabularies by resource name.
+func (m *model) addResourceModels(declarations []livewire.Declaration) map[string]*resourceModel {
+	filters := map[string]*resourceModel{}
+	for _, declaration := range declarations {
+		resource, ok := declaration.(*livewire.Resource)
+		if !ok {
+			continue
+		}
+		filters[resource.Name()] = &resourceModel{name: pascalCase(resource.Name()), target: resource.Name(), fields: resource.Fields()}
+		m.resources = append(m.resources, filters[resource.Name()])
+		if details := detailNames(resource.Fields()); len(details) > 0 {
+			m.details[resource.Name()] = details
+			m.types.reserved[listItemName(resource.Name())] = true
+		}
+		if resource.HistoryPath() != "" && m.history == nil {
+			m.history = &resourceModel{name: historyPrefix, fields: livewire.HistoryFields(), history: true}
+		}
+	}
+	return filters
 }
 
 // detailNames are the fields marked Detail, which a list read leaves out (D93).

@@ -217,7 +217,6 @@
           "not_found",
           "conflict",
           "in_progress",
-          "not_replayable",
           "internal"
         ],
         "type": "string"

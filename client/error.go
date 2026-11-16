@@ -42,7 +42,7 @@ func (e *EndedError) Error() string {
 var errorCodes = []livewire.Code{
 	livewire.CodeInvalidRequest, livewire.CodeInvalidFilter, livewire.CodeInvalidSort, livewire.CodeInvalidPage,
 	livewire.CodeInvalidCursor, livewire.CodeForbiddenField, livewire.CodeUnauthenticated, livewire.CodeForbidden,
-	livewire.CodeNotFound, livewire.CodeConflict, livewire.CodeInProgress, livewire.CodeNotReplayable, livewire.CodeInternal,
+	livewire.CodeNotFound, livewire.CodeConflict, livewire.CodeInProgress, livewire.CodeInternal,
 }
 
 // errorOf builds the Error of a status and a body; status 0 (an error push) takes the
@@ -88,7 +88,7 @@ func statusOfCode(code livewire.Code) int {
 		return http.StatusUnauthorized
 	case livewire.CodeNotFound:
 		return http.StatusNotFound
-	case livewire.CodeConflict, livewire.CodeInProgress, livewire.CodeNotReplayable:
+	case livewire.CodeConflict, livewire.CodeInProgress:
 		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError

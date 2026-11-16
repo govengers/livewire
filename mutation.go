@@ -74,8 +74,8 @@ func Removes(target string) Effect { return Effect{Kind: EffectRemoves, Target: 
 // what the mutation does, for people and agents (D85); "" leaves the OpenAPI operation
 // without one and the tool catalogue with a description of its own. SecretResponse keeps
 // the response out of the idempotency record because it carries a secret shown once (a new
-// API key, D91): the record keeps only the status, and a repeat of the key answers 409
-// not_replayable instead of the response.
+// API key, D91): the record keeps only the status, and a repeat of the key answers a 409
+// conflict whose field idempotencyKey is NotReplayableText instead of the response.
 type MutationOptions[Parameters, Request, Response any] struct {
 	Description    string
 	SecretResponse bool

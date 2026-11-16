@@ -123,7 +123,7 @@ func TestOpenAPIDocumentValidates(t *testing.T) {
 	require.NotContains(t, part.Required, "ownerId", "a field promoted through an embedded pointer is left out with it")
 	require.Contains(t, part.Required, "started", "omitempty never omits a struct")
 	require.True(t, part.Properties["updatedAt"].Value.Nullable)
-	require.Equal(t, []any{"invalid_request", "invalid_filter", "invalid_sort", "invalid_page", "invalid_cursor", "forbidden_field", "unauthenticated", "forbidden", "not_found", "conflict", "in_progress", "not_replayable", "internal"}, schemas["ErrorCode"].Value.Enum)
+	require.Equal(t, []any{"invalid_request", "invalid_filter", "invalid_sort", "invalid_page", "invalid_cursor", "forbidden_field", "unauthenticated", "forbidden", "not_found", "conflict", "in_progress", "internal"}, schemas["ErrorCode"].Value.Enum)
 	require.Equal(t, []any{"bolt", "nut"}, schemas["Kind"].Value.Enum)
 	require.NotNil(t, schemas["FixturePartVersionListResponse"])
 	require.NotNil(t, schemas["HistoryFilter"])

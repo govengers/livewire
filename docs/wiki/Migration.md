@@ -48,7 +48,7 @@ v1 is a new module, `github.com/govengers/livewire`, with the same idea and a ne
 | v0.2 | v1 |
 |---|---|
 | `livewire.Errorf(status, code, format, ...)`, `*livewire.Error{Status, Code, Message, Fields}` | the constructors above; `*livewire.Error` has no exported fields, `Status()` and `Body()` read it |
-| any code a handler chose | **breaking:** a closed set: `invalid_request`, `invalid_filter`, `invalid_sort`, `invalid_page`, `invalid_cursor`, `forbidden_field`, `unauthenticated`, `forbidden`, `not_found`, `conflict`, `in_progress`, `not_replayable` (D91), `internal`; the message is fixed per code |
+| any code a handler chose | **breaking:** a closed set: `invalid_request`, `invalid_filter`, `invalid_sort`, `invalid_page`, `invalid_cursor`, `forbidden_field`, `unauthenticated`, `forbidden`, `not_found`, `conflict`, `in_progress`, `internal`; the message is fixed per code |
 | `unauthorized` | **breaking:** `unauthenticated` |
 | `CodeInvalidRequest`, ... (untyped string constants) | the typed `livewire.Code` constants; `CodeUnauthorized` is `CodeUnauthenticated` |
 

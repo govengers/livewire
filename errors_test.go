@@ -31,7 +31,6 @@ func TestResponseFor(t *testing.T) {
 		{name: "not found", err: livewire.NotFound(), status: http.StatusNotFound, code: livewire.CodeNotFound},
 		{name: "conflict", err: livewire.Conflict(), status: http.StatusConflict, code: livewire.CodeConflict},
 		{name: "in progress", err: livewire.InProgress(), status: http.StatusConflict, code: livewire.CodeInProgress},
-		{name: "not replayable", err: livewire.NotReplayable(), status: http.StatusConflict, code: livewire.CodeNotReplayable},
 		{name: "invalid", err: livewire.Invalid(map[string]string{"name": "required"}), status: http.StatusBadRequest, code: livewire.CodeInvalidRequest, wantFields: map[string]string{"name": "required"}},
 		{name: "forbidden field", err: livewire.ForbiddenField("secret"), status: http.StatusForbidden, code: livewire.CodeForbiddenField, wantFields: map[string]string{"secret": "forbidden"}},
 		{name: "wrapped core error", err: fmt.Errorf("load part: %w", livewire.NotFound()), status: http.StatusNotFound, code: livewire.CodeNotFound},

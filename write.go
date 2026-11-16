@@ -610,7 +610,7 @@ type writeRun func(ctx context.Context, transaction Transaction) (int, json.RawM
 func (e *Engine) write(ctx context.Context, plan writePlan, run writeRun) (*writeAnswer, error) {
 	if plan.idempotencyKey != "" {
 		if _, err := uuid.Parse(plan.idempotencyKey); err != nil {
-			return nil, invalidParameter("idempotencyKey", "must be a UUID")
+			return nil, invalidParameter(idempotencyKeyField, "must be a UUID")
 		}
 	}
 	transaction, err := e.options.Transactor.Begin(ctx, TransactionDetails{
@@ -635,8 +635,8 @@ func (e *Engine) write(ctx context.Context, plan writePlan, run writeRun) (*writ
 }
 
 // runReserved reserves the key, runs and records the answer; a finished key replays, except
-// one whose answer carries a secret: its record keeps the status only and a repeat is 409
-// not_replayable (D91).
+// one whose answer carries a secret: its record keeps the status only and a repeat is a 409
+// conflict naming the key (D91).
 func (e *Engine) runReserved(ctx context.Context, plan writePlan, run func(ctx context.Context) (int, json.RawMessage, error)) (*writeAnswer, error) {
 	store := e.options.IdempotencyStore
 	owner, hasOwner := OwnerOf(ctx)
@@ -654,7 +654,7 @@ func (e *Engine) runReserved(ctx context.Context, plan writePlan, run func(ctx c
 		}
 		switch {
 		case replay && plan.secretResponse:
-			return nil, NotReplayable()
+			return nil, notReplayable()
 		case replay:
 			return &writeAnswer{status: record.Status, payload: record.Response, replayed: true}, nil
 		}

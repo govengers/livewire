@@ -192,7 +192,7 @@ type TodoParameters struct {
 - The body is decoded strictly (D40): it must be an object, an unknown member at any depth and a repeated member are 400 `invalid_request` naming the member's path. Then the field checks run ([Column checks](#column-checks)), then the `validate` tags (go-playground/validator, D44), each failure named by its JSON path. A tag the validator cannot parse fails `Add`.
 - `Check` runs before the body is read, on REST too (D8).
 - The handler runs inside the engine's transaction, after the `Idempotency-Key` was reserved; `livewire.IdempotencyKeyFrom(ctx)` reads the key ([Postgres](Postgres.md#the-transactor)).
-- `SecretResponse: true` keeps the response out of the idempotency record, for a response that shows a secret once, such as a new API key (D91): a repeat of the key answers 409 `not_replayable` instead of the response, and the client knows the call ran.
+- `SecretResponse: true` keeps the response out of the idempotency record, for a response that shows a secret once, such as a new API key (D91): a repeat of the key answers 409 `conflict` whose field `idempotencyKey` is `livewire.NotReplayableText` instead of the response, so the client knows the call ran.
 - A string, a member name or a parameter holding U+0000 is 400 `invalid_request` naming it (D95): PostgreSQL text cannot store it.
 
 ### Client ids
@@ -264,7 +264,6 @@ A loader or handler returns livewire's refusals or an `*auth.Error`; anything el
 | `livewire.NotFound()` | 404 `not_found` |
 | `livewire.Conflict()` | 409 `conflict` |
 | `livewire.InProgress()` | 409 `in_progress` |
-| `livewire.NotReplayable()` | 409 `not_replayable`: the repeat of a `SecretResponse` call (D91) |
 | `*auth.Error`, `auth.ErrUnauthenticated`, `auth.ErrForbidden` | 401 `unauthenticated`, 403 `forbidden`, ... |
 
 The filter, sort, page and cursor refusals of the `query` package answer 400 `invalid_filter`, `invalid_sort`, `invalid_page` and `invalid_cursor`. The body is always `{code, message, fields?}`; the code set is closed, so a client can switch on it. Map the domain's errors once:

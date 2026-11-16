@@ -117,21 +117,28 @@ func (r *Registry) Tenant(ctx context.Context, parameters any) (string, error) {
 // or answers no context, it answers ctx and a finish that does nothing; a panicking finish
 // costs that finish and nothing else.
 func (r *Registry) StartUnit(ctx context.Context, unit Unit) (context.Context, func()) {
-	started, finish := ctx, func() {}
 	if r.options.StartUnit == nil {
-		return started, finish
+		return ctx, func() {}
 	}
-	_ = recovering(func() error { // a panic of application code has nobody left to report to
-		begun, end := r.options.StartUnit(ctx, unit)
-		if begun != nil {
-			started = begun
+	begun, end := r.callStartUnit(ctx, unit)
+	if begun == nil {
+		begun = ctx
+	}
+	if end == nil {
+		return begun, func() {}
+	}
+	return begun, func() { _ = recovering(func() error { end(); return nil }) }
+}
+
+// callStartUnit runs the StartUnit option; its panic, which has nobody left to report to,
+// answers neither a context nor a finish.
+func (r *Registry) callStartUnit(ctx context.Context, unit Unit) (begun context.Context, end func()) {
+	defer func() {
+		if recover() != nil {
+			begun, end = nil, nil
 		}
-		if end != nil {
-			finish = func() { _ = recovering(func() error { end(); return nil }) }
-		}
-		return nil
-	})
-	return started, finish
+	}()
+	return r.options.StartUnit(ctx, unit)
 }
 
 // Observe reports an outcome to the Observer; it does nothing without one.
