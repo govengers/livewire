@@ -198,6 +198,33 @@ CREATE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON other.things 
 	require.Equal(t, before, definitions(), "only the triggers of livewire's functions are re-created")
 }
 
+func TestTriggerUpgradeSQLKeepsTheEnabledStateAndTheApplicationsTriggers(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	// A replicated and a bulk-loaded table, and an application's own trigger of that name on
+	// livewire_notify() that skips updates.
+	_, err := database.pool.Exec(t.Context(), `CREATE TABLE replicated (id uuid PRIMARY KEY DEFAULT uuidv7());
+CREATE TABLE imported (id uuid PRIMARY KEY DEFAULT uuidv7());
+CREATE TABLE sessions (id uuid PRIMARY KEY DEFAULT uuidv7(), tenant text);
+`+postgresadapter.TriggerSQL("replicated", "imported")+`ALTER TABLE replicated ENABLE ALWAYS TRIGGER livewire_notify;
+ALTER TABLE imported DISABLE TRIGGER livewire_notify;
+CREATE TRIGGER livewire_notify AFTER INSERT OR DELETE ON sessions FOR EACH ROW EXECUTE FUNCTION livewire_notify('tenant');
+`)
+	require.NoError(t, err)
+	triggers := func() []string {
+		rows, err := database.pool.Query(t.Context(), `SELECT tgenabled::text || ' ' || pg_get_triggerdef(oid) FROM pg_trigger
+			WHERE tgname = 'livewire_notify' AND tgrelid IN ('replicated'::regclass, 'imported'::regclass, 'sessions'::regclass) ORDER BY 1`)
+		require.NoError(t, err)
+		triggers, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		return triggers
+	}
+	before := triggers()
+	_, err = database.pool.Exec(t.Context(), postgresadapter.TriggerUpgradeSQL)
+	require.NoError(t, err)
+	require.Equal(t, before, triggers(), "the enabled states and the application's trigger stay")
+}
+
 func TestTriggerUpgradeSQLLetsAWarmSessionWriteAfterTheIDsTypeChanged(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)

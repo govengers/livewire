@@ -292,11 +292,14 @@ const (
 // of every table TriggerSQL or PartitionedTriggerSQL ran for (finding them by the row trigger
 // livewire_notify on livewire_notify() or a livewire_notify_<column>() of livewire_notify()'s
 // schema, and reading the partition column from its first argument) with the functions of
-// their partition columns, and the triggers of livewire_presence where that table exists; a
-// trigger of that name on another function, such as another library's or another schema's,
-// stays as it is. It is idempotent and changes no table, so the application runs it in a
-// goose migration of its own, in the migration's transaction, whenever a release says its
-// trigger SQL changed. Until then a trigger that this release's TriggerSQL or
+// their partition columns, and the triggers of livewire_presence where that table exists. A
+// re-created row trigger keeps its enabled state (disabled, replica or always). A trigger of
+// that name on another function, such as another library's or another schema's, stays as it
+// is, and so does one on livewire's functions in a shape TriggerSQL never creates (other
+// events, a WHEN condition): it keeps its earlier arguments, so on this release's function it
+// sends the id "" and the partition "". It is idempotent and changes no table, so the
+// application runs it in a goose migration of its own, in the migration's transaction,
+// whenever a release says its trigger SQL changed. Until then a trigger that this release's TriggerSQL or
 // PartitionedTriggerSQL creates on the earlier livewire_notify() sends what the earlier form
 // sent.
 //
@@ -310,18 +313,24 @@ const (
 // partition (every change then reaches every partition's subscriptions). Re-creating a
 // trigger waits for the SHARE ROW EXCLUSIVE lock on its table, so the migration sets its own
 // lock_timeout (DAT-006).
-const TriggerUpgradeSQL = TriggerFunctionSQL + historyFunctionSQL + `DO $livewire$ DECLARE relation regclass; partition_column text;` + notifyVariablesSQL + ` BEGIN
-	-- The row triggers of TriggerSQL and PartitionedTriggerSQL, on livewire's functions only: an
+const TriggerUpgradeSQL = TriggerFunctionSQL + historyFunctionSQL + `DO $livewire$ DECLARE relation regclass; partition_column text; enabled "char";` + notifyVariablesSQL + ` BEGIN
+	-- The row triggers of TriggerSQL and PartitionedTriggerSQL, on livewire's functions and in
+	-- their shape only (AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW, tgtype 29, no WHEN): an
 	-- earlier release's have no argument or the partition column, this release's the partition
 	-- column and 'id' or ''.
-	FOR relation, partition_column IN SELECT tgrelid::regclass, CASE WHEN tgnargs > 0
-			THEN convert_from(substring(tgargs FROM 1 FOR position(decode('00', 'hex') IN tgargs) - 1), getdatabaseencoding()) ELSE '' END
+	FOR relation, partition_column, enabled IN SELECT tgrelid::regclass, CASE WHEN tgnargs > 0
+			THEN convert_from(substring(tgargs FROM 1 FOR position(decode('00', 'hex') IN tgargs) - 1), getdatabaseencoding()) ELSE '' END, tgenabled
 		FROM pg_trigger JOIN pg_proc ON pg_proc.oid = tgfoid
-		WHERE tgname = 'livewire_notify' AND tgparentid = 0 AND tgtype & 1 = 1 AND tgrelid IS DISTINCT FROM to_regclass('livewire_presence')
+		WHERE tgname = 'livewire_notify' AND tgparentid = 0 AND tgtype = 29 AND tgqual IS NULL AND tgrelid IS DISTINCT FROM to_regclass('livewire_presence')
 			AND (proname = 'livewire_notify' OR proname LIKE 'livewire\_notify\_%')
 			AND pronamespace = (SELECT pronamespace FROM pg_proc WHERE oid = to_regproc('livewire_notify'))
 	LOOP
-` + notifyInstallSQL + `	END LOOP;
+` + notifyInstallSQL + `		-- CREATE OR REPLACE TRIGGER enables the trigger as origin: a disabled, replica or always one gets its state back.
+		IF enabled <> 'O' THEN
+			EXECUTE format('ALTER TABLE %s %s TRIGGER livewire_notify', relation,
+				CASE enabled WHEN 'D' THEN 'DISABLE' WHEN 'A' THEN 'ENABLE ALWAYS' ELSE 'ENABLE REPLICA' END);
+		END IF;
+	END LOOP;
 	IF to_regclass('livewire_presence') IS NOT NULL THEN
 		partition_column := 'tenant';
 		` + partitionFunctionSQL + `		EXECUTE $trigger$` + presenceTriggerSQL + `$trigger$;

@@ -62,7 +62,7 @@ livewire v1.0.1 and earlier converted every changed row to jsonb in `livewire_no
 const triggerUpgradeSQL = "SET LOCAL lock_timeout = '5s';\n" + postgresadapter.TriggerUpgradeSQL
 ```
 
-It replaces both functions and re-creates the notify triggers of every table `TriggerSQL` or `PartitionedTriggerSQL` ran for (it finds them by their row trigger `livewire_notify`) and, where `livewire_presence` exists, its triggers; it changes no table and is idempotent. Re-creating a trigger waits for its table's SHARE ROW EXCLUSIVE lock, hence the lock timeout. No restart is needed: every session runs the new functions from its next write on. A later release that changes the trigger SQL again says so, and the same constant in a new migration upgrades to it.
+It replaces both functions and re-creates the notify triggers of every table `TriggerSQL` or `PartitionedTriggerSQL` ran for (it finds them by their row trigger `livewire_notify` on `livewire_notify()` or a `livewire_notify_<column>()` in `livewire_notify()`'s schema, in the shape `TriggerSQL` creates: after insert, update and delete, no `WHEN`; a disabled, replica or always trigger keeps that state) and, where `livewire_presence` exists, its triggers; it changes no table and is idempotent. Re-creating a trigger waits for its table's SHARE ROW EXCLUSIVE lock, hence the lock timeout. No restart is needed: every session runs the new functions from its next write on. A later release that changes the trigger SQL again says so, and the same constant in a new migration upgrades to it.
 
 ### Deploy order of a changed SQL
 
