@@ -16,8 +16,9 @@ import (
 // body's top-level members by name with their raw text. An unknown member at any depth
 // (struct fields, array elements, map values), a member that repeats within one object
 // (skipped subtrees included) and a body that is not one JSON object are refused with fixed
-// texts naming the member's path. The path is kept as a stack of segments and written only
-// for the refusal, so a deep body costs memory in proportion to its size.
+// texts naming the member's path, and so is a string or member name holding U+0000, which
+// PostgreSQL text and jsonb cannot store. The path is kept as a stack of segments and
+// written only for the refusal, so a deep body costs memory in proportion to its size.
 func inspectBody(raw []byte, requestType reflect.Type, fields fieldIndex) (map[string]json.RawMessage, error) {
 	walker := newBodyWalker(raw, fields)
 	if err := walker.walkBody(requestType); err != nil {
@@ -153,6 +154,32 @@ func (w *bodyWalker) refuse(message string) error {
 	return invalidParameter(writePath(w.segments), message)
 }
 
+// refuseHere refuses at the current path, "body" at the top level.
+func (w *bodyWalker) refuseHere(message string) error {
+	if len(w.segments) == 0 {
+		return invalidParameter("body", message)
+	}
+	return w.refuse(message)
+}
+
+// The texts of a refused U+0000 (PostgreSQL text holds none, so it would fail in the database).
+const (
+	noNULValue = "must not contain U+0000"
+	noNULName  = "a member name must not contain U+0000"
+)
+
+// next reads the next token; a string holding U+0000 is refused at the current path.
+func (w *bodyWalker) next() (json.Token, error) {
+	token, err := w.decoder.Token()
+	if err != nil {
+		return nil, invalidParameter("body", "must be valid JSON")
+	}
+	if text, ok := token.(string); ok && strings.ContainsRune(text, 0) {
+		return nil, w.refuseHere(noNULValue)
+	}
+	return token, nil
+}
+
 func (w *bodyWalker) push(segment pathSegment) { w.segments = append(w.segments, segment) }
 
 func (w *bodyWalker) pop() { w.segments = w.segments[:len(w.segments)-1] }
@@ -170,6 +197,9 @@ func (w *bodyWalker) nextMember(seen map[string]bool, index bool) (key string, d
 		return "", true, nil
 	}
 	key, _ = token.(string)
+	if strings.ContainsRune(key, 0) {
+		return "", false, w.refuseHere(noNULName)
+	}
 	w.push(pathSegment{text: key, index: index})
 	if seen[key] {
 		return "", false, w.refuse("duplicate member")
@@ -224,9 +254,9 @@ func (w *bodyWalker) walkValue(fieldType reflect.Type, start int64) error {
 // expects is left to the decoder, which names it.
 func (w *bodyWalker) consumeValue(fieldType reflect.Type) error {
 	fieldType = unwrapPointer(fieldType)
-	token, err := w.decoder.Token()
+	token, err := w.next()
 	if err != nil {
-		return invalidParameter("body", "must be valid JSON")
+		return err
 	}
 	switch {
 	case hasOwnUnmarshaler(fieldType):
@@ -314,9 +344,9 @@ func (w *bodyWalker) skipArray() error {
 }
 
 func (w *bodyWalker) skipValue() error {
-	token, err := w.decoder.Token()
+	token, err := w.next()
 	if err != nil {
-		return invalidParameter("body", "must be valid JSON")
+		return err
 	}
 	return w.skipAfter(token)
 }
