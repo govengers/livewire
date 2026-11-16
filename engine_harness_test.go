@@ -151,7 +151,7 @@ func (b *testbed) registry() *livewire.Registry {
 	registry, err := livewire.NewRegistry(&options)
 	require.NoError(b.t, err)
 	require.NoError(b.t, registry.Add(b.gadgets(), b.groupList(), b.counter(), b.team(), b.createGadget(), b.failGadget(),
-		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget(), b.mintSecret()))
+		b.blockGadget(), b.panicGadget(), b.removeGadget(), b.revealGadget(), b.anonymousGadget(), b.upload(), b.openGadgets(), b.groupReveal(), b.myGadgets(), b.myBoard(), b.pagedGadgets(), b.documents(), b.cancelGadget(), b.mintSecret(), b.gadgetCards()))
 	return registry
 }
 
@@ -369,6 +369,26 @@ func (b *testbed) revealGadget() *livewire.Mutation {
 		Handle: func(context.Context, *livewire.NoParameters, *livewire.NoBody) (*gadget, error) {
 			return &gadget{ID: "r", Name: "Revealed", Secret: "s3cret"}, nil
 		},
+	})
+}
+
+// gadgetCards lists the gadgets without their name, a Detail field (D93) that the item read
+// carries; the name stays filterable and searchable.
+func (b *testbed) gadgetCards() *livewire.Resource {
+	fields := gadgetFields()
+	for position := range fields {
+		fields[position].Detail = fields[position].Name == "name"
+	}
+	return livewire.NewResource("gadgetCards", "/gadget-cards", &livewire.ResourceOptions[gadget]{
+		Tables: []string{"gadgets"},
+		Read:   authorization.HasRole(roleReader),
+		Fields: fields,
+		Item:   &livewire.ItemKey{Parameter: "id", Field: "id"},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[gadget], error) {
+			items := b.world.sorted("")
+			return &livewire.Page[gadget]{Items: items, Total: len(items)}, nil
+		},
+		Get: b.getGadget,
 	})
 }
 

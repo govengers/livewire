@@ -288,6 +288,17 @@ func (r *Resource) Versioned() bool { return r.versioned }
 // Cursor reports whether the resource pages by cursor on request (D38).
 func (r *Resource) Cursor() bool { return r.cursor }
 
+// detailNames are the fields marked Detail, which a list read leaves out (D93).
+func (r *Resource) detailNames() map[string]bool {
+	names := map[string]bool{}
+	for _, field := range r.fields {
+		if field.Detail {
+			names[field.Name] = true
+		}
+	}
+	return names
+}
+
 // ExportColumns are the fields an export writes, every field when empty (D35); the result
 // is the caller's copy.
 func (r *Resource) ExportColumns() []string { return slices.Clone(r.exportColumns) }
@@ -449,6 +460,9 @@ func (r *Resource) validate(maximumLimit, distinctMaximum int) error {
 	if err := r.validateGuardedFields(); err != nil {
 		return err
 	}
+	if err := r.validateDetailFields(); err != nil {
+		return err
+	}
 	if r.live() {
 		if err := requireJSONField(r.itemType, keyFieldJSON, liveListNeedsID); err != nil {
 			return err
@@ -480,6 +494,27 @@ func (r *Resource) validateGuardedFields() error {
 		guardedLiveID := r.live() && field.Name == keyFieldJSON && field.Read != nil
 		if guardedLiveID {
 			return errors.New(`the field "id" of a live resource cannot have a Read check: a list without ids cannot be diffed`)
+		}
+	}
+	return nil
+}
+
+// validateDetailFields checks that every Detail field names a JSON key of the item, which a
+// list read strips, and is neither "id", by which a list is diffed, nor the item key, by which
+// a client reads the item a row of the list shows (D93).
+func (r *Resource) validateDetailFields() error {
+	for _, field := range r.fields {
+		if !field.Detail {
+			continue
+		}
+		switch {
+		case field.Name == keyFieldJSON:
+			return errors.New(`the field "id" cannot be a Detail field: a list without ids cannot be diffed`)
+		case r.item != nil && field.Name == r.item.Field:
+			return fmt.Errorf("the item key field %q cannot be a Detail field: a list row must name its item", field.Name)
+		}
+		if err := requireJSONField(r.itemType, field.Name, "a Detail field is left out of list reads by it"); err != nil {
+			return err
 		}
 	}
 	return nil

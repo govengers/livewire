@@ -650,6 +650,19 @@ describe('LiveConnection', () => {
     expect(item.states).toEqual([])
   })
 
+  test('an upsert leaves the Detail fields the effect omits out of the list row, never out of the answer (D93)', async () => {
+    const { connection, current, received } = subscribedList([{ id: 'a', name: 'A' }])
+    const describePart = mutation<Record<string, never>, { id?: string; name: string }, Part & { description: string }>({
+      name: 'describePart', method: 'POST', path: '/parts/describe', pathParameters: [], body: true, content: true,
+      effect: { kind: 'upserts', target: 'parts', omit: ['description'] },
+    })
+    const call = connection.call(describePart, {}, { id: 'n', name: 'new' }, { optimistic: { id: 'n', name: 'new', description: 'long' } })
+    expect(received.last()?.data.items).toEqual([{ id: 'a', name: 'A' }, { id: 'n', name: 'new' }])
+    current().answer('call', { status: 201, payload: { id: 'n', name: 'stored', description: 'long' } })
+    expect(await call).toEqual({ id: 'n', name: 'stored', description: 'long' })
+    expect(received.last()?.data.items).toEqual([{ id: 'a', name: 'A' }, { id: 'n', name: 'stored' }])
+  })
+
   test('a settled upsert of a row the list does not hold ends with the reconcile window: an unchanged list pushes nothing (D36)', async () => {
     const { connection, clock, current, received, ids } = subscribedList([{ id: 'a', name: 'A' }], { reconcileWindow: 500 })
     const call = connection.call(createPart, {}, { name: 'filtered out' })

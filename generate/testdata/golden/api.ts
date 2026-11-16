@@ -14,7 +14,7 @@ export interface PartsListQuery {
 }
 
 /** GET /api/v1/parts (socket target 'parts'). */
-export function getParts(client: runtime.Client, parameters: PartsListQuery = {}, options?: runtime.RequestOptions): Promise<runtime.ListResponse<types.FixturePart>> {
+export function getParts(client: runtime.Client, parameters: PartsListQuery = {}, options?: runtime.RequestOptions): Promise<runtime.ListResponse<Omit<types.FixturePart, 'notes'>>> {
   return client.read(reads.parts, parameters, options)
 }
 
@@ -120,7 +120,7 @@ export function getDashboardPresence(client: runtime.Client, parameters: Dashboa
 
 /** Every read: its socket target (D46), REST route and kind. */
 export const reads = {
-  parts: runtime.liveRead<PartsListQuery, runtime.ListResponse<types.FixturePart>>({ target: 'parts', path: '/parts', pathParameters: [], list: true }),
+  parts: runtime.liveRead<PartsListQuery, runtime.ListResponse<Omit<types.FixturePart, 'notes'>>>({ target: 'parts', path: '/parts', pathParameters: [], list: true }),
   "parts.item": runtime.liveRead<PartsItemParameters, types.FixturePart>({ target: 'parts.item', path: '/parts/{id}', pathParameters: ['id'], list: false }),
   "parts.distinct": runtime.liveRead<PartsDistinctQuery, types.DistinctValue[]>({ target: 'parts.distinct', path: '/parts/distinct', pathParameters: [], list: false }),
   "parts.history": runtime.liveRead<PartsHistoryQuery, runtime.ListResponse<runtime.Version<types.FixturePart>>>({ target: 'parts.history', path: '/parts/{id}/history', pathParameters: ['id'], list: true }),
@@ -187,8 +187,8 @@ export function rebuild(client: runtime.Client, options?: runtime.CallOptions): 
 
 /** Every mutation, for LiveConnection.call (the socket, with its optimistic effect, D36) and runtime.batchCall. */
 export const calls = {
-  createPart: runtime.mutation<CreatePartParameters, types.CreatePart, types.FixturePart>({ name: 'createPart', method: 'POST', path: '/parts', pathParameters: [], body: true, content: true, effect: { kind: 'upserts', target: 'parts' }, clientID: 7 }),
-  renamePart: runtime.mutation<RenamePartParameters, types.RenamePart, types.FixturePart>({ name: 'renamePart', method: 'PATCH', path: '/parts/{id}', pathParameters: ['id'], body: true, content: true, effect: { kind: 'upserts', target: 'parts' } }),
+  createPart: runtime.mutation<CreatePartParameters, types.CreatePart, types.FixturePart>({ name: 'createPart', method: 'POST', path: '/parts', pathParameters: [], body: true, content: true, effect: { kind: 'upserts', target: 'parts', omit: ['notes'] }, clientID: 7 }),
+  renamePart: runtime.mutation<RenamePartParameters, types.RenamePart, types.FixturePart>({ name: 'renamePart', method: 'PATCH', path: '/parts/{id}', pathParameters: ['id'], body: true, content: true, effect: { kind: 'upserts', target: 'parts', omit: ['notes'] } }),
   deletePart: runtime.mutation<DeletePartParameters, undefined, void>({ name: 'deletePart', method: 'DELETE', path: '/parts/{id}', pathParameters: ['id'], body: false, content: false, effect: { kind: 'removes', target: 'parts' } }),
   chargePart: runtime.mutation<ChargePartParameters, types.BillingRecord, types.BillingPart>({ name: 'chargePart', method: 'POST', path: '/billing/charges', pathParameters: [], body: true, content: true }),
   rebuild: runtime.mutation<RebuildParameters, undefined, types.PageNode>({ name: 'rebuild', method: 'POST', path: '/rebuild', pathParameters: [], body: false, content: true }),

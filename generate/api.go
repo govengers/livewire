@@ -225,7 +225,11 @@ func renderMutations(builder *strings.Builder, api *model, identifiers *identifi
 			mutation.method, api.basePath, mutation.path, mutation.status, mutation.name, argument, bodyArgument, response, mutation.name, passed, bodyPassed)
 		var extra string
 		if mutation.effect.Kind != "" {
-			extra += fmt.Sprintf(", effect: { kind: %s, target: %s }", quote(string(mutation.effect.Kind)), quote(mutation.effect.Target))
+			omit := ""
+			if details := api.details[mutation.effect.Target]; len(details) > 0 && mutation.effect.Kind == livewire.EffectUpserts {
+				omit = ", omit: " + stringArray(details) // the list rows carry no Detail field (D93)
+			}
+			extra += fmt.Sprintf(", effect: { kind: %s, target: %s%s }", quote(string(mutation.effect.Kind)), quote(mutation.effect.Target), omit)
 		}
 		switch mutation.clientID {
 		case livewire.UUIDv7:

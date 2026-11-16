@@ -61,6 +61,7 @@ func partFields() query.Fields {
 		{Name: "version", Type: query.TypeInteger, SQL: "parts.version", Filter: true, Sort: true},
 		{Name: "flag", Type: query.TypeBoolean, SQL: "parts.flag", Filter: true},
 		{Name: "extra", Type: query.TypeJSON, SQL: "parts.extra"},
+		{Name: "notes", Type: query.TypeText, SQL: "parts.notes", Search: true, Detail: true},
 	}
 }
 

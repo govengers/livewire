@@ -56,6 +56,14 @@ func TestResourceDeclarationErrors(t *testing.T) {
 		{name: "live resource with a guarded id", change: func(options *livewire.ResourceOptions[part]) {
 			options.Fields[0].Read = authorization.IsAdmin()
 		}, want: `the field "id" of a live resource cannot have a Read check`},
+		{name: "detail id", change: func(options *livewire.ResourceOptions[part]) { options.Fields[0].Detail = true }, want: `the field "id" cannot be a Detail field`},
+		{name: "detail item key", change: func(options *livewire.ResourceOptions[part]) {
+			options.Item.Field = "name"
+			options.Fields[1].Detail = true
+		}, want: `the item key field "name" cannot be a Detail field`},
+		{name: "detail field not in the item type", change: func(options *livewire.ResourceOptions[part]) {
+			options.Fields = append(options.Fields, query.Field{Name: "body", Type: query.TypeText, SQL: "parts.body", Search: true, Detail: true})
+		}, want: `no JSON field "body" (a Detail field is left out of list reads by it)`},
 		{name: "cursor without a uuid id", change: func(options *livewire.ResourceOptions[part]) {
 			options.Cursor = true
 			options.Fields[0] = query.Field{Name: "id", Type: query.TypeInteger, SQL: "parts.number", Filter: true, Sort: true}

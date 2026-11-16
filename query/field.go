@@ -54,6 +54,10 @@ type Field struct {
 	Filter bool
 	Sort   bool
 	Search bool
+	// Detail marks a field the item read carries and a list read leaves out (livewire's
+	// D93): a long text that must not travel with every row of a list. Filter, Sort and
+	// Search work on it as on any field, since they run in SQL; this package only stores it.
+	Detail bool
 	Read   func(context.Context) error
 	Write  func(context.Context) error
 }

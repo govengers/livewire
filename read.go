@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 
@@ -399,6 +400,14 @@ func loadPage(ctx context.Context, resource *Resource, parameters *ReadParameter
 	}
 	items, total, next := page.parts()
 	answer := listAnswer{items: items, limit: listQuery.Limit, offset: listQuery.Offset, total: total}
+	if details := resource.detailNames(); len(details) > 0 {
+		fields := resource.Fields()
+		answer.redact = func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+			hidden := hiddenFields(ctx, fields)
+			maps.Copy(hidden, details) // a Detail field is the item read's only (D93)
+			return stripItems(raw, hidden)
+		}
+	}
 	if resource.Cursor() && next != nil {
 		encoded, err := next.Encode()
 		if err != nil {

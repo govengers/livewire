@@ -88,7 +88,11 @@ func TestOpenAPIDocumentValidates(t *testing.T) {
 	}
 	parts := document.Paths.Find("/api/v1/parts")
 	require.Equal(t, map[string]any{"target": "parts", "ops": []any{"query", "subscribe"}}, parts.Get.Extensions["x-websocket"])
-	require.Equal(t, "#/components/schemas/FixturePartListResponse", parts.Get.Responses.Status(http.StatusOK).Value.Content["application/json"].Schema.Ref)
+	require.Equal(t, "#/components/schemas/PartsListItemListResponse", parts.Get.Responses.Status(http.StatusOK).Value.Content["application/json"].Schema.Ref)
+	listItem, item := document.Components.Schemas["PartsListItem"].Value, document.Components.Schemas["FixturePart"].Value
+	require.Contains(t, item.Properties, "notes", "the item read carries the Detail field")
+	require.NotContains(t, listItem.Properties, "notes", "a list row does not (D93)")
+	require.Len(t, listItem.Properties, len(item.Properties)-1)
 	require.Equal(t, map[string]any{"target": "createPart", "ops": []any{"call"}}, parts.Post.Extensions["x-websocket"])
 	require.NotNil(t, parts.Post.Responses.Status(http.StatusCreated).Value.Content["application/json"])
 	require.Equal(t, "#/components/schemas/PartsFilter", parts.Get.Parameters.GetByInAndName("query", "filter").Content["application/json"].Schema.Ref)
