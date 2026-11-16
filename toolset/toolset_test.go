@@ -353,6 +353,35 @@ func TestAReadPassesEveryArgumentAsAParameter(t *testing.T) {
 	require.JSONEq(t, `{"Body":"abc","Content":"def"}`, string(answer))
 }
 
+type taggedParameters struct {
+	Tags []string `query:"tags"`
+}
+
+func TestAListValueHoldsNoComma(t *testing.T) {
+	t.Parallel()
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{})
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(livewire.NewObject("tagged", "/tagged", &livewire.ObjectOptions[taggedParameters, taggedParameters]{
+		Read: authorization.IsUser(),
+		Load: func(_ context.Context, parameters *taggedParameters) (*taggedParameters, error) {
+			return parameters, nil
+		},
+	})))
+	engine, err := toolfixture.NewEngine(registry)
+	require.NoError(t, err)
+	catalogue, err := generate.NewCatalogue(registry, nil)
+	require.NoError(t, err)
+	tools, err := toolset.New(&toolset.Options{Engine: engine, Catalogue: catalogue, Agent: "assistant"})
+	require.NoError(t, err)
+	ctx := toolfixture.User(t.Context())
+	answer, err := tools.Call(ctx, "getTagged", json.RawMessage(`{"tags":["a","b"]}`), toolset.CallOptions{})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"Tags":["a","b"]}`, string(answer))
+	_, err = tools.Call(ctx, "getTagged", json.RawMessage(`{"tags":["a,b","c"]}`), toolset.CallOptions{})
+	refusal(t, err, livewire.CodeInvalidRequest)
+	require.ErrorContains(t, err, "tags: a list value holds no comma")
+}
+
 // search is an object and a mutation whose own parameter is named filterId, as the reserved
 // parameter of a filterable read is; the catalogue keeps it (D85 drops the reserved one only).
 type searchParameters struct {

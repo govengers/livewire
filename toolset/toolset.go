@@ -452,6 +452,10 @@ func (s source) add(name string, value json.RawMessage) error {
 		if err != nil {
 			return err
 		}
+		// The engine splits a list's values on commas (REST's form), so one element would become two.
+		if strings.Contains(text, ",") {
+			return errors.New("a list value holds no comma")
+		}
 		values = append(values, text)
 	}
 	s[name] = values
