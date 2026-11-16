@@ -308,12 +308,16 @@ type Unit struct {
 
 // UnitStarter begins a unit of work the engine runs on its own, outside a transport's request
 // (D92): every socket frame, subscription re-run and end, identity re-validation, socket open
-// and close, presence heartbeat, change feed failure, and each OutcomeAfterCommit report, on
-// REST too. It answers the context the unit runs on, the loaders, handlers, stores and the
-// Observer included, where the application puts its own unit (a wide event its database
-// tracer records db.* on, LOG-004), and a finish the engine calls once after the unit's last
-// outcome (nil for none), where the application ends it (emits the event). A transport's
-// request (REST, a toolset call) is no such unit: Engine.Read, Call, Batch, Upload, Export and
-// the stored filter methods run on the context they are given. It must not block and must be
-// safe for concurrent use.
+// and close, each presence leave at a socket's end, presence heartbeat, change feed failure,
+// and each OutcomeAfterCommit report, on REST too. It answers the context the unit runs on,
+// the loaders, handlers, stores and the Observer included, where the application puts its own
+// unit (a wide event its database tracer records db.* on, LOG-004), and a finish the engine
+// calls once after the unit's last outcome (nil for none), where the application ends it
+// (emits the event). A unit may end without any outcome: a re-run whose socket or
+// subscription ended, or whose identity is gone, during its work reports nothing (the socket's
+// close or the subscription's end does), so the application states the outcome of such a unit
+// itself. A StartUnit that panics is reported as a 500 outcome of the unit's kind, and the
+// unit runs on the context it came with. A transport's request (REST, a toolset call) is no
+// such unit: Engine.Read, Call, Batch, Upload, Export and the stored filter methods run on the
+// context they are given. It must not block and must be safe for concurrent use.
 type UnitStarter func(ctx context.Context, unit Unit) (context.Context, func())

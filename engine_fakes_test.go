@@ -552,6 +552,8 @@ type fakePresences struct {
 	heartbeats atomic.Int64
 	failLeave  atomic.Bool
 	failJoin   atomic.Bool
+	// leftIn are the units of work (unitKey) each Leave ran in, nil outside one.
+	leftIn []any
 	// blockSweep makes a Sweep wait for its context; sweepBlocked reports one waiting.
 	blockSweep   atomic.Bool
 	sweepBlocked chan struct{}
@@ -585,7 +587,10 @@ func (f *fakePresences) Join(_ context.Context, presence *livewire.Presence) err
 	return nil
 }
 
-func (f *fakePresences) Leave(_ context.Context, tenant, socket, target, key string) error {
+func (f *fakePresences) Leave(ctx context.Context, tenant, socket, target, key string) error {
+	f.mutex.Lock()
+	f.leftIn = append(f.leftIn, ctx.Value(unitKey{}))
+	f.mutex.Unlock()
 	if f.failLeave.Load() {
 		return errTestConnectionLost
 	}

@@ -187,3 +187,13 @@ func TestProbesMakeNoSpan(t *testing.T) {
 	require.Equal(t, "GET", spans[0].Name(), "an unmatched path is no part of the name")
 	require.Equal(t, codes.Unset, spans[0].Status().Code)
 }
+
+func TestAUnitWithoutAnOutcomeStillStatesOne(t *testing.T) {
+	var emitted []map[string]any
+	start := NewUnitStarter(wideevent.EmitterFunc(func(we *wideevent.Event) { emitted = append(emitted, we.FieldsMap()) }))
+	_, finish := start(t.Context(), livewire.Unit{Kind: livewire.OutcomeRerun, Target: "todos", Subscription: "s1"})
+	finish() // a re-run whose socket ended during its read: no outcome was observed
+	require.Len(t, emitted, 1)
+	require.Equal(t, wideevent.OutcomeSuccess, emitted[0][wideevent.KeyOutcome])
+	require.Equal(t, map[string]any{"kind": "rerun", "operation": "", "target": "todos", "subscription": "s1", "unanswered": true}, emitted[0]["livewire"])
+}

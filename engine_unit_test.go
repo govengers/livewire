@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -139,6 +140,11 @@ func TestAPanickingStartUnitCostsItsUnitOnly(t *testing.T) {
 	socket := bed.dial("ada")
 	require.True(t, socket.do(livewire.OperationQuery, "gadgets", nil, nil).OK)
 	require.True(t, socket.call("createGadget", nil, map[string]string{"name": "Anchor"}, "").OK, "the work runs on the context it came with")
+	require.Eventually(t, func() bool {
+		return outcomeWith(bed, livewire.OutcomeCall, func(outcome livewire.Outcome) bool {
+			return outcome.Status == http.StatusInternalServerError && outcome.Target == "createGadget" && outcome.Err != nil && strings.Contains(outcome.Err.Error(), "the unit starter panicked")
+		})
+	}, frameWait, time.Millisecond, "the panic is reported as a 500 of the unit's kind")
 
 	finishing := newTestbedWith(t, livewire.RegistryOptions{StartUnit: func(context.Context, livewire.Unit) (context.Context, func()) {
 		return nil, func() { panic("the finish panicked") }
@@ -147,4 +153,24 @@ func TestAPanickingStartUnitCostsItsUnitOnly(t *testing.T) {
 	answered := finishingSocket.do(livewire.OperationQuery, "gadgets", nil, nil)
 	require.True(t, answered.OK, "no context is the context the unit came with, a panicking finish is dropped")
 	require.Equal(t, http.StatusOK, answered.Status)
+}
+
+func TestTheLeavesOfAClosedSocketAreUnitsWithAnOutcome(t *testing.T) {
+	log := &unitLog{}
+	bed := newTestbedWith(t, livewire.RegistryOptions{StartUnit: log.start}, nil)
+	socket := bed.dial("ada")
+	require.True(t, socket.do(livewire.OperationJoin, "team", map[string]string{"team": "red", "key": "board"}, nil).OK)
+	require.NoError(t, socket.connection.Close())
+	require.Eventually(t, func() bool {
+		return outcomeWith(bed, livewire.OutcomeRequest, func(outcome livewire.Outcome) bool {
+			return outcome.Operation == livewire.OperationLeave && outcome.Status == http.StatusOK
+		})
+	}, frameWait, time.Millisecond, "a leave at the socket's end reports its outcome")
+	leave := log.unitOf(livewire.OutcomeRequest, livewire.OperationLeave, "team")
+	require.NotZero(t, leave, "a leave at the socket's end is a unit of its own")
+	bed.presences.mutex.Lock()
+	leftIn := slices.Clone(bed.presences.leftIn)
+	bed.presences.mutex.Unlock()
+	require.Equal(t, []any{leave}, leftIn, "the store's leave runs in the unit")
+	require.Eventually(t, func() bool { return log.isFinished(leave) }, frameWait, time.Millisecond)
 }

@@ -61,7 +61,7 @@ func startUnit(kind OutcomeKind, operation Operation, target string) unitOfWork 
 // (D92): the context it runs and is observed on, and the finish to call after its last
 // outcome. Its target is the closed set an outcome reports.
 func (e *Engine) begin(ctx context.Context, unit unitOfWork) (context.Context, func()) {
-	return e.registry.StartUnit(ctx, Unit{Kind: unit.kind, Operation: unit.operation, Target: e.reportedTarget(unit.target), Subscription: unit.subscription})
+	return e.registry.startUnit(ctx, Unit{Kind: unit.kind, Operation: unit.operation, Target: e.reportedTarget(unit.target), Subscription: unit.subscription})
 }
 
 // observeAlone reports a unit of work that is done once it is reported (a socket open or

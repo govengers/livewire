@@ -317,8 +317,9 @@ func (s *socket) leaveRecord(ctx context.Context, record presenceRecord) error {
 	return nil
 }
 
-// leavePresences removes the presences of an ended socket; a failed leave is reported and
-// the sweep removes the row after PresenceExpiry.
+// leavePresences removes the presences of an ended socket, each leave a unit of work of its
+// own (D92) with its outcome, as a leave frame's; after a failed leave the sweep removes the
+// row after PresenceExpiry.
 func (s *socket) leavePresences() {
 	s.presenceMutex.Lock()
 	defer s.presenceMutex.Unlock()
@@ -331,14 +332,19 @@ func (s *socket) leavePresences() {
 	if len(records) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), leaveTimeout)
+	ctx, cancel := context.WithTimeout(auth.WithIdentity(context.WithoutCancel(s.ctx), s.lastIdentity()), leaveTimeout)
 	defer cancel()
 	for _, record := range records {
-		unit := startUnit(OutcomeRequest, OperationLeave, record.target)
-		if err := s.leaveRecord(ctx, record); err != nil {
-			s.observe(unit, err)
-		}
+		s.leaveAtEnd(ctx, record)
 	}
+}
+
+// leaveAtEnd is one leave of leavePresences: begun before the store runs, observed, finished.
+func (s *socket) leaveAtEnd(ctx context.Context, record presenceRecord) {
+	unit := startUnit(OutcomeRequest, OperationLeave, record.target)
+	ctx, finish := s.engine.begin(WithTenant(ctx, record.tenant), unit)
+	defer finish()
+	s.engine.observe(ctx, unit.outcome(ctx, s.leaveRecord(ctx, record)))
 }
 
 func (s *socket) hasPresences() bool {
