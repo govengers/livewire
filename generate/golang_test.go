@@ -201,14 +201,18 @@ func TestGoIdentifiersSpellInitialismsInOneCase(t *testing.T) {
 				{Name: "ownerId", Type: query.TypeUUID, SQL: "keys.owner_id", Filter: true, Sort: true},
 			},
 			Item: &livewire.ItemKey{Parameter: "keyId", Field: "id"},
-			List: func(context.Context, *query.ListQuery) (*livewire.Page[fixture.Part], error) { return &livewire.Page[fixture.Part]{}, nil },
-			Get:  func(context.Context, *query.ListQuery) (*fixture.Part, error) { return &fixture.Part{}, nil },
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[fixture.Part], error) {
+				return &livewire.Page[fixture.Part]{}, nil
+			},
+			Get: func(context.Context, *query.ListQuery) (*fixture.Part, error) { return &fixture.Part{}, nil },
 		}),
 		livewire.NewMutation("createApiKey", http.MethodPost, "/api-keys/{userId}", &livewire.MutationOptions[struct {
 			UserID string `path:"userId"`
 		}, livewire.NoBody, fixture.Part]{
-			Check:  authorization.IsUser(),
-			Handle: func(context.Context, *struct{ UserID string `path:"userId"` }, *livewire.NoBody) (*fixture.Part, error) { return &fixture.Part{}, nil },
+			Check: authorization.IsUser(),
+			Handle: func(context.Context, *struct {
+				UserID string `path:"userId"`
+			}, *livewire.NoBody) (*fixture.Part, error) { return &fixture.Part{}, nil },
 		}),
 	))
 	directory := t.TempDir()
