@@ -1,6 +1,6 @@
 # Testing
 
-`livewiretest` holds the contract gates an application's test suite runs (D23, D70). Each drives the application as its clients do: `livewiretest.Application{Engine, Handler, SocketPath}` is the application's own router, with its authentication, its REST routes and its socket, served on a local test server, and an `Authenticate func(*http.Request)` makes every request and the socket's upgrade the fixture identity's (an API key header, a session cookie). Run them on the wiring `main` builds, on a real database: [examples/todo/cmd/todo](../../examples/todo/cmd/todo) runs `newApplication` on embedded PostgreSQL, one server per test binary and a database per test cloned from a migrated template.
+`livewiretest` holds the contract gates an application's test suite runs (D23, D70). Each drives the application as its clients do: `livewiretest.Application{Engine, Handler, SocketPath}` is the application's own router, with its authentication, its REST routes and its socket, served on a local test server, and an `Authenticate func(*http.Request)` makes every request and the socket's upgrade the fixture identity's (an API key header, a session cookie). Run them on the wiring `main` builds, on a real database: [examples/todo/cmd/todo](../../examples/todo/cmd/todo) runs `newApplication` on embedded PostgreSQL through [govengers/postgrestest](https://github.com/govengers/postgrestest), one server per test binary and a database per test copied from a migrated template.
 
 ## GeneratedIsCurrent
 
