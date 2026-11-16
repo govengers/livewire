@@ -7,7 +7,7 @@ oasdiff := "go run github.com/oasdiff/oasdiff@v1.35.0"
 coverage_threshold := "80"
 # The nested modules of the agent adapters (D87): each keeps its dependency (aikido, the MCP SDK) out of livewire's go.mod
 adapters := "aikidoadapter mcpadapter"
-excluded := "/examples/|/test/|/generate/internal/fixture/|/internal/toolfixture/"
+excluded := "/examples/|/test/|/generate/internal/fixture/|/internal/toolfixture/|/internal/postgrestest/"
 # CI (GitHub sets CI) has bun: the TypeScript parts of the e2e suite fail there instead of skipping
 require_typescript := if env_var_or_default("CI", "") != "" { "LIVEWIRE_REQUIRE_TYPESCRIPT=1" } else { "" }
 
@@ -23,17 +23,19 @@ lint: && openapi-breaking
     cd examples/todo && go vet ./... && golangci-lint run ./...
     for module in {{adapters}}; do (cd "$module" && go vet ./... && golangci-lint run ./...); done
 
-# Unit tests with the race detector; fails below the coverage threshold (examples, the e2e suite and the generator's fixture with its generated clients excluded); then the example's and the adapters' tests
+# Unit tests with the race detector, cached by go test (TST-014): a rerun runs only the packages whose test binary or inputs changed;
+# fails below the coverage threshold (examples, the e2e suite, the test harnesses and the generator's fixture with its generated clients excluded);
+# then the example's and the adapters' tests. The TypeScript gates, whose inputs the cache cannot see, are test-typescript's
 test: && test-example test-adapters
     mkdir -p sandbox
-    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -count=1 -coverprofile=sandbox/unit.raw.cover ./...
+    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -coverprofile=sandbox/unit.raw.cover ./...
     grep -v -E '{{excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
     go tool cover -func=sandbox/unit.cover > sandbox/unit.func
     awk -v threshold={{coverage_threshold}} '/^total:/ { found = 1; sub("%", "", $3); print "coverage " $3 "%"; if ($3 + 0 < threshold) { print "coverage is below " threshold "%"; exit 1 } } END { if (!found) { print "no coverage total"; exit 1 } }' sandbox/unit.func
 
-# The example application's tests (a module of its own, examples/todo): the contract gates, the generated Go client and CLI against it, the frontend's type check
+# The example application's tests (a module of its own, examples/todo): the contract gates, the generated Go client and CLI against it; cached by go test
 test-example:
-    cd examples/todo && {{require_typescript}} go test -race -count=1 ./...
+    cd examples/todo && go test -race ./...
 
 # The agent adapters' tests (modules of their own), cached by go test: they read nothing the cache cannot see
 test-adapters:
@@ -43,10 +45,12 @@ test-adapters:
 adapters-against version:
     for module in {{adapters}}; do copy="$(mktemp -d)"; cp -R "$module/." "$copy"; (cd "$copy" && go mod edit -dropreplace=github.com/govengers/livewire -require=github.com/govengers/livewire@{{version}} && go mod tidy && go vet ./... && go test ./...) || { rm -rf "$copy"; echo "$module does not build against livewire {{version}}"; exit 1; }; rm -rf "$copy"; done
 
-# The TypeScript gates of the generator (tsc on the generated client, the runtime's bun tests), failing without bun
+# The TypeScript gates (tsc on the generated client, the runtime's bun tests, the example frontend's type check), failing without bun;
+# never cached (-count=1): go test cannot see the files bun reads, so CI runs them on every push
 test-typescript:
     cd generate/runtime && bun install --frozen-lockfile
     LIVEWIRE_REQUIRE_TYPESCRIPT=1 go test -count=1 -run 'TestGeneratedTypeScriptTypeChecks|TestRuntimeUnitTests' ./generate/
+    cd examples/todo && LIVEWIRE_REQUIRE_TYPESCRIPT=1 go test -race -count=1 -run TestTheFrontendTypeChecks ./cmd/todo/
 
 # End-to-end: two engines on one embedded Postgres, the TypeScript runtime driven by bun (build tag e2e), then the example's SQL check chain; without bun the TypeScript parts skip, except in CI
 test-e2e: && db-check-example
@@ -80,4 +84,4 @@ vulncheck:
     for module in {{adapters}}; do (cd "$module" && {{govulncheck}} ./...); done
 
 # Everything CI runs
-check: lint test test-e2e vulncheck
+check: lint test test-typescript test-e2e vulncheck
