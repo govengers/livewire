@@ -211,8 +211,10 @@ func TestGoIdentifiersSpellInitialismsInOneCase(t *testing.T) {
 			Get: func(context.Context, *query.ListQuery) (*fixture.Part, error) { return &fixture.Part{}, nil },
 		}),
 		livewire.NewMutation("createApiKey", http.MethodPost, "/api-keys/{userId}", &livewire.MutationOptions[userParameters, livewire.NoBody, fixture.Part]{
-			Check:  authorization.IsUser(),
-			Handle: func(context.Context, *userParameters, *livewire.NoBody) (*fixture.Part, error) { return &fixture.Part{}, nil },
+			Check: authorization.IsUser(),
+			Handle: func(context.Context, *userParameters, *livewire.NoBody) (*fixture.Part, error) {
+				return &fixture.Part{}, nil
+			},
 		}),
 	))
 	directory := t.TempDir()
