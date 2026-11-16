@@ -15,6 +15,7 @@ import (
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/generate"
 	"github.com/govengers/livewire/internal/toolfixture"
+	"github.com/govengers/livewire/query"
 )
 
 // compileSchema compiles a tool schema as JSON Schema draft 2020-12, which every one must be.
@@ -133,6 +134,12 @@ func TestTheSchemasAreJSONSchemaNotOpenAPI(t *testing.T) {
 	require.NotContains(t, string(tool.Result), "guarded")
 }
 
+// search is the item of a versioned resource with a history.
+type search struct {
+	ID      string `json:"id"`
+	Version int    `json:"version"`
+}
+
 func TestTheCatalogueRefusesWhatAModelCannotCall(t *testing.T) {
 	t.Parallel()
 	mutation := func(name string) livewire.Declaration {
@@ -165,6 +172,30 @@ func TestTheCatalogueRefusesWhatAModelCannotCall(t *testing.T) {
 	require.Error(t, err)
 	_, err = generate.NewCatalogue(long, &generate.CatalogueOptions{Enums: []generate.Enum{{}}})
 	require.Error(t, err)
+}
+
+// TestTheCatalogueRefusesAReadParameterNamedLikeAReservedOne: REST keeps a history's item key
+// (path) and its reserved parameters (query) apart, a tool's arguments are one object.
+func TestTheCatalogueRefusesAReadParameterNamedLikeAReservedOne(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{livewire.ParameterFilterID, livewire.ParameterFilter, livewire.ParameterSort, livewire.ParameterLimit, livewire.ParameterOffset} {
+		registry, err := livewire.NewRegistry(&livewire.RegistryOptions{})
+		require.NoError(t, err)
+		require.NoError(t, registry.Add(livewire.NewResource("searches", "/searches", &livewire.ResourceOptions[search]{
+			Read: authorization.IsUser(), Versioned: true,
+			Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "searches.id", Filter: true, Sort: true}},
+			Item:   &livewire.ItemKey{Parameter: key, Field: "id"},
+			List: func(context.Context, *query.ListQuery) (*livewire.Page[search], error) {
+				return &livewire.Page[search]{}, nil
+			},
+			Get: func(context.Context, *query.ListQuery) (*search, error) { return &search{}, nil },
+			History: func(context.Context, *query.ListQuery) (*livewire.Page[livewire.Version[search]], error) {
+				return &livewire.Page[livewire.Version[search]]{}, nil
+			},
+		})), key)
+		_, err = generate.NewCatalogue(registry, nil)
+		require.ErrorContains(t, err, `getSearchesHistory: the parameter "`+key+`" is also a reserved parameter`, "the history's item key and its reserved parameter share one argument")
+	}
 }
 
 func TestRenderWritesTheCatalogueFile(t *testing.T) {

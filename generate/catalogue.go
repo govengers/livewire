@@ -170,6 +170,9 @@ func describeTools(api *model) ([]Tool, error) {
 	document := newOpenAPI(api)
 	var tools []Tool
 	for _, read := range api.reads {
+		if err := document.refuseReservedNames(read); err != nil {
+			return nil, err
+		}
 		properties, required := document.argumentProperties(read.parameters, read.reserved)
 		tools = append(tools, Tool{
 			Name: read.functionName(), Description: describeReadTool(read), Kind: ToolRead,
@@ -178,45 +181,18 @@ func describeTools(api *model) ([]Tool, error) {
 		})
 	}
 	for _, mutation := range api.mutations {
-		properties, required := document.argumentProperties(mutation.parameters, reservedModel{})
-		tool := Tool{
-			Name: mutation.name, Description: describeMutationTool(mutation), Kind: ToolMutation, Mutating: true,
-			Target: mutation.name, Method: mutation.method, Path: api.basePath + mutation.path,
-			Result: json.RawMessage(`{"type":"null"}`),
-		}
-		if err := refuseArgumentNames(mutation.name, properties); err != nil {
+		tool, err := document.mutationTool(api.basePath, mutation)
+		if err != nil {
 			return nil, err
 		}
-		if mutation.body != nil {
-			body := document.schema(mutation.body)
-			properties[ArgumentBody], required = body, append(required, ArgumentBody)
-			tool.Body = document.toolSchema(body)
-		}
-		if mutation.response != nil {
-			tool.Result = document.toolSchema(document.schema(mutation.response))
-		}
-		tool.Parameters = document.toolSchema(argumentsSchema(properties, required))
 		tools = append(tools, tool)
 	}
 	for _, upload := range api.uploads {
-		properties, required := document.argumentProperties(upload.parameters, reservedModel{})
-		if err := refuseArgumentNames(upload.name, properties); err != nil {
+		tool, err := document.uploadTool(api.basePath, upload)
+		if err != nil {
 			return nil, err
 		}
-		properties[ArgumentContent] = object{"type": "string", "description": "The file: its text as it is, or its bytes in base64 with contentEncoding base64; at most " + strconv.FormatInt(upload.maximumBytes, 10) + " bytes."}
-		properties[ArgumentContentType] = object{"type": "string", "enum": upload.contentTypes, "description": "The file's content type."}
-		required = append(required, ArgumentContent, ArgumentContentType)
-		encoding := object{"type": "string", "enum": []string{ContentText, ContentBase64}, "description": "How content is written; text by default."}
-		if slices.ContainsFunc(upload.contentTypes, func(contentType string) bool { return !strings.HasPrefix(contentType, "text/") }) {
-			encoding["description"], required = "How content is written; required, since a file of a type that is not text/* travels in base64.", append(required, ArgumentContentEncoding)
-		}
-		properties[ArgumentContentEncoding] = encoding
-		tools = append(tools, Tool{
-			Name: upload.name, Description: describeUploadTool(upload), Kind: ToolUpload, Mutating: true,
-			Target: upload.name, Method: http.MethodPost, Path: api.basePath + upload.path,
-			Parameters: document.toolSchema(argumentsSchema(properties, required)),
-			Result:     document.toolSchema(document.schema(upload.response)),
-		})
+		tools = append(tools, tool)
 	}
 	if document.err != nil {
 		return nil, document.err
@@ -229,11 +205,70 @@ func describeTools(api *model) ([]Tool, error) {
 	return tools, nil
 }
 
+// mutationTool is a mutation's tool: its parameters, its body under body.
+func (o *openAPI) mutationTool(basePath string, mutation *mutationModel) (Tool, error) {
+	properties, required := o.argumentProperties(mutation.parameters, reservedModel{})
+	if err := refuseArgumentNames(mutation.name, properties); err != nil {
+		return Tool{}, err
+	}
+	tool := Tool{
+		Name: mutation.name, Description: describeMutationTool(mutation), Kind: ToolMutation, Mutating: true,
+		Target: mutation.name, Method: mutation.method, Path: basePath + mutation.path,
+		Result: json.RawMessage(`{"type":"null"}`),
+	}
+	if mutation.body != nil {
+		body := o.schema(mutation.body)
+		properties[ArgumentBody], required = body, append(required, ArgumentBody)
+		tool.Body = o.toolSchema(body)
+	}
+	if mutation.response != nil {
+		tool.Result = o.toolSchema(o.schema(mutation.response))
+	}
+	tool.Parameters = o.toolSchema(argumentsSchema(properties, required))
+	return tool, nil
+}
+
+// uploadTool is an upload's tool: its parameters, the file as content, contentType and
+// contentEncoding.
+func (o *openAPI) uploadTool(basePath string, upload *uploadModel) (Tool, error) {
+	properties, required := o.argumentProperties(upload.parameters, reservedModel{})
+	if err := refuseArgumentNames(upload.name, properties); err != nil {
+		return Tool{}, err
+	}
+	properties[ArgumentContent] = object{"type": "string", "description": "The file: its text as it is, or its bytes in base64 with contentEncoding base64; at most " + strconv.FormatInt(upload.maximumBytes, 10) + " bytes."}
+	properties[ArgumentContentType] = object{"type": "string", "enum": upload.contentTypes, "description": "The file's content type."}
+	required = append(required, ArgumentContent, ArgumentContentType)
+	encoding := object{"type": "string", "enum": []string{ContentText, ContentBase64}, "description": "How content is written; text by default."}
+	if slices.ContainsFunc(upload.contentTypes, func(contentType string) bool { return !strings.HasPrefix(contentType, "text/") }) {
+		encoding["description"], required = "How content is written; required, since a file of a type that is not text/* travels in base64.", append(required, ArgumentContentEncoding)
+	}
+	properties[ArgumentContentEncoding] = encoding
+	return Tool{
+		Name: upload.name, Description: describeUploadTool(upload), Kind: ToolUpload, Mutating: true,
+		Target: upload.name, Method: http.MethodPost, Path: basePath + upload.path,
+		Parameters: o.toolSchema(argumentsSchema(properties, required)),
+		Result:     o.toolSchema(o.schema(upload.response)),
+	}, nil
+}
+
 // refuseArgumentNames refuses a parameter that the members of a body or file would shadow.
 func refuseArgumentNames(name string, properties object) error {
 	for _, reserved := range []string{ArgumentBody, ArgumentContent, ArgumentContentType, ArgumentContentEncoding} {
 		if _, taken := properties[reserved]; taken {
 			return fmt.Errorf("generate: %s: the parameter %q is the tool argument of the body or file (D85); rename it", name, reserved)
+		}
+	}
+	return nil
+}
+
+// refuseReservedNames refuses a read's parameter named like one of its reserved ones (a
+// history's item key named sort, say): on REST one is a path segment and the other a query
+// value, but a tool's arguments are one object, so one value would reach both.
+func (o *openAPI) refuseReservedNames(read *readModel) error {
+	for _, reserved := range o.parameters(nil, read.reserved) {
+		name, _ := reserved["name"].(string)
+		if slices.ContainsFunc(read.parameters, func(declared parameterModel) bool { return declared.name == name }) {
+			return fmt.Errorf("generate: %s: the parameter %q is also a reserved parameter of the read, and a tool's arguments hold one value per name (D85); rename it", read.functionName(), name)
 		}
 	}
 	return nil
