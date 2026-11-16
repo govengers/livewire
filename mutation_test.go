@@ -385,7 +385,7 @@ func TestMutationRequiredValidation(t *testing.T) {
 	fields := requireError(t, err, http.StatusBadRequest, livewire.CodeInvalidRequest, "email")
 	require.Equal(t, map[string]string{"email": "required", "address.city": "required"}, fields)
 
-	_, err = mutation.DecodeBody(userContext(), []byte(`{"email":"a@b.de","address":{"city":"Stuttgart"}}`))
+	_, err = mutation.DecodeBody(userContext(), []byte(`{"email":"a@example.com","address":{"city":"Springfield"}}`))
 	require.NoError(t, err)
 }
 
