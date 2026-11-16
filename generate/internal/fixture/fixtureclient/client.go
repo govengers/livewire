@@ -8,7 +8,6 @@ package fixtureclient
 import (
 	"context"
 	"encoding/json"
-	"encoding/json/jsontext"
 	"io"
 	"time"
 
@@ -126,7 +125,7 @@ type PartsListItem struct {
 	Version     int                `json:"version"`
 	Expires     time.Time          `json:"expires,omitzero"`
 	Started     time.Time          `json:"started,omitempty"`
-	Extra       jsontext.Value     `json:"extra"`
+	Extra       json.RawMessage    `json:"extra"`
 	Anything    any                `json:"anything"`
 	Payload     fixture.Raw        `json:"payload"`
 	Code        fixture.Code       `json:"code"`

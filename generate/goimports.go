@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/format"
 	"go/token"
@@ -113,6 +114,8 @@ func (f *goFile) importLine(path string) string {
 	return strconv.Quote(path)
 }
 
+var rawMessageType = reflect.TypeFor[json.RawMessage]()
+
 // expression is the Go type expression of goType, which names every struct it reaches.
 func (f *goFile) expression(goType reflect.Type) (string, error) {
 	return f.typeExpression(goType, false)
@@ -186,8 +189,12 @@ func (f *goFile) structExpression(goType reflect.Type) (string, error) {
 // with the alias of its package, a generic instance with its type arguments, which reflect
 // knows only by their text.
 func (f *goFile) named(goType reflect.Type) (string, error) {
-	if goType.PkgPath() == "" {
+	switch {
+	case goType.PkgPath() == "":
 		return goType.Name(), nil
+	case goType == rawMessageType:
+		// since Go 1.27 an alias of jsontext.Value, which Go 1.26 builds only with GOEXPERIMENT=jsonv2
+		return f.use("encoding/json", "json") + ".RawMessage", nil
 	}
 	if err := f.importable(goType.PkgPath(), goType.Name(), goType.String()); err != nil {
 		return "", err
