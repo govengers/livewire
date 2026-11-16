@@ -3,17 +3,15 @@ package query_test
 import (
 	"context"
 	"fmt"
-	"io"
-	"net"
 	"strings"
 	"testing"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 
+	"github.com/govengers/livewire/internal/postgrestest"
 	"github.com/govengers/livewire/query"
 )
 
@@ -83,23 +81,17 @@ var (
 	}}
 )
 
+// startPostgres starts the test binary's one PostgreSQL (TestPostgresSemantics is its only
+// user) and returns a connection with the schema applied.
 func startPostgres(t *testing.T) *pgx.Conn {
 	t.Helper()
-	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := listener.Addr().(*net.TCPAddr).Port
-	require.NoError(t, listener.Close())
-
-	database := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Port(uint32(port)). //nolint:gosec // G115: a TCP port fits a uint32
-		RuntimePath(t.TempDir()).
-		Logger(io.Discard))
-	if err := database.Start(); err != nil {
+	server, err := postgrestest.Start()
+	if err != nil {
 		t.Skipf("embedded postgres did not start (download or platform): %v", err)
 	}
-	t.Cleanup(func() { require.NoError(t, database.Stop()) })
+	t.Cleanup(func() { require.NoError(t, server.Stop()) })
 
-	connection, err := pgx.Connect(t.Context(), fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/postgres", port))
+	connection, err := pgx.Connect(t.Context(), server.URL("postgres"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = connection.Close(context.Background()) }) // the database stops right after; the close error carries nothing
 	_, err = connection.Exec(t.Context(), schema)

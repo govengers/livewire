@@ -6,15 +6,11 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"path/filepath"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/govengers/auth/password"
@@ -36,6 +31,7 @@ import (
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/client"
+	"github.com/govengers/livewire/internal/postgrestest"
 
 	"github.com/govengers/livewire/examples/todo/client/todoclient"
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
@@ -50,7 +46,7 @@ import (
 const testPassword = "correct horse battery staple"
 
 var postgres struct {
-	port     int
+	server   *postgrestest.Server
 	mutex    sync.Mutex // CREATE DATABASE ... TEMPLATE refuses a template another clone reads
 	sequence atomic.Int64
 }
@@ -63,32 +59,12 @@ func TestMain(m *testing.M) {
 }
 
 func runTests(m *testing.M) int {
-	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	server, err := postgrestest.Start()
 	if err != nil {
-		return failed("pick a port", err)
-	}
-	postgres.port = listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		return failed("free the port", err)
-	}
-	runtimePath, err := os.MkdirTemp("", "todo-example-")
-	if err != nil {
-		return failed("create the runtime directory", err)
-	}
-	defer func() { _ = os.RemoveAll(runtimePath) }() // a temporary directory; a leftover is harmless
-	server := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Port(uint32(postgres.port)). //nolint:gosec // G115: a TCP port fits a uint32
-		Version(embeddedpostgres.V18).
-		RuntimePath(runtimePath).
-		// ponytail: the binaries are extracted once per machine and version (xz under -race takes a
-		// minute); a run killed mid-extraction leaves a broken directory, which deleting it repairs.
-		BinariesPath(binariesPath()).
-		Logger(io.Discard))
-	if err := server.Start(); err != nil {
 		return failed("start embedded postgres", err)
 	}
-	defer func() { _ = server.Stop() }()      // the result is decided; a failed stop changes nothing
-	http.DefaultClient.CloseIdleConnections() // the binaries' download would outlive the tests
+	defer func() { _ = server.Stop() }() // the result is decided; a failed stop changes nothing
+	postgres.server = server
 	if err := migrateTemplate(); err != nil {
 		return failed("migrate the template database", err)
 	}
@@ -101,28 +77,12 @@ func runTests(m *testing.M) int {
 	return code
 }
 
-// binariesPath is where the PostgreSQL binaries are extracted: per embedded-postgres module
-// version and PostgreSQL version, so an upgrade of either extracts afresh.
-func binariesPath() string {
-	module := "unknown"
-	if build, ok := debug.ReadBuildInfo(); ok {
-		for _, dependency := range build.Deps {
-			if dependency.Path == "github.com/fergusstrange/embedded-postgres" {
-				module = dependency.Version
-			}
-		}
-	}
-	return filepath.Join(os.TempDir(), "livewire-todo-postgres-"+module+"-"+string(embeddedpostgres.V18))
-}
-
 func failed(what string, err error) int {
 	fmt.Fprintf(os.Stderr, "todo tests: %s: %v\n", what, err)
 	return 1
 }
 
-func databaseURL(name string) string {
-	return fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/%s", postgres.port, name)
-}
+func databaseURL(name string) string { return postgres.server.URL(name) }
 
 // migrateTemplate runs the application's migrations on the template database.
 func migrateTemplate() error {

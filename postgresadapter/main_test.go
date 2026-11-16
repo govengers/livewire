@@ -3,9 +3,6 @@ package postgresadapter_test
 import (
 	"context"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"sync"
@@ -13,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
+	"github.com/govengers/livewire/internal/postgrestest"
 	"github.com/govengers/livewire/postgresadapter"
 )
 
@@ -44,7 +41,7 @@ CREATE TABLE orders_us PARTITION OF orders FOR VALUES IN ('us');
 // postgres is the one embedded server of this test binary (TST-002): every test gets a
 // database of its own, cloned from the migrated template.
 var postgres struct {
-	port     int
+	server   *postgrestest.Server
 	mutex    sync.Mutex // CREATE DATABASE ... TEMPLATE refuses a template that another clone reads
 	sequence atomic.Int64
 }
@@ -56,30 +53,12 @@ func TestMain(m *testing.M) {
 }
 
 func run(m *testing.M) int {
-	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	server, err := postgrestest.Start()
 	if err != nil {
-		return fail("pick a port", err)
-	}
-	postgres.port = listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		return fail("free the port", err)
-	}
-	runtimePath, err := os.MkdirTemp("", "livewire-postgresadapter-")
-	if err != nil {
-		return fail("create the runtime directory", err)
-	}
-	defer func() { _ = os.RemoveAll(runtimePath) }() // a temporary directory; a leftover is harmless
-	server := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Port(uint32(postgres.port)). //nolint:gosec // G115: a TCP port fits a uint32
-		RuntimePath(runtimePath).
-		Logger(io.Discard))
-	if err := server.Start(); err != nil {
 		return fail("start embedded postgres", err)
 	}
 	defer func() { _ = server.Stop() }() // the test result is decided; a failed stop changes nothing
-	// A first start downloads the binaries over the default client, whose idle connection
-	// would otherwise outlive the tests and fail goleak.
-	http.DefaultClient.CloseIdleConnections()
+	postgres.server = server
 	if err := migrateTemplate(); err != nil {
 		return fail("migrate the template database", err)
 	}
@@ -97,9 +76,7 @@ func fail(what string, err error) int {
 	return 1
 }
 
-func dsn(database string) string {
-	return fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/%s", postgres.port, database)
-}
+func dsn(database string) string { return postgres.server.URL(database) }
 
 // migrateTemplate applies every SQL text of the package, as an application's migrations
 // would, to the template database.
