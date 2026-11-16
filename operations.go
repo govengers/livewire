@@ -57,28 +57,37 @@ func (s *socket) start(frame *RequestFrame) {
 	s.spawn(func() {
 		defer release()
 		unit := startUnit(OutcomeRequest, frame.Operation, frame.Target)
-		if err := recovering(func() error { s.run(frame, release); return nil }); err != nil {
-			s.observe(unit, err)
+		ctx, finish := s.engine.begin(s.ctx, startUnit(frameKinds[frame.Operation], frame.Operation, frame.Target))
+		defer finish()
+		if err := recovering(func() error { s.run(ctx, frame, release); return nil }); err != nil {
+			s.engine.observe(ctx, unit.outcome(auth.WithIdentity(ctx, s.lastIdentity()), err))
 			release()
 			s.respondError(frame.ID, err)
 		}
 	})
 }
 
-// run re-validates the identity, runs the op under it, gives the op's in-flight slot back
-// and answers. A subscribe answers itself, together with its first push, and releases the
-// slot before it queues them.
-func (s *socket) run(frame *RequestFrame, release func()) {
+// frameKinds are the kinds of the work of the ops that run on their own, as their outcomes
+// report it (Unit.Kind); a refusal before the op ran reports OutcomeRequest.
+var frameKinds = map[Operation]OutcomeKind{
+	OperationQuery: OutcomeRequest, OperationJoin: OutcomeRequest, OperationLeave: OutcomeRequest,
+	OperationSubscribe: OutcomeSubscribe, OperationCall: OutcomeCall, OperationBatch: OutcomeBatch,
+}
+
+// run re-validates the identity, runs the op under it on ctx (the frame's unit, D92), gives
+// the op's in-flight slot back and answers. A subscribe answers itself, together with its
+// first push, and releases the slot before it queues them.
+func (s *socket) run(ctx context.Context, frame *RequestFrame, release func()) {
 	unit := startUnit(OutcomeRequest, frame.Operation, frame.Target)
-	metered := withQueryWait(s.ctx)
+	metered := withQueryWait(ctx)
 	identity, err := s.freshIdentity(metered)
 	if err != nil {
-		s.observe(unit, err)
+		s.engine.observe(ctx, unit.outcome(auth.WithIdentity(ctx, s.lastIdentity()), err))
 		release()
 		s.respondError(frame.ID, err)
 		return
 	}
-	ctx := auth.WithIdentity(metered, identity)
+	ctx = auth.WithIdentity(metered, identity)
 	status, payload := http.StatusOK, json.RawMessage(nil)
 	switch frame.Operation {
 	case OperationSubscribe:
@@ -343,6 +352,8 @@ func (e *Engine) refreshPresences(ctx context.Context) {
 		return
 	}
 	unit := startUnit(OutcomeHeartbeat, "", "")
+	ctx, finish := e.begin(ctx, unit)
+	defer finish()
 	e.mutex.Lock()
 	open := e.openSockets()
 	e.mutex.Unlock()

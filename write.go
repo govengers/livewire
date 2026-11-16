@@ -254,7 +254,8 @@ func (e *Engine) batch(ctx context.Context, operation Operation, request BatchRe
 		return redactBatch(ctx, prepared, answer.payload)
 	}
 	for _, call := range prepared {
-		e.observe(ctx, Outcome{Kind: OutcomeAfterCommit, Target: call.mutation.Name(), Tenant: call.tenant, Identity: auth.IdentityFrom(ctx), Parameters: call.parameters, Status: call.mutation.Status()})
+		committed := Outcome{Kind: OutcomeAfterCommit, Target: call.mutation.Name(), Tenant: call.tenant, Identity: auth.IdentityFrom(ctx), Parameters: call.parameters, Status: call.mutation.Status()}
+		e.observeAlone(ctx, startUnit(OutcomeAfterCommit, "", committed.Target), committed)
 	}
 	return answer.payload, nil
 }
@@ -499,7 +500,7 @@ func (e *Engine) observeWrite(ctx context.Context, unit unitOfWork, parameters a
 	if err == nil && !answer.replayed {
 		committed := outcome
 		committed.Kind, committed.Operation, committed.Err, committed.Duration = OutcomeAfterCommit, "", nil, 0
-		e.observe(ctx, committed)
+		e.observeAlone(ctx, startUnit(OutcomeAfterCommit, "", committed.Target), committed)
 	}
 }
 

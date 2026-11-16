@@ -278,7 +278,7 @@ func (e *Engine) consumeFeed(ctx context.Context) {
 		if err == nil {
 			err = errors.New("livewire: the change feed returned before its context ended")
 		}
-		e.observe(ctx, Outcome{Kind: OutcomeFeed, Status: http.StatusInternalServerError, Err: err, Duration: time.Since(started)})
+		e.observeAlone(ctx, startUnit(OutcomeFeed, "", ""), Outcome{Kind: OutcomeFeed, Status: http.StatusInternalServerError, Err: err, Duration: time.Since(started)})
 		select {
 		case <-ctx.Done():
 			return
@@ -311,7 +311,7 @@ func (e *Engine) tick(ctx context.Context) {
 			work = func() { e.refreshPresences(ctx) }
 		}
 		if err := recovering(func() error { work(); return nil }); err != nil {
-			e.observe(ctx, Outcome{Kind: OutcomeHeartbeat, Status: http.StatusInternalServerError, Err: err})
+			e.observeAlone(ctx, startUnit(OutcomeHeartbeat, "", ""), Outcome{Kind: OutcomeHeartbeat, Status: http.StatusInternalServerError, Err: err})
 		}
 	}
 }

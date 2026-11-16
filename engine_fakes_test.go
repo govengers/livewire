@@ -279,9 +279,11 @@ type fakeTransactor struct {
 	// described are the calls of batches described to their transaction (CallDescriber).
 	described    []livewire.TransactionDetails
 	failDescribe atomic.Bool
+	// units holds, per Begin, the unit of work its context carried (unitKey).
+	units []any
 }
 
-func (f *fakeTransactor) Begin(_ context.Context, details livewire.TransactionDetails) (livewire.Transaction, error) {
+func (f *fakeTransactor) Begin(ctx context.Context, details livewire.TransactionDetails) (livewire.Transaction, error) {
 	if f.failBegin.Load() {
 		return nil, errors.New("the pool is exhausted")
 	}
@@ -290,6 +292,7 @@ func (f *fakeTransactor) Begin(_ context.Context, details livewire.TransactionDe
 	}
 	f.mutex.Lock()
 	f.details = append(f.details, details)
+	f.units = append(f.units, ctx.Value(unitKey{}))
 	f.mutex.Unlock()
 	return &fakeTransaction{transactor: f}, nil
 }
@@ -668,15 +671,18 @@ func compareText(left, right string) int {
 type outcomes struct {
 	mutex    sync.Mutex
 	received []livewire.Outcome
+	// units holds, per received outcome, the unit of work its context carried (unitKey).
+	units []any
 	// panics makes the Observer panic after it recorded the outcome.
 	panics atomic.Bool
 	// holdSubscribe, when set, holds every OutcomeSubscribe until it is closed.
 	holdSubscribe atomic.Pointer[chan struct{}]
 }
 
-func (o *outcomes) observe(_ context.Context, outcome livewire.Outcome) {
+func (o *outcomes) observe(ctx context.Context, outcome livewire.Outcome) {
 	o.mutex.Lock()
 	o.received = append(o.received, outcome)
+	o.units = append(o.units, ctx.Value(unitKey{}))
 	o.mutex.Unlock()
 	if hold := o.holdSubscribe.Load(); hold != nil && outcome.Kind == livewire.OutcomeSubscribe {
 		<-*hold

@@ -4,7 +4,7 @@ Every part of an API is a declaration in one registry. Constructors return the d
 
 <!-- snippet: examples/todo/internal/controller/registry.go#new-registry -->
 ```go
-registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: observer})
+registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: observer, StartUnit: startUnit})
 ```
 
 `BasePath` prefixes every REST route; `Tenant` resolves the tenant of a request ([Tenant](#tenant)); `Observer` receives every outcome ([Live-Engine](Live-Engine.md#the-observer)). `Add` refuses a duplicate name, two declarations on one method and route, the reserved names `batch` and `filters`, the library's own routes `/batch` and `/filters`, and a mutation whose `Resource` or `Effect` names a declaration that is not registered by the end of the call.

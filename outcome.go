@@ -57,6 +57,21 @@ func startUnit(kind OutcomeKind, operation Operation, target string) unitOfWork 
 	return unitOfWork{kind: kind, operation: operation, target: target, started: time.Now()}
 }
 
+// begin starts a unit of work the engine runs on its own through the registry's StartUnit
+// (D92): the context it runs and is observed on, and the finish to call after its last
+// outcome. Its target is the closed set an outcome reports.
+func (e *Engine) begin(ctx context.Context, unit unitOfWork) (context.Context, func()) {
+	return e.registry.StartUnit(ctx, Unit{Kind: unit.kind, Operation: unit.operation, Target: e.reportedTarget(unit.target), Subscription: unit.subscription})
+}
+
+// observeAlone reports a unit of work that is done once it is reported (a socket open or
+// close, a frame answered at once, an ended subscription): begun, observed, finished.
+func (e *Engine) observeAlone(ctx context.Context, unit unitOfWork, outcome Outcome) {
+	ctx, finish := e.begin(ctx, unit)
+	defer finish()
+	e.observe(ctx, outcome)
+}
+
 // outcome reports the unit with the identity and tenant of ctx and the status err answers.
 func (u unitOfWork) outcome(ctx context.Context, err error) Outcome {
 	return Outcome{

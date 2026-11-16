@@ -213,7 +213,7 @@ func newStores(pool *pgxpool.Pool) (*stores, error) {
 
 // snippet:end stores
 
-// newEngine builds the registry with its Observer (Prometheus and wide events) and the
+// newEngine builds the registry with its Observer and StartUnit (Prometheus and wide events) and the
 // engine on livewire's Postgres stores.
 func newEngine(options *applicationOptions, livewireStores *stores, identities *authentication.Authentication, todoService *service.TodoService, accountService *service.AccountService) (*livewire.Engine, error) {
 	// snippet:begin metrics
@@ -223,7 +223,8 @@ func newEngine(options *applicationOptions, livewireStores *stores, identities *
 	}
 	// snippet:end metrics
 	registry, err := controller.NewRegistry(&controller.RegistryOptions{
-		TodoService: todoService, AccountService: accountService, Observer: server.NewObserver(metrics, options.Emitter),
+		TodoService: todoService, AccountService: accountService,
+		Observer: server.NewObserver(metrics), StartUnit: server.NewUnitStarter(options.Emitter),
 	})
 	if err != nil {
 		return nil, err

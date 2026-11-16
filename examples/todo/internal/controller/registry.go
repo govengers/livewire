@@ -28,11 +28,13 @@ const BasePath = "/api/v1"
 const maximumAttachmentBytes = 1 << 20
 
 // RegistryOptions configures the registry. TodoService and AccountService are required;
-// Observer receives every outcome of the engine and the REST adapter (D49).
+// Observer receives every outcome of the engine and the REST adapter (D49), StartUnit begins
+// the units of work the engine runs on its own (D92).
 type RegistryOptions struct {
 	TodoService    *service.TodoService
 	AccountService *service.AccountService
 	Observer       livewire.Observer
+	StartUnit      livewire.UnitStarter
 }
 
 // NewRegistry declares the API (section 3): the todos (a filterable, versioned resource with
@@ -42,18 +44,18 @@ func NewRegistry(options *RegistryOptions) (*livewire.Registry, error) {
 	if options == nil || options.TodoService == nil || options.AccountService == nil {
 		return nil, errors.New("controller: RegistryOptions.TodoService and AccountService are required")
 	}
-	return newRegistry(&todoController{todos: options.TodoService}, &accountController{accounts: options.AccountService}, options.Observer)
+	return newRegistry(&todoController{todos: options.TodoService}, &accountController{accounts: options.AccountService}, options.Observer, options.StartUnit)
 }
 
 // Contract is the API's registry without services, for the generator (cmd/generate): it
 // describes every declaration, and none of its handlers or loaders may run.
 func Contract() (*livewire.Registry, error) {
-	return newRegistry(&todoController{}, &accountController{}, nil)
+	return newRegistry(&todoController{}, &accountController{}, nil, nil)
 }
 
-func newRegistry(todos *todoController, accounts *accountController, observer livewire.Observer) (*livewire.Registry, error) {
+func newRegistry(todos *todoController, accounts *accountController, observer livewire.Observer, startUnit livewire.UnitStarter) (*livewire.Registry, error) {
 	// snippet:begin new-registry
-	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: observer})
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{BasePath: BasePath, Tenant: actor.Workspace, Observer: observer, StartUnit: startUnit})
 	// snippet:end new-registry
 	if err != nil {
 		return nil, err

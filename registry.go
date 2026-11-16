@@ -16,11 +16,14 @@ import (
 // ("/api/v1"; empty for none) and must start with a slash and not end with one. Tenant
 // resolves the tenant of a request from the decoded parameters (a *Parameters, nil for a
 // resource read) and the identity in ctx (D42); nil means one tenant. Observer receives the
-// outcomes of the engine and the adapters; nil means none.
+// outcomes of the engine and the adapters; nil means none. StartUnit begins each unit of
+// work the engine runs on its own, outside a transport's request (D92): a socket frame, a
+// subscription re-run, an after-commit report; nil runs them on the context they come with.
 type RegistryOptions struct {
-	BasePath string
-	Tenant   func(ctx context.Context, parameters any) (string, error)
-	Observer Observer
+	BasePath  string
+	Tenant    func(ctx context.Context, parameters any) (string, error)
+	Observer  Observer
+	StartUnit UnitStarter
 }
 
 // Registry is the single source of truth of an API: every declaration by name, in
@@ -107,6 +110,28 @@ func (r *Registry) Tenant(ctx context.Context, parameters any) (string, error) {
 		return "", errors.New("livewire: the Tenant function returned no tenant and no error")
 	}
 	return tenant, nil
+}
+
+// StartUnit begins a unit of work through the StartUnit option: the context the unit runs
+// on and the finish to call after its last outcome. Without the option, and when it panics
+// or answers no context, it answers ctx and a finish that does nothing; a panicking finish
+// costs that finish and nothing else.
+func (r *Registry) StartUnit(ctx context.Context, unit Unit) (context.Context, func()) {
+	started, finish := ctx, func() {}
+	if r.options.StartUnit == nil {
+		return started, finish
+	}
+	_ = recovering(func() error { // a panic of application code has nobody left to report to
+		begun, end := r.options.StartUnit(ctx, unit)
+		if begun != nil {
+			started = begun
+		}
+		if end != nil {
+			finish = func() { _ = recovering(func() error { end(); return nil }) }
+		}
+		return nil
+	})
+	return started, finish
 }
 
 // Observe reports an outcome to the Observer; it does nothing without one.

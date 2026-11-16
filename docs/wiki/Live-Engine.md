@@ -121,17 +121,41 @@ The todo app feeds Prometheus and writes one wide event per outcome that has no 
 
 <!-- snippet: examples/todo/internal/server/server.go#observer -->
 ```go
-// NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome
+// unitEventKey carries the wide event NewUnitStarter began for a unit of work.
+type unitEventKey struct{}
+
+// NewUnitStarter is the registry's StartUnit (D92): a unit of work the engine runs on its own
 // without a request's wide event (a socket frame, a re-run, the feed, a heartbeat: the socket
-// route takes the upgrade's event out of their context) is a unit of work of its own and gets
-// one event. A REST outcome is on the request's event already, which the REST adapter recorded.
-func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) livewire.Observer {
+// route takes the upgrade's event out of their context) gets an event of its own before its
+// work runs, so its queries count on it (db.*, LOG-004), and the event is emitted when the
+// unit finishes. A unit inside a request or frame (the after-commit report of a mutation)
+// stays on its event: this application has no after-commit reaction whose work would need
+// one of its own.
+func NewUnitStarter(emitter wideevent.Emitter) livewire.UnitStarter {
+    return func(ctx context.Context, unit livewire.Unit) (context.Context, func()) {
+        if wideevent.FromContext(ctx) != nil {
+            return ctx, nil
+        }
+        we := wideevent.Begin(emitter, "livewire."+string(unit.Kind))
+        ctx, queries := database.CountQueries(wideevent.NewContext(ctx, we))
+        return context.WithValue(ctx, unitEventKey{}, we), func() {
+            queries.Record(we)
+            we.Emit()
+        }
+    }
+}
+
+// NewObserver is the registry's Observer (D49): every outcome feeds the metrics; an outcome of
+// a unit NewUnitStarter began is recorded on the unit's event, an after-commit report aside,
+// whose call's outcome said everything. A REST outcome is on the request's event already,
+// which the REST adapter recorded.
+func NewObserver(metrics *prometheusadapter.Metrics) livewire.Observer {
     return func(ctx context.Context, outcome livewire.Outcome) {
         metrics.Observe(ctx, outcome)
-        if wideevent.FromContext(ctx) != nil {
+        we, ok := ctx.Value(unitEventKey{}).(*wideevent.Event)
+        if !ok || outcome.Kind == livewire.OutcomeAfterCommit {
             return
         }
-        we := wideevent.Begin(emitter, "livewire."+string(outcome.Kind))
         we.String("livewire.kind", string(outcome.Kind)).
             String("livewire.operation", string(outcome.Operation)).
             String("livewire.target", outcome.Target).
@@ -146,10 +170,9 @@ func NewObserver(metrics *prometheusadapter.Metrics, emitter wideevent.Emitter) 
         recordIdentifiers(we, outcome.Parameters)
         if outcome.Err != nil {
             we.Failure(outcome.Err)
-        } else {
+        } else if !we.HasError() { // a failed call of a batch fails the batch's unit
             we.Success()
         }
-        we.Emit()
     }
 }
 ```
