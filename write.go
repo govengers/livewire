@@ -485,6 +485,8 @@ func checkFile(upload *Upload, file *File) error {
 		return invalidParameter("file", "the content type is not accepted")
 	case file.Size > upload.MaximumBytes():
 		return invalidParameter("file", "larger than "+strconv.FormatInt(upload.MaximumBytes(), 10)+" bytes")
+	case strings.ContainsRune(file.Filename, 0):
+		return invalidParameter("file", "the file name "+noNULValue) // PostgreSQL text holds no U+0000 (D95)
 	}
 	return nil
 }

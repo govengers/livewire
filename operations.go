@@ -180,6 +180,9 @@ func (s *socket) join(ctx context.Context, frame *RequestFrame) error {
 	s.presenceMutex.Lock() // before the slot: a join waiting for another holds none
 	defer s.presenceMutex.Unlock()
 	err := s.engine.inSlot(ctx, func() error {
+		if err := inspectValue(frame.Body); err != nil {
+			return err // the state goes to the store as it is: no U+0000, no repeated member (D95)
+		}
 		var err error
 		if resolved, err = s.engine.resolve(ctx, ReadRequest{Target: frame.Target, Kind: ReadPresence, Source: MapSource(frame.Parameters)}); err != nil {
 			return err

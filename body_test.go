@@ -460,10 +460,12 @@ type withMaps struct {
 	Loose  *lenient          `json:"loose"`
 	Cents  *boxed            `json:"cents"`
 	Number json.Number       `json:"number"`
+	Quoted *string           `json:"quoted,string"`
 }
 
 type nested struct {
-	Note string `json:"note" validate:"max=3"`
+	Note   string `json:"note" validate:"max=3"`
+	Quoted string `json:"quoted,string"`
 }
 
 func TestMutationBodyWalkRefusalsByPath(t *testing.T) {
@@ -501,6 +503,8 @@ func TestMutationBodyWalkRefusalsByPath(t *testing.T) {
 		{name: "U+0000 inside a raw value", raw: `{"raw":"\u0000"}`, field: "raw", text: "must not contain U+0000"},
 		{name: "U+0000 in a map key", raw: `{"byName":{"a\u0000":{}}}`, field: "byName", text: "a member name must not contain U+0000"},
 		{name: "U+0000 in a top-level member name", raw: `{"\u0000":1}`, field: "body", text: "a member name must not contain U+0000"},
+		{name: "U+0000 inside a quoted string", raw: `{"quoted":"\"a\\u0000\""}`, field: "quoted", text: "must not contain U+0000"},
+		{name: "U+0000 inside a quoted string of a nested object", raw: `{"lines":[{"quoted":"\"\\u0000\""}]}`, field: "lines[0].quoted", text: "must not contain U+0000"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {

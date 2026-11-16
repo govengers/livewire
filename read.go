@@ -230,9 +230,11 @@ func sourceOrEmpty(source ParameterSource) ParameterSource {
 const maximumPresenceKeyBytes = 256
 
 func presenceKeyFrom(source ParameterSource) (string, error) {
-	values, ok := source.Query(ParameterPresenceKey)
+	values, err := readQueryValues(source, ParameterPresenceKey, true) // refuses U+0000 (D95)
 	switch {
-	case !ok || len(values) != 1 || values[0] == "":
+	case err != nil:
+		return "", err
+	case len(values) != 1 || values[0] == "":
 		return "", invalidParameter(ParameterPresenceKey, "required, once")
 	case len(values[0]) > maximumPresenceKeyBytes:
 		return "", invalidParameter(ParameterPresenceKey, "at most 256 bytes")

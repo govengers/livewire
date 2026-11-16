@@ -226,11 +226,51 @@ func (w *bodyWalker) walkObject(structType reflect.Type, top bool) error {
 		if err := w.walkValue(field.Type, start); err != nil {
 			return err
 		}
+		if quotesString(field) && quotedNUL(bytes.TrimLeft(w.raw[start:w.decoder.InputOffset()], " \t\r\n:")) {
+			return w.refuse(noNULValue)
+		}
 		if top {
 			w.topLevel[key] = bytes.TrimLeft(w.raw[start:w.decoder.InputOffset()], " \t\r\n:")
 		}
 		w.pop()
 	}
+}
+
+// quotesString reports whether encoding/json reads the string field from inside a JSON
+// string (the `string` option), where an escaped U+0000 is no U+0000 of the outer token.
+func quotesString(field reflect.StructField) bool {
+	_, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+	fieldType := field.Type
+	if fieldType.Name() == "" && fieldType.Kind() == reflect.Pointer {
+		fieldType = fieldType.Elem()
+	}
+	return fieldType.Kind() == reflect.String && slices.Contains(strings.Split(options, ","), "string")
+}
+
+// quotedNUL reports whether value, a JSON string holding a JSON string, holds U+0000 inside.
+func quotedNUL(value []byte) bool {
+	var outer, inner string
+	if json.Unmarshal(value, &outer) != nil || json.Unmarshal([]byte(outer), &inner) != nil {
+		return false // the decoder names a value of another shape
+	}
+	return strings.ContainsRune(inner, 0)
+}
+
+// inspectValue refuses a JSON value holding U+0000 in a string or member name, at the path
+// of the member, "body" at the top; an empty value passes. It reads a value livewire stores
+// without a request type, such as a presence's state.
+func inspectValue(raw json.RawMessage) error {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	walker := newBodyWalker(raw, nil)
+	if err := walker.skipValue(); err != nil {
+		return err
+	}
+	if _, err := walker.decoder.Token(); !errors.Is(err, io.EOF) {
+		return invalidParameter("body", "must be valid JSON")
+	}
+	return nil
 }
 
 // walkValue consumes one value of the type; a walk that locates a target offset ends at the

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/govengers/auth"
@@ -78,6 +79,11 @@ func (e *Engine) saveFilter(ctx context.Context, body []byte) (json.RawMessage, 
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil || !atEnd(decoder) {
 		return nil, Owner{}, invalidParameter("body", "must be one JSON object {resource, context, name, filter}")
+	}
+	for _, member := range [][2]string{{"resource", request.Resource}, {"context", request.Context}, {"name", request.Name}} {
+		if strings.ContainsRune(member[1], 0) {
+			return nil, Owner{}, invalidParameter(member[0], noNULValue) // PostgreSQL text holds no U+0000 (D95)
+		}
 	}
 	resource, fields, err := e.filterTarget(request.Resource)
 	if err != nil {
