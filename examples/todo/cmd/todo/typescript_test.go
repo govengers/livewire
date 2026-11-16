@@ -11,16 +11,17 @@ import (
 
 // TestTheFrontendTypeChecks compiles web/src (the generated client and live.ts, which uses it)
 // with tsc under the generator's strict settings and runs live.test.ts under bun, on the TypeScript and Vue of the generator's
-// runtime harness (generate/runtime, installed from its lockfile). Without bun it skips, unless
-// LIVEWIRE_REQUIRE_TYPESCRIPT=1 (set in CI, which has bun) makes it fail.
+// runtime harness (generate/runtime, installed from its lockfile). It runs only with
+// LIVEWIRE_REQUIRE_TYPESCRIPT=1 (just test-typescript, uncached) and fails there without bun:
+// go test's cache cannot see the harness bun reads outside this module.
 func TestTheFrontendTypeChecks(t *testing.T) {
 	t.Parallel()
+	if os.Getenv("LIVEWIRE_REQUIRE_TYPESCRIPT") != "1" {
+		t.Skip("the frontend's type check runs in just test-typescript (LIVEWIRE_REQUIRE_TYPESCRIPT=1), uncached")
+	}
 	bun, err := exec.LookPath("bun")
 	if err != nil {
-		if os.Getenv("LIVEWIRE_REQUIRE_TYPESCRIPT") == "1" {
-			t.Fatal("LIVEWIRE_REQUIRE_TYPESCRIPT=1 but bun is not installed")
-		}
-		t.Skip("bun is not installed: the frontend's type check is skipped (LIVEWIRE_REQUIRE_TYPESCRIPT=1 requires it)")
+		t.Fatal("LIVEWIRE_REQUIRE_TYPESCRIPT=1 but bun is not installed")
 	}
 	harness, err := filepath.Abs(filepath.Join("..", "..", "..", "..", "generate", "runtime"))
 	require.NoError(t, err)

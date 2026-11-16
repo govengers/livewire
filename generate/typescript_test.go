@@ -11,20 +11,21 @@ import (
 	"github.com/govengers/livewire/generate"
 )
 
-// requireTypeScript is the bun executable; without bun the TypeScript gates skip, unless
-// LIVEWIRE_REQUIRE_TYPESCRIPT=1 (just test-typescript, which CI runs with bun installed)
-// makes them fail instead.
+// requireTypeScript is the bun executable. The TypeScript gates run only with
+// LIVEWIRE_REQUIRE_TYPESCRIPT=1 (just test-typescript, which CI runs on every push) and fail
+// there without bun; otherwise they skip, since go test's cache cannot see the files bun
+// reads (the runtime's sources and tests, its lockfile, node_modules) and would keep a
+// result they changed (D89).
 func requireTypeScript(t *testing.T) string {
 	t.Helper()
-	bun, err := exec.LookPath("bun")
-	if err == nil {
-		return bun
+	if os.Getenv("LIVEWIRE_REQUIRE_TYPESCRIPT") != "1" {
+		t.Skip("the TypeScript gates run in just test-typescript (LIVEWIRE_REQUIRE_TYPESCRIPT=1), uncached")
 	}
-	if os.Getenv("LIVEWIRE_REQUIRE_TYPESCRIPT") == "1" {
+	bun, err := exec.LookPath("bun")
+	if err != nil {
 		t.Fatal("LIVEWIRE_REQUIRE_TYPESCRIPT=1 but bun is not installed")
 	}
-	t.Skip("bun is not installed: the TypeScript gates are skipped (just test-typescript requires them)")
-	return ""
+	return bun
 }
 
 func runBun(t *testing.T, directory, bun string, arguments ...string) {
