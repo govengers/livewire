@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
@@ -15,6 +16,7 @@ import (
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/generate"
 	"github.com/govengers/livewire/internal/toolfixture"
+	"github.com/govengers/livewire/query"
 	"github.com/govengers/livewire/toolset"
 )
 
@@ -272,6 +274,12 @@ func TestAnUploadTakesTextOrBase64(t *testing.T) {
 	_, err = tools.Call(ctx, "attachNote", json.RawMessage(`{"id":"`+note+`","contentType":"image/png","content":"`+png+`"}`), toolset.CallOptions{})
 	refusal(t, err, livewire.CodeInvalidRequest)
 	require.ErrorContains(t, err, "contentEncoding: required", "base64 text is never stored as a binary file's bytes")
+	answer, err = tools.Call(ctx, "attachNote", json.RawMessage(`{"id":"`+note+`","contentType":"TEXT/Plain; charset=utf-8","content":"hi"}`), toolset.CallOptions{})
+	require.NoError(t, err, "a media type is case-insensitive, as the engine reads it")
+	require.JSONEq(t, `{"size":2,"content":"hi"}`, string(answer))
+	_, err = tools.Call(ctx, "attachNote", json.RawMessage(`{"id":"`+note+`","content":"hi"}`), toolset.CallOptions{})
+	refusal(t, err, livewire.CodeInvalidRequest)
+	require.ErrorContains(t, err, "file: the content type is not accepted", "a missing type is refused as the type, not as the encoding")
 
 	for _, arguments := range []string{
 		`{"id":"` + note + `","contentType":"text/plain"}`,
@@ -343,4 +351,75 @@ func TestAReadPassesEveryArgumentAsAParameter(t *testing.T) {
 	answer, err := tools.Call(toolfixture.User(t.Context()), "getThing", json.RawMessage(`{"body":"abc","content":"def"}`), toolset.CallOptions{})
 	require.NoError(t, err)
 	require.JSONEq(t, `{"Body":"abc","Content":"def"}`, string(answer))
+}
+
+// search is an object and a mutation whose own parameter is named filterId, as the reserved
+// parameter of a filterable read is; the catalogue keeps it (D85 drops the reserved one only).
+type searchParameters struct {
+	FilterID string `path:"filterId"`
+}
+
+type renameParameters struct {
+	FilterID string `query:"filterId"`
+}
+
+func TestADeclaredFilterIDIsAnArgument(t *testing.T) {
+	t.Parallel()
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{})
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(
+		livewire.NewObject("search", "/saved-searches/{filterId}", &livewire.ObjectOptions[searchParameters, searchParameters]{
+			Read: authorization.IsUser(),
+			Load: func(_ context.Context, parameters *searchParameters) (*searchParameters, error) {
+				return parameters, nil
+			},
+		}),
+		livewire.NewMutation("renameSearch", http.MethodPost, "/saved-searches", &livewire.MutationOptions[renameParameters, livewire.NoBody, renameParameters]{
+			Check: authorization.IsUser(),
+			Handle: func(_ context.Context, parameters *renameParameters, _ *livewire.NoBody) (*renameParameters, error) {
+				return parameters, nil
+			},
+		}),
+	))
+	catalogue, err := generate.NewCatalogue(registry, nil)
+	require.NoError(t, err)
+	for _, name := range []string{"getSearch", "renameSearch"} {
+		tool, ok := catalogue.Lookup(name)
+		require.True(t, ok)
+		require.Contains(t, string(tool.Parameters), `"filterId"`, name)
+	}
+	engine, err := toolfixture.NewEngine(registry)
+	require.NoError(t, err)
+	tools, err := toolset.New(&toolset.Options{Engine: engine, Catalogue: catalogue, Agent: "assistant"})
+	require.NoError(t, err)
+	answer, err := tools.Call(toolfixture.User(t.Context()), "getSearch", json.RawMessage(`{"filterId":"abc"}`), toolset.CallOptions{})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"FilterID":"abc"}`, string(answer))
+}
+
+func TestAPanicOfAReadIsReportedUnderTheEnginesTarget(t *testing.T) {
+	t.Parallel()
+	var outcomes []livewire.Outcome
+	registry, err := livewire.NewRegistry(&livewire.RegistryOptions{Observer: func(_ context.Context, outcome livewire.Outcome) { outcomes = append(outcomes, outcome) }})
+	require.NoError(t, err)
+	require.NoError(t, registry.Add(livewire.NewResource("things", "/things", &livewire.ResourceOptions[toolfixture.Note]{
+		Read:   func(context.Context) error { panic("secret internal state: hunter2") },
+		Fields: query.Fields{{Name: "id", Type: query.TypeUUID, SQL: "things.id", Filter: true, Sort: true}},
+		Item:   &livewire.ItemKey{Parameter: "id", Field: "id"},
+		List: func(context.Context, *query.ListQuery) (*livewire.Page[toolfixture.Note], error) {
+			return &livewire.Page[toolfixture.Note]{}, nil
+		},
+		Get: func(context.Context, *query.ListQuery) (*toolfixture.Note, error) { return &toolfixture.Note{}, nil },
+	})))
+	engine, err := toolfixture.NewEngine(registry)
+	require.NoError(t, err)
+	catalogue, err := generate.NewCatalogue(registry, nil)
+	require.NoError(t, err)
+	tools, err := toolset.New(&toolset.Options{Engine: engine, Catalogue: catalogue, Agent: "assistant"})
+	require.NoError(t, err)
+	_, err = tools.Call(toolfixture.User(t.Context()), "getThingsItem", json.RawMessage(`{"id":"019a0000-0000-7000-8000-000000000001"}`), toolset.CallOptions{})
+	refusal(t, err, livewire.CodeInternal)
+	require.Len(t, outcomes, 1)
+	require.Equal(t, "things.item", outcomes[0].Target, "counted under the item read, not the list")
+	require.Positive(t, outcomes[0].Duration)
 }

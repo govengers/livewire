@@ -14,7 +14,8 @@
 // The server is stateless (no Mcp-Session-Id, POST only, JSON answers): each request is a
 // session of its own, so an identity never outlives its request and any replica can answer.
 // A client may set the call's Idempotency-Key (a UUID) as `_meta.idempotencyKey` of
-// tools/call to retry it safely; without one every call is its own write. A write's request
+// tools/call to retry it safely (a key that is present and no UUID, "" included, is refused);
+// without one every call is its own write. A write's request
 // id in the audit and the history is the X-Request-ID the application's middleware answers
 // with (govengers/wide-event-logger's does), as on REST, so it joins the request's log line.
 //
@@ -84,9 +85,11 @@ func New(options *Options) (http.Handler, error) {
 				IdempotentHint: !tool.Mutating || tool.Method == http.MethodPut || tool.Method == http.MethodDelete,
 			},
 		}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			// a retry the client believes safe must not write twice: a key that is present is a
+			// UUID or refused, "" included (an unset variable on the client's side)
 			key, isText := request.Params.Meta[MetaIdempotencyKey].(string)
-			if member := request.Params.Meta[MetaIdempotencyKey]; member != nil && !isText { // a retry the client believes safe must not write twice
-				return refusal(&toolset.Error{Code: livewire.CodeInvalidRequest, Message: "The idempotency key is not a UUID.", Fields: map[string]string{"idempotencyKey": "not a string"}}), nil
+			if member := request.Params.Meta[MetaIdempotencyKey]; member != nil && (!isText || key == "") {
+				return refusal(&toolset.Error{Code: livewire.CodeInvalidRequest, Message: "The idempotency key is not a UUID.", Fields: map[string]string{"idempotencyKey": "not a UUID"}}), nil
 			}
 			requestID, _ := ctx.Value(requestIDKey{}).(string)
 			answer, err := tools.Call(ctx, name, request.Params.Arguments, toolset.CallOptions{IdempotencyKey: key, RequestID: requestID})

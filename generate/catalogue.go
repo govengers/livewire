@@ -27,8 +27,9 @@ const (
 // body under ArgumentBody, an upload's file as ArgumentContent with its ArgumentContentType,
 // written as ArgumentContentEncoding says (ContentText, the default, or ContentBase64).
 // Every other member is a parameter of the declaration, the reserved ones of a filterable
-// read included (filter as a JSON document, not as text) except filterId: stored filters are
-// no tools, so an agent never holds a filter's id.
+// read included (filter as a JSON document, not as text) except the reserved filterId: stored
+// filters are no tools, so an agent never holds a filter's id. A declared parameter named
+// filterId stays an argument.
 const (
 	ArgumentBody            = "body"
 	ArgumentContent         = "content"
@@ -243,9 +244,9 @@ func refuseArgumentNames(name string, properties object) error {
 // and the names a call must carry.
 func (o *openAPI) argumentProperties(parameters []parameterModel, reserved reservedModel) (object, []string) {
 	properties, required := object{}, []string{}
-	for _, parameter := range o.parameters(parameters, reserved) {
+	for index, parameter := range o.parameters(parameters, reserved) {
 		name, _ := parameter["name"].(string)
-		if name == livewire.ParameterFilterID {
+		if index >= len(parameters) && name == livewire.ParameterFilterID { // the reserved one only; a declared filterId is the application's
 			continue
 		}
 		schema, ok := parameter["schema"].(object)

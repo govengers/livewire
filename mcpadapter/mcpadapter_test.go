@@ -202,15 +202,18 @@ func TestNewRefusesIncompleteOptions(t *testing.T) {
 	require.Error(t, err, "a server keeps a body cap")
 }
 
-func TestAKeyThatIsNoStringIsRefused(t *testing.T) {
+func TestAKeyThatIsNoUUIDIsRefused(t *testing.T) {
 	t.Parallel()
 	fixture, server := serve(t, nil)
-	result, err := connect(t, server, "alice").CallTool(t.Context(), &mcp.CallToolParams{
-		Name: "createNote", Arguments: map[string]any{"body": map[string]any{"title": "x"}}, Meta: mcp.Meta{mcpadapter.MetaIdempotencyKey: 12345},
-	})
-	require.NoError(t, err)
-	require.True(t, result.IsError)
-	require.Contains(t, text(t, result), `"code":"invalid_request"`)
+	alice := connect(t, server, "alice")
+	for _, key := range []any{12345, "", "nope"} {
+		result, err := alice.CallTool(t.Context(), &mcp.CallToolParams{
+			Name: "createNote", Arguments: map[string]any{"body": map[string]any{"title": "x"}}, Meta: mcp.Meta{mcpadapter.MetaIdempotencyKey: key},
+		})
+		require.NoError(t, err)
+		require.True(t, result.IsError, "%#v", key)
+		require.Contains(t, text(t, result), `"code":"invalid_request"`)
+	}
 	require.Len(t, fixture.Notes(), 1, "a retry the client believes safe never writes under a fresh key")
 }
 

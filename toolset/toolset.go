@@ -18,11 +18,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"mime"
 	"net/http"
 	"regexp"
 	"runtime/debug"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/govengers/auth"
@@ -171,9 +173,10 @@ func (t *Toolset) Call(ctx context.Context, name string, arguments json.RawMessa
 		return nil, &Error{Code: livewire.CodeNotFound, Message: "There is no tool of this name."}
 	}
 	tool, _ := t.options.Catalogue.Lookup(name)
+	started := time.Now()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			answer, err = nil, t.panicked(ctx, tool, fmt.Errorf("toolset: %s panicked: %v\n%s", tool.Name, recovered, debug.Stack()))
+			answer, err = nil, t.panicked(ctx, tool, started, fmt.Errorf("toolset: %s panicked: %v\n%s", tool.Name, recovered, debug.Stack()))
 		}
 	}()
 	parsed, err := parseArguments(arguments, members, tool.Kind)
@@ -218,16 +221,20 @@ func (t *Toolset) Call(ctx context.Context, name string, arguments json.RawMessa
 }
 
 // panicked reports a recovered panic to the registry's Observer, as the engine reports the
-// panics it recovers, and answers it as CodeInternal.
-func (t *Toolset) panicked(ctx context.Context, tool generate.Tool, err error) *Error {
-	kind := livewire.OutcomeRequest
+// panics it recovers (a read under the engine's target, "<declaration>.<kind>" for every read
+// but the main one, D46), and answers it as CodeInternal.
+func (t *Toolset) panicked(ctx context.Context, tool generate.Tool, started time.Time, err error) *Error {
+	kind, target := livewire.OutcomeRequest, tool.Target
 	if tool.Mutating {
 		kind = livewire.OutcomeCall
+	} else if tool.Read != livewire.ReadMain {
+		target += "." + string(tool.Read)
 	}
 	func() {
 		defer func() { _ = recover() }() // the panic of an Observer has nobody left to report to
 		t.options.Engine.Registry().Observe(ctx, livewire.Outcome{
-			Kind: kind, Target: tool.Target, Identity: auth.IdentityFrom(ctx), Status: http.StatusInternalServerError, Err: err,
+			Kind: kind, Target: target, Identity: auth.IdentityFrom(ctx), Tenant: livewire.TenantFrom(ctx),
+			Status: http.StatusInternalServerError, Err: err, Duration: time.Since(started),
 		})
 	}()
 	return errorOf(err)
@@ -328,7 +335,9 @@ func (a *arguments) file() (*livewire.File, error) {
 		return nil, invalidArgument(generate.ArgumentContent, "required")
 	}
 	content := []byte(*a.content)
-	if a.encoding == "" && !strings.HasPrefix(a.typ, "text/") { // base64 text stored as an image's bytes is a silent corruption
+	// base64 text stored as an image's bytes is a silent corruption; a type the engine cannot
+	// parse (none included) is the engine's to refuse, under its own member
+	if mediaType, _, err := mime.ParseMediaType(a.typ); err == nil && a.encoding == "" && !strings.HasPrefix(mediaType, "text/") {
 		return nil, invalidArgument(generate.ArgumentContentEncoding, "required for a content type that is not text/*")
 	}
 	switch a.encoding {
