@@ -60,7 +60,7 @@ func settings(t *testing.T, database postgresadapter.DBTX) transactionSettings {
 func TestTransactorSetsTheSettingsForTheTransactionOnly(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
-	single, err := pgxpool.New(t.Context(), database.dsn()+"?pool_max_conns=1") // every transaction on one session
+	single, err := pgxpool.New(t.Context(), database.dsnWith("pool_max_conns=1")) // every transaction on one session
 	require.NoError(t, err)
 	t.Cleanup(single.Close)
 	transactor := newTransactor(t, single)
@@ -154,7 +154,7 @@ func TestTransactorFailures(t *testing.T) {
 func TestWritesAreReadCommittedWhateverTheDefault(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
-	repeatable, err := pgxpool.New(t.Context(), database.dsn()+"?default_transaction_isolation=repeatable%20read")
+	repeatable, err := pgxpool.New(t.Context(), database.dsnWith("default_transaction_isolation=repeatable%20read"))
 	require.NoError(t, err)
 	t.Cleanup(repeatable.Close)
 	write, err := newTransactor(t, repeatable).Begin(t.Context(), livewire.TransactionDetails{Mutation: "createPart"})

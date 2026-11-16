@@ -11,3 +11,8 @@ exceptions:
       ends it (cancelled on close, unsubscribe or engine shutdown) and every goroutine it starts derives from
       that context. Storing it on the lifetime object is the only way to cancel it from another goroutine;
       functions still take ctx as their first parameter.
+  - rule: DES-003
+    reason: >-
+      Test code only: each PostgreSQL test package (postgresadapter, query, test/e2e, the example's cmd/todo)
+      keeps its one postgrestest.Server in a package variable that TestMain builds and closes, as
+      govengers/postgrestest prescribes (design D90); one server per test binary, a database per test.

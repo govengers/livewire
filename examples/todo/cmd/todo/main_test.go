@@ -5,22 +5,20 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/govengers/auth/password"
+	"github.com/govengers/postgrestest"
 	wideevent "github.com/govengers/wide-event-logger"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -31,7 +29,6 @@ import (
 
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/client"
-	"github.com/govengers/livewire/internal/postgrestest"
 
 	"github.com/govengers/livewire/examples/todo/client/todoclient"
 	"github.com/govengers/livewire/examples/todo/internal/authentication"
@@ -40,62 +37,25 @@ import (
 )
 
 // The tests run the application as main wires it (newApplication) on an embedded PostgreSQL
-// (TST-002): one server per test binary, a database per test cloned from a migrated template.
+// (TST-002): one server per test binary, a database per test copied from a migrated template.
 
 // testPassword is every seeded user's password.
 const testPassword = "correct horse battery staple"
 
-var postgres struct {
-	server   *postgrestest.Server
-	mutex    sync.Mutex // CREATE DATABASE ... TEMPLATE refuses a template another clone reads
-	sequence atomic.Int64
-}
-
-const templateDatabase = "todo_template"
+// postgres is the test binary's one PostgreSQL (govengers/postgrestest). No Fingerprint: the
+// migrations are the application's goose files and Go functions, and a fingerprint matters only on
+// a long-lived external server (POSTGRESTEST_URL), where an empty one builds a template per run.
+var postgres = postgrestest.New(&postgrestest.Options{Migrate: migrateTemplate})
 
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.ReleaseMode)
-	os.Exit(runTests(m))
+	goleak.VerifyTestMain(postgres.Main(m))
 }
 
-func runTests(m *testing.M) int {
-	server, err := postgrestest.Start()
-	if err != nil {
-		return failed("start embedded postgres", err)
-	}
-	defer func() { _ = server.Stop() }() // the result is decided; a failed stop changes nothing
-	postgres.server = server
-	if err := migrateTemplate(); err != nil {
-		return failed("migrate the template database", err)
-	}
-	code := m.Run()
-	if code == 0 {
-		if err := goleak.Find(); err != nil {
-			return failed("goroutines leaked", err)
-		}
-	}
-	return code
-}
-
-func failed(what string, err error) int {
-	fmt.Fprintf(os.Stderr, "todo tests: %s: %v\n", what, err)
-	return 1
-}
-
-func databaseURL(name string) string { return postgres.server.URL(name) }
-
-// migrateTemplate runs the application's migrations on the template database.
-func migrateTemplate() error {
-	ctx := context.Background()
-	admin, err := pgx.Connect(ctx, databaseURL("postgres"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = admin.Close(ctx) }() // the template exists or the error is returned
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+templateDatabase); err != nil {
-		return err
-	}
-	pool, err := database.NewPool(ctx, databaseURL(templateDatabase), 4, noop.NewTracerProvider())
+// migrateTemplate runs the application's migrations on the template database; its pool is closed
+// before it returns, as postgrestest requires.
+func migrateTemplate(ctx context.Context, connection *pgx.Conn) error {
+	pool, err := database.NewPool(ctx, connection.Config().ConnString(), 4, noop.NewTracerProvider())
 	if err != nil {
 		return err
 	}
@@ -103,29 +63,13 @@ func migrateTemplate() error {
 	return database.Migrate(ctx, pool)
 }
 
-// newPool clones the template into a database of the test's own and drops it after.
+// newPool is a pool on a copy of the template of the test's own, as main opens it, dropped after
+// the test.
 func newPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	name := "test_" + strconv.FormatInt(postgres.sequence.Add(1), 10)
-	admin, err := pgx.Connect(t.Context(), databaseURL("postgres"))
+	pool, err := database.NewPool(t.Context(), postgres.Database(t), maximumConnections, noop.NewTracerProvider())
 	require.NoError(t, err)
-	postgres.mutex.Lock()
-	_, err = admin.Exec(t.Context(), "CREATE DATABASE "+name+" TEMPLATE "+templateDatabase)
-	postgres.mutex.Unlock()
-	require.NoError(t, admin.Close(t.Context()))
-	require.NoError(t, err)
-	pool, err := database.NewPool(t.Context(), databaseURL(name), maximumConnections, noop.NewTracerProvider())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		pool.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		admin, err := pgx.Connect(ctx, databaseURL("postgres"))
-		require.NoError(t, err)
-		_, err = admin.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)")
-		require.NoError(t, err)
-		require.NoError(t, admin.Close(ctx))
-	})
+	t.Cleanup(pool.Close)
 	return pool
 }
 

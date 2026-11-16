@@ -12,10 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +24,7 @@ import (
 	authginadapter "github.com/govengers/auth/ginadapter"
 	"github.com/govengers/auth/password"
 	"github.com/govengers/auth/session"
+	"github.com/govengers/postgrestest"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -34,7 +33,6 @@ import (
 	"github.com/govengers/livewire"
 	"github.com/govengers/livewire/client"
 	"github.com/govengers/livewire/ginadapter"
-	"github.com/govengers/livewire/internal/postgrestest"
 	"github.com/govengers/livewire/postgresadapter"
 	"github.com/govengers/livewire/query"
 )
@@ -60,74 +58,34 @@ var keys = map[string]*auth.Identity{
 // unnamedFiltersPerOwner is the FilterStore's cap, small so a test evicts (D54).
 const unnamedFiltersPerOwner = 2
 
-var postgres struct {
-	server   *postgrestest.Server
-	mutex    sync.Mutex
-	sequence atomic.Int64
-}
-
-const templateDatabase = "e2e_template"
+// postgres is the suite's one PostgreSQL (govengers/postgrestest): every cluster gets a database
+// of its own, copied from the template the schema and livewire's SQL (D22) migrated.
+var postgres *postgrestest.Server
 
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.ReleaseMode)
-	os.Exit(run(m))
-}
-
-func run(m *testing.M) int {
-	server, err := postgrestest.Start()
-	if err != nil {
-		return fail("start embedded postgres", err)
-	}
-	defer func() { _ = server.Stop() }() // the result is decided; a failed stop changes nothing
-	postgres.server = server
-	if err := migrateTemplate(); err != nil {
-		return fail("migrate the template database", err)
-	}
-	code := m.Run()
-	if code == 0 {
-		if err := goleak.Find(); err != nil {
-			return fail("goroutines leaked", err)
-		}
-	}
-	return code
-}
-
-func fail(what string, err error) int {
-	fmt.Fprintf(os.Stderr, "e2e: %s: %v\n", what, err)
-	return 1
-}
-
-func dsn(database string) string { return postgres.server.URL(database) }
-
-// migrateTemplate applies the schema and livewire's SQL (D22) as an application's migrations.
-func migrateTemplate() error {
-	ctx := context.Background()
-	admin, err := pgx.Connect(ctx, dsn("postgres"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = admin.Close(ctx) }() // the template exists or the error is returned
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+templateDatabase); err != nil {
-		return err
-	}
-	connection, err := pgx.Connect(ctx, dsn(templateDatabase))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = connection.Close(ctx) }() // as above
 	history, err := postgresadapter.HistorySQL("notes")
 	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "e2e: the template's SQL: %v\n", err)
+		os.Exit(1)
 	}
-	for _, statement := range []string{
+	statements := []string{
 		schemaSQL, postgresadapter.TriggerFunctionSQL, postgresadapter.TriggerSQL("notes"), history,
 		postgresadapter.FiltersSQL, postgresadapter.IdempotencySQL, postgresadapter.AuditSQL, postgresadapter.PresenceSQL,
-	} {
-		if _, err := connection.Exec(ctx, statement); err != nil {
-			return fmt.Errorf("%w\n%s", err, statement)
-		}
 	}
-	return nil
+	postgres = postgrestest.New(&postgrestest.Options{
+		Migrate:     postgrestest.Statements(statements...),
+		Fingerprint: strings.Join(statements, "\n"),
+	})
+	goleak.VerifyTestMain(postgres.Main(m))
+}
+
+// withParameters is a database URL with the query parameters added (key=value pairs joined by &).
+func withParameters(address, parameters string) string {
+	if strings.Contains(address, "?") {
+		return address + "&" + parameters
+	}
+	return address + "?" + parameters
 }
 
 // cluster is one database with two engines on it, each behind a server of its own.
@@ -147,31 +105,15 @@ type replica struct {
 // baseURL is the replica's API root with the registry's BasePath.
 func (r *replica) baseURL() string { return r.server.URL + "/api" }
 
-// newCluster clones the template into a database of the test's own and starts two replicas.
+// newCluster starts two replicas on a copy of the template of the test's own.
 func newCluster(t *testing.T) *cluster {
 	t.Helper()
-	name := "e2e_" + strconv.FormatInt(postgres.sequence.Add(1), 10)
-	admin, err := pgx.Connect(t.Context(), dsn("postgres"))
-	require.NoError(t, err)
-	postgres.mutex.Lock()
-	_, err = admin.Exec(t.Context(), "CREATE DATABASE "+name+" TEMPLATE "+templateDatabase)
-	postgres.mutex.Unlock()
-	require.NoError(t, admin.Close(t.Context()))
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		admin, err := pgx.Connect(ctx, dsn("postgres"))
-		require.NoError(t, err)
-		_, err = admin.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)")
-		require.NoError(t, err)
-		require.NoError(t, admin.Close(ctx))
-	})
-	pool, err := pgxpool.New(t.Context(), dsn(name))
+	address := postgres.Database(t)
+	pool, err := pgxpool.New(t.Context(), address)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 	logins := newLogins(t)
-	started := &cluster{pool: pool, first: newReplica(t, name, logins), second: newReplica(t, name, logins)}
+	started := &cluster{pool: pool, first: newReplica(t, address, logins), second: newReplica(t, address, logins)}
 	require.Eventually(t, func() bool {
 		var listening int
 		err := pool.QueryRow(t.Context(), `SELECT count(*) FROM pg_stat_activity
@@ -181,14 +123,14 @@ func newCluster(t *testing.T) *cluster {
 	return started
 }
 
-// newReplica starts one engine on the database with the postgresadapter's Listener,
+// newReplica starts one engine on the database at address with the postgresadapter's Listener,
 // Transactor and stores, and serves it on gin.
-func newReplica(t *testing.T, database string, logins *logins) *replica {
+func newReplica(t *testing.T, address string, logins *logins) *replica {
 	t.Helper()
-	pool, err := pgxpool.New(t.Context(), dsn(database))
+	pool, err := pgxpool.New(t.Context(), address)
 	require.NoError(t, err)
 	registry := newRegistry(t, pool)
-	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{DSN: dsn(database) + "?application_name=livewire_feed", RetryInterval: 10 * time.Millisecond})
+	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{DSN: withParameters(address, "application_name=livewire_feed"), RetryInterval: 10 * time.Millisecond})
 	require.NoError(t, err)
 	transactor, err := postgresadapter.NewTransactor(&postgresadapter.TransactorOptions{Pool: pool})
 	require.NoError(t, err)

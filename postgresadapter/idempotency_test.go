@@ -142,7 +142,7 @@ func TestTheEarlierJSONBRecordsReplayBeforeAndAfterTheUpgrade(t *testing.T) {
 	database := newDatabase(t)
 	_, err := database.pool.Exec(t.Context(), earlierIdempotencySQL)
 	require.NoError(t, err)
-	single, err := pgxpool.New(t.Context(), database.dsn()+"?pool_max_conns=1") // the replica's one connection
+	single, err := pgxpool.New(t.Context(), database.dsnWith("pool_max_conns=1")) // the replica's one connection
 	require.NoError(t, err)
 	t.Cleanup(single.Close)
 	store := newIdempotencyStore(t, database)

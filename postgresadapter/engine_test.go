@@ -118,7 +118,7 @@ func newLiveEngine(t *testing.T, database *testDatabase) *liveEngine {
 			},
 		}),
 	))
-	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{DSN: database.dsn() + "?application_name=livewire_engine_feed", RetryInterval: 10 * time.Millisecond})
+	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{DSN: database.dsnWith("application_name=livewire_engine_feed"), RetryInterval: 10 * time.Millisecond})
 	require.NoError(t, err)
 	transactor := newTransactor(t, database.pool)
 	filters := newFilterStore(t, database, postgresadapter.FilterStoreOptions{})

@@ -293,7 +293,7 @@ func TestAuditMaintainCutsUTCMonthsWhateverTheSessionTimeZone(t *testing.T) {
 	database := newDatabase(t)
 	for _, timeZone := range []string{"Europe/Berlin", "America/New_York", "Pacific/Kiritimati"} {
 		t.Run(timeZone, func(t *testing.T) {
-			connection, err := pgx.Connect(t.Context(), database.dsn()+"?timezone="+timeZone)
+			connection, err := pgx.Connect(t.Context(), database.dsnWith("timezone="+timeZone))
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = connection.Close(context.Background()) }) // the database is dropped next; the close error carries nothing
 			_, err = connection.Exec(t.Context(), "DROP TABLE IF EXISTS livewire_audit_202603, livewire_audit_202604, livewire_audit_202612, livewire_audit_202701")
@@ -329,7 +329,7 @@ func TestAuditMaintainHoldsUnderConcurrentWrites(t *testing.T) {
 	t.Run("the store on a repeatable read default", func(t *testing.T) {
 		t.Parallel()
 		database := newDatabase(t)
-		repeatable, err := pgxpool.New(t.Context(), database.dsn()+"?default_transaction_isolation=repeatable%20read")
+		repeatable, err := pgxpool.New(t.Context(), database.dsnWith("default_transaction_isolation=repeatable%20read"))
 		require.NoError(t, err)
 		t.Cleanup(repeatable.Close)
 		store, err := postgresadapter.NewAuditStore(&postgresadapter.AuditStoreOptions{Pool: repeatable})

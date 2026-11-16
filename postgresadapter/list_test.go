@@ -286,7 +286,7 @@ func TestWriteCSVLeavesOutTheColumnsTheIdentityMayNotRead(t *testing.T) {
 func TestListPageRunsInTheEngineTransactionWhateverTheDatabase(t *testing.T) {
 	t.Parallel()
 	database := seedParts(t)
-	single, err := pgxpool.New(t.Context(), database.dsn()+"?pool_max_conns=1") // a second connection would wait forever
+	single, err := pgxpool.New(t.Context(), database.dsnWith("pool_max_conns=1")) // a second connection would wait forever
 	require.NoError(t, err)
 	t.Cleanup(single.Close)
 	read, err := newTransactor(t, single).Begin(t.Context(), livewire.TransactionDetails{Tenant: "north", ReadOnly: true})

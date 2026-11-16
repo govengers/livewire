@@ -3,19 +3,18 @@ package postgresadapter_test
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
-	"strconv"
-	"sync"
-	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/govengers/postgrestest"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
-	"github.com/govengers/livewire/internal/postgrestest"
 	"github.com/govengers/livewire/postgresadapter"
 )
 
@@ -38,72 +37,35 @@ CREATE TABLE orders_eu PARTITION OF orders FOR VALUES IN ('eu');
 CREATE TABLE orders_us PARTITION OF orders FOR VALUES IN ('us');
 `
 
-// postgres is the one embedded server of this test binary (TST-002): every test gets a
-// database of its own, cloned from the migrated template.
-var postgres struct {
-	server   *postgrestest.Server
-	mutex    sync.Mutex // CREATE DATABASE ... TEMPLATE refuses a template that another clone reads
-	sequence atomic.Int64
-}
-
-const templateDatabase = "livewire_template"
+// postgres is the one PostgreSQL of this test binary (TST-002, govengers/postgrestest): every
+// test gets a database of its own, copied from the template the package's SQL migrated.
+var postgres *postgrestest.Server
 
 func TestMain(m *testing.M) {
-	os.Exit(run(m))
+	statements, err := templateSQL()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "postgresadapter tests: the template's SQL: %v\n", err)
+		os.Exit(1)
+	}
+	postgres = postgrestest.New(&postgrestest.Options{
+		Migrate:     postgrestest.Statements(statements...),
+		Fingerprint: strings.Join(statements, "\n"),
+	})
+	goleak.VerifyTestMain(postgres.Main(m))
 }
 
-func run(m *testing.M) int {
-	server, err := postgrestest.Start()
-	if err != nil {
-		return fail("start embedded postgres", err)
-	}
-	defer func() { _ = server.Stop() }() // the test result is decided; a failed stop changes nothing
-	postgres.server = server
-	if err := migrateTemplate(); err != nil {
-		return fail("migrate the template database", err)
-	}
-	code := m.Run()
-	if code == 0 {
-		if err := goleak.Find(); err != nil {
-			return fail("goroutines leaked", err)
-		}
-	}
-	return code
-}
-
-func fail(what string, err error) int {
-	fmt.Fprintf(os.Stderr, "postgresadapter tests: %s: %v\n", what, err)
-	return 1
-}
-
-func dsn(database string) string { return postgres.server.URL(database) }
-
-// migrateTemplate applies every SQL text of the package, as an application's migrations
-// would, to the template database.
-func migrateTemplate() error {
-	ctx := context.Background()
-	admin, err := pgx.Connect(ctx, dsn("postgres"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = admin.Close(ctx) }() // the template is created or the error is returned; the close error adds nothing
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+templateDatabase); err != nil {
-		return err
-	}
-	connection, err := pgx.Connect(ctx, dsn(templateDatabase))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = connection.Close(ctx) }() // as above
+// templateSQL is every SQL text of the package, in the order an application's migrations would
+// apply them.
+func templateSQL() ([]string, error) {
 	partsHistory, err := postgresadapter.HistorySQL("parts")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ordersHistory, err := postgresadapter.HistorySQL("orders")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, statements := range []string{
+	return []string{
 		fixtureSQL,
 		postgresadapter.TriggerFunctionSQL,
 		postgresadapter.TriggerSQL("parts"),
@@ -115,46 +77,39 @@ func migrateTemplate() error {
 		postgresadapter.IdempotencySQL,
 		postgresadapter.AuditSQL,
 		postgresadapter.PresenceSQL,
-	} {
-		if _, err := connection.Exec(ctx, statements); err != nil {
-			return fmt.Errorf("%w\n%s", err, statements)
-		}
-	}
-	return nil
+	}, nil
 }
 
-// testDatabase is a database of one test: its name and a pool on it.
+// testDatabase is a database of one test: its name, its URL and a pool on it.
 type testDatabase struct {
 	name string
+	url  string
 	pool *pgxpool.Pool
 }
 
-func (d *testDatabase) dsn() string { return dsn(d.name) }
+func (d *testDatabase) dsn() string { return d.url }
 
-// newDatabase clones the template into a database of the test's own and drops it after.
+// dsnWith is the database's URL with the query parameters added (key=value pairs joined by &).
+func (d *testDatabase) dsnWith(parameters string) string {
+	if parameters == "" {
+		return d.url
+	}
+	if strings.Contains(d.url, "?") {
+		return d.url + "&" + parameters
+	}
+	return d.url + "?" + parameters
+}
+
+// newDatabase is a copy of the template of the test's own, dropped after the test.
 func newDatabase(t *testing.T) *testDatabase {
 	t.Helper()
-	name := "test_" + strconv.FormatInt(postgres.sequence.Add(1), 10)
-	admin, err := pgx.Connect(t.Context(), dsn("postgres"))
+	address := postgres.Database(t)
+	parsed, err := url.Parse(address)
 	require.NoError(t, err)
-	postgres.mutex.Lock()
-	_, err = admin.Exec(t.Context(), "CREATE DATABASE "+name+" TEMPLATE "+templateDatabase)
-	postgres.mutex.Unlock()
-	require.NoError(t, admin.Close(t.Context()))
+	pool, err := pgxpool.New(t.Context(), address)
 	require.NoError(t, err)
-	pool, err := pgxpool.New(t.Context(), dsn(name))
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		pool.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		admin, err := pgx.Connect(ctx, dsn("postgres"))
-		require.NoError(t, err)
-		_, err = admin.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)")
-		require.NoError(t, err)
-		require.NoError(t, admin.Close(ctx))
-	})
-	return &testDatabase{name: name, pool: pool}
+	t.Cleanup(pool.Close)
+	return &testDatabase{name: strings.TrimPrefix(parsed.Path, "/"), url: address, pool: pool}
 }
 
 // notifications listens on the change channel of database on a connection of its own.

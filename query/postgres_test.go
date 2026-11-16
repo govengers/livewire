@@ -3,15 +3,16 @@ package query_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/govengers/postgrestest"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 
-	"github.com/govengers/livewire/internal/postgrestest"
 	"github.com/govengers/livewire/query"
 )
 
@@ -81,21 +82,19 @@ var (
 	}}
 )
 
-// startPostgres starts the test binary's one PostgreSQL (TestPostgresSemantics is its only
-// user) and returns a connection with the schema applied.
+// postgres is the test binary's one PostgreSQL (TST-002, govengers/postgrestest); it starts with
+// the first test that asks for a database, so the tests without one start nothing.
+var postgres = postgrestest.New(&postgrestest.Options{Migrate: postgrestest.Statements(schema), Fingerprint: schema})
+
+func TestMain(m *testing.M) { os.Exit(postgres.Main(m).Run()) }
+
+// startPostgres returns a connection to a copy of the template with the schema applied, dropped
+// after the test (TestPostgresSemantics is its only user).
 func startPostgres(t *testing.T) *pgx.Conn {
 	t.Helper()
-	server, err := postgrestest.Start()
-	if err != nil {
-		t.Skipf("embedded postgres did not start (download or platform): %v", err)
-	}
-	t.Cleanup(func() { require.NoError(t, server.Stop()) })
-
-	connection, err := pgx.Connect(t.Context(), server.URL("postgres"))
+	connection, err := pgx.Connect(t.Context(), postgres.Database(t))
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = connection.Close(context.Background()) }) // the database stops right after; the close error carries nothing
-	_, err = connection.Exec(t.Context(), schema)
-	require.NoError(t, err)
+	t.Cleanup(func() { _ = connection.Close(context.Background()) }) // the database is dropped right after; the close error carries nothing
 	return connection
 }
 
