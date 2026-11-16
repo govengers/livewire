@@ -45,7 +45,10 @@ func livewireSchema(ctx context.Context, transaction *sql.Tx) error {
 - A trigger notifies `{table, op, id, partition}` on the channel `livewire` (`postgresadapter.Channel`), one per row. A TRUNCATE notifies one change without an id, which reaches every subscription of the table. Two applications on one database receive each other's changes; the engine ignores tables it does not subscribe.
 - A natively partitioned table reports its root table. A partition attached later notifies its own TRUNCATE only once `TriggerSQL` ran again; a DETACH notifies nothing.
 - The notify trigger reads only the row's `id` and partition column, by name (D88): a large column costs a write nothing extra, and a `json` value that jsonb refuses (a `\u0000` escape) fails no write. The history trigger does convert the row.
-- Whether a table has an `id` column and the partition column is looked up when `TriggerSQL` or `PartitionedTriggerSQL` runs. A migration that adds, drops, renames or changes the type of a live table's `id` or partition column runs `TriggerUpgradeSQL` too: without it, a session that wrote the table before keeps the reads it compiled and fails its next writes (SQLSTATE 42804) until it disconnects.
+- Whether a table has an `id` column and the partition column is looked up when `TriggerSQL` or `PartitionedTriggerSQL` runs, so a migration that changes either column of a live table runs the table's trigger SQL again in the same migration:
+  - a type change: `TriggerUpgradeSQL` (or the table's `TriggerSQL`/`PartitionedTriggerSQL`). Without it, a session that wrote the table before keeps the read it compiled for the old type and fails its next writes (SQLSTATE 42804) until it disconnects.
+  - a rename or drop: every session's writes fail (SQLSTATE 42703, `record "new" has no field ...`) until the table's trigger SQL runs again. After a rename of the partition column that is `PartitionedTriggerSQL(table, newName)`: `TriggerUpgradeSQL` knows only the old name and would drop the partition, so every change would reach every partition's subscriptions.
+  - an added column: the table's trigger SQL, or `TriggerUpgradeSQL`.
 - Leave tables with large binary columns out of `HistorySQL`: every version stores the whole row as jsonb, and a versioned table cannot hold a json value jsonb refuses.
 
 ### A changed trigger SQL
@@ -75,7 +78,7 @@ ALTER TABLE livewire_idempotency ALTER COLUMN response TYPE bytea USING convert_
 
 - The `ALTER` rewrites the table under an ACCESS EXCLUSIVE lock, so mutations wait for it; the table holds one `Window` of records (default 24 h), and the lock timeout keeps a busy table from stalling the deploy.
 - It changes the types the store's statements were prepared with. Every pooled connection that prepared them before fails two idempotent calls after it: the reservation's read with SQLSTATE 0A000 (`cached plan must not change result type`), then the record's UPDATE, whose parameter was prepared as jsonb, with 42804. pgx prepares each statement again after its failure, so a retry on the same connection can fail too (D74). **Restart every replica after the migration**; the restart is required.
-- An application's own migration that changes the type of a live table's `id` or partition column (or adds, drops or renames one) runs `TriggerUpgradeSQL` in the same migration (D88): the notify trigger reads those columns by name, a session that ran it compiled the reads for the old type, and only a replaced function makes every session compile it anew. Without it, those sessions fail every later write to the table (SQLSTATE 42804) until they disconnect.
+- An application's own migration that changes a live table's `id` or partition column runs the table's trigger SQL again in the same migration (D88, the bullets under the table above): `TriggerUpgradeSQL` after a type change (42804 on sessions that wrote before), `PartitionedTriggerSQL(table, newName)` after a rename of the partition column (42703 on every session).
 
 ## The transactor
 

@@ -124,12 +124,12 @@ func TestTriggerUpgradeSQLUpgradesTheEarlierTriggersInAMigration(t *testing.T) {
 	triggers, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	require.NoError(t, err)
 	require.Equal(t, []string{
-		"documents livewire_notify livewire_notify_tenant('id', 'tenant')",
-		"gadgets livewire_notify livewire_notify_tenant_id('id', 'tenant_id')",
-		"livewire_presence livewire_notify livewire_notify_tenant('', 'tenant')",
-		"livewire_presence livewire_notify_update livewire_notify_tenant('', 'tenant')",
-		"orders livewire_notify livewire_notify('id', '')",
-		"parts livewire_notify livewire_notify('id', '')",
+		"documents livewire_notify livewire_notify_tenant('tenant', 'id')",
+		"gadgets livewire_notify livewire_notify_tenant_id('tenant_id', 'id')",
+		"livewire_presence livewire_notify livewire_notify_tenant('tenant', '')",
+		"livewire_presence livewire_notify_update livewire_notify_tenant('tenant', '')",
+		"orders livewire_notify livewire_notify('', 'id')",
+		"parts livewire_notify livewire_notify('', 'id')",
 	}, triggers, "every row trigger reads its table's columns by name")
 
 	listening := notifications(t, database)
@@ -150,6 +150,52 @@ func TestTriggerUpgradeSQLUpgradesTheEarlierTriggersInAMigration(t *testing.T) {
 	require.NoError(t, err)
 	_, err = database.pool.Exec(t.Context(), postgresadapter.TriggerUpgradeSQL)
 	require.NoError(t, err, "an installation without presences upgrades too")
+}
+
+func TestTriggerSQLOnTheEarlierFunctionSendsTheIDAndNoPartition(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	// An installation still on v1.0.1's livewire_notify() that adds live tables with this
+	// release's SQL before its TriggerUpgradeSQL migration.
+	_, err := database.pool.Exec(t.Context(), documentsTableSQL+earlierTriggersSQL+`CREATE TABLE notes (id uuid PRIMARY KEY DEFAULT uuidv7(), title text NOT NULL);
+CREATE TABLE memos (id uuid PRIMARY KEY DEFAULT uuidv7(), title text NOT NULL);
+`+postgresadapter.TriggerSQL("notes")+postgresadapter.PartitionedTriggerSQL("memos", "tenant"))
+	require.NoError(t, err)
+	listening := notifications(t, database)
+
+	for _, table := range []string{"notes", "memos"} {
+		var id string
+		require.NoError(t, database.pool.QueryRow(t.Context(), "INSERT INTO "+table+" (title) VALUES ('a') RETURNING id::text").Scan(&id))
+		require.JSONEq(t, `{"table":"`+table+`","op":"insert","id":"`+id+`","partition":""}`, nextPayload(t, listening, time.Second),
+			"the earlier function reads the first argument as the partition column")
+	}
+}
+
+func TestTriggerUpgradeSQLLeavesTheTriggersOfOtherFunctions(t *testing.T) {
+	t.Parallel()
+	database := newDatabase(t)
+	// A library's own trigger of that name (one that skips some updates) and another
+	// application's livewire_notify() in a schema outside the search path.
+	_, err := database.pool.Exec(t.Context(), `CREATE TABLE queue (id uuid PRIMARY KEY DEFAULT uuidv7(), lease_until timestamptz);
+CREATE FUNCTION queue_notify() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+CREATE TRIGGER livewire_notify AFTER INSERT OR DELETE ON queue FOR EACH ROW EXECUTE FUNCTION queue_notify();
+CREATE SCHEMA other;
+CREATE FUNCTION other.livewire_notify() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+CREATE TABLE other.things (id uuid PRIMARY KEY DEFAULT uuidv7(), tenant text);
+CREATE TRIGGER livewire_notify AFTER INSERT OR UPDATE OR DELETE ON other.things FOR EACH ROW EXECUTE FUNCTION other.livewire_notify('tenant');
+`)
+	require.NoError(t, err)
+	definitions := func() []string {
+		rows, err := database.pool.Query(t.Context(), "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid IN ('queue'::regclass, 'other.things'::regclass) ORDER BY 1")
+		require.NoError(t, err)
+		definitions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		return definitions
+	}
+	before := definitions()
+	_, err = database.pool.Exec(t.Context(), postgresadapter.TriggerUpgradeSQL)
+	require.NoError(t, err)
+	require.Equal(t, before, definitions(), "only the triggers of livewire's functions are re-created")
 }
 
 func TestTriggerUpgradeSQLLetsAWarmSessionWriteAfterTheIDsTypeChanged(t *testing.T) {

@@ -529,7 +529,8 @@ func TestTriggerSQLKeepsNamesThatHoldItsDollarQuote(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
 	_, err := database.pool.Exec(t.Context(), `CREATE TABLE "x$livewire$y" (id uuid PRIMARY KEY DEFAULT uuidv7());
-		CREATE TABLE plain (id uuid PRIMARY KEY DEFAULT uuidv7(), "c$livewire$" text NOT NULL)`)
+		CREATE TABLE plain (id uuid PRIMARY KEY DEFAULT uuidv7(), "c$livewire$" text NOT NULL);
+		CREATE TABLE odd (id uuid PRIMARY KEY DEFAULT uuidv7(), "a$$b" text NOT NULL)`)
 	require.NoError(t, err)
 	_, err = database.pool.Exec(t.Context(), postgresadapter.TriggerSQL("x$livewire$y"))
 	require.NoError(t, err)
@@ -545,6 +546,10 @@ func TestTriggerSQLKeepsNamesThatHoldItsDollarQuote(t *testing.T) {
 	_, err = database.pool.Exec(t.Context(), "TRUNCATE plain")
 	require.NoError(t, err)
 	require.JSONEq(t, `{"table":"plain","op":"delete","id":"","partition":""}`, nextPayload(t, listening, time.Second))
+	_, err = database.pool.Exec(t.Context(), postgresadapter.PartitionedTriggerSQL("odd", "a$$b"))
+	require.NoError(t, err, "a column name holding the function body's quote")
+	require.NoError(t, database.pool.QueryRow(t.Context(), `INSERT INTO odd ("a$$b") VALUES ('north') RETURNING id::text`).Scan(&id))
+	require.JSONEq(t, `{"table":"odd","op":"insert","id":"`+id+`","partition":"north"}`, nextPayload(t, listening, time.Second))
 }
 
 func writeConcurrently(t *testing.T, database *testDatabase, statement string, maintain func() error) {
