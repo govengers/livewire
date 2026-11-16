@@ -75,7 +75,7 @@ func TestListenerResynchronizesOnEveryConnectAndDeliversChanges(t *testing.T) {
 	database := newDatabase(t)
 	delivered := &feed{}
 	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{
-		DSN: database.dsn() + "?application_name=livewire_listener", RetryInterval: 10 * time.Millisecond, OnError: delivered.failed,
+		DSN: database.dsnWith("application_name=livewire_listener"), RetryInterval: 10 * time.Millisecond, OnError: delivered.failed,
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -106,7 +106,7 @@ func TestListenerPingsASilentConnection(t *testing.T) {
 	t.Parallel()
 	database := newDatabase(t)
 	listener, err := postgresadapter.NewListener(&postgresadapter.ListenerOptions{
-		DSN: database.dsn() + "?application_name=livewire_pinged", PingInterval: 200 * time.Millisecond,
+		DSN: database.dsnWith("application_name=livewire_pinged"), PingInterval: 200 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	runListener(t, listener)

@@ -103,11 +103,11 @@ func TestFilterSaveBoundsTheFiltersOfAnOwner(t *testing.T) {
 
 func TestFilterMaximumsHoldUnderConcurrentSaves(t *testing.T) {
 	t.Parallel()
-	for name, parameters := range map[string]string{"server default": "", "repeatable read default": "?default_transaction_isolation=repeatable%20read"} {
+	for name, parameters := range map[string]string{"server default": "", "repeatable read default": "default_transaction_isolation=repeatable%20read"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			database := newDatabase(t)
-			pool, err := pgxpool.New(t.Context(), database.dsn()+parameters)
+			pool, err := pgxpool.New(t.Context(), database.dsnWith(parameters))
 			require.NoError(t, err)
 			t.Cleanup(pool.Close)
 			store, err := postgresadapter.NewFilterStore(&postgresadapter.FilterStoreOptions{Pool: pool, MaximumUnnamedPerOwner: 1, MaximumNamedPerOwner: 1})
