@@ -117,6 +117,27 @@ async function main(): Promise<void> {
   await logout(engineB, alice)
   const stale = await fetch(`${engineA}/api/notes`, { headers: { Cookie: alice.cookie } })
   if (stale.status !== 401) throw new Error(`alice's cookie still reads on engine A after her logout on B: ${stale.status}`)
+  // D97: a tab still holding the logged-out cookie opens a socket; the engine upgrades it and
+  // closes 4401, so the runtime ends and calls onUnauthorized once instead of reconnecting.
+  let unauthorized = 0
+  let sockets = 0
+  const StaleSocket = socketOf(alice.cookie)
+  const stalePair = createLivePair({
+    identity: () => alice.identity,
+    client: { baseURL: `${engineA}/api`, headers: () => ({ Cookie: alice.cookie }) },
+    connection: {
+      url: `${engineB.replace(/^http/, 'ws')}/api/socket`,
+      WebSocket: class extends StaleSocket { constructor(url: string) { super(url); sockets++ } },
+      reconnectDelay: 50,
+      onUnauthorized: () => { unauthorized++ },
+    },
+  })
+  const staleWatch = watchNotes(stalePair.connection)
+  await eventually('the stale tab heard the identity is gone', () => unauthorized === 1)
+  await eventually('the stale subscription ended', () => staleWatch.ended)
+  if (stalePair.connection.status !== 'ended') throw new Error(`the stale connection is ${stalePair.connection.status}, not ended`)
+  await new Promise((resolve) => setTimeout(resolve, 300)) // six reconnect delays
+  if (sockets !== 1 || unauthorized !== 1) throw new Error(`the stale tab opened ${sockets} sockets and heard ${unauthorized} 4401s`)
   const bob = await login(engineB, 'bob')
   if (bob.identity === alice.identity || bob.cookie === alice.cookie) throw new Error('the re-login kept alice\'s session')
   pair = pairOf(bob)

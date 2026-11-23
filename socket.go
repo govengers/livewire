@@ -71,6 +71,8 @@ func (e *Engine) serveSocket(writer http.ResponseWriter, request *http.Request) 
 			writeError(writer, err)
 			return
 		}
+		// the socket's context carries its identity, as an authentication middleware's would
+		request = request.WithContext(auth.WithIdentity(request.Context(), identity))
 	}
 	clientSocket, err := e.admit(request, identity)
 	if err != nil {
@@ -90,31 +92,41 @@ func (e *Engine) serveSocket(writer http.ResponseWriter, request *http.Request) 
 // a browser's client learns the identity is gone (a refused handshake only shows it 1006) and
 // the browser does not count a failed handshake against the host. It reads until the client's
 // close or the frame timeout before it closes: a close with unread frames (the subscribes a
-// client sends on open) resets the connection, which may discard the close frame.
+// client sends on open) resets the connection, which may discard the close frame. A closing
+// engine refuses it with 503 as it refuses every socket, and Close waits for it; it is
+// observed as an open and a close, as every upgraded socket is.
 func (e *Engine) closeGone(writer http.ResponseWriter, request *http.Request) {
-	unit := startUnit(OutcomeClose, "", "")
+	e.mutex.Lock()
+	if e.closing {
+		e.mutex.Unlock()
+		writeError(writer, errUnavailable)
+		return
+	}
+	e.lifetimes.Add(1)
+	e.mutex.Unlock()
+	defer e.lifetimes.Done()
 	connection, err := e.upgrader.Upgrade(writer, request, nil)
 	if err != nil {
 		return // the upgrader answered the handshake failure
 	}
+	ctx := request.Context()
+	opened := startUnit(OutcomeOpen, "", "")
+	e.observeAlone(ctx, opened, opened.outcome(ctx, nil))
+	closed := startUnit(OutcomeClose, "", "")
 	deadline := time.Now().Add(closeFrameTimeout)
 	_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(CloseIdentityGone, "the identity is gone"), deadline) // a peer that does not take it is gone
 	_ = connection.SetReadDeadline(deadline)
-	connection.SetReadLimit(maximumGoneFrameBytes)
+	connection.SetReadLimit(e.options.FrameBytes)
 	for {
 		if _, _, err := connection.NextReader(); err != nil {
 			break // the client's close, the deadline or a broken connection
 		}
 	}
 	_ = connection.Close() // the close of a hijacked connection reports nothing to act on
-	outcome := unit.outcome(request.Context(), nil)
+	outcome := closed.outcome(ctx, nil)
 	outcome.Status = CloseIdentityGone
-	e.observeAlone(request.Context(), unit, outcome)
+	e.observeAlone(ctx, closed, outcome)
 }
-
-// maximumGoneFrameBytes bounds a frame closeGone reads past: a client's first frames are
-// small requests, and a larger one only ends the wait for its close early.
-const maximumGoneFrameBytes = 64 * 1024
 
 // identityGone tells whether an IdentitySource answer says the identity is gone (D7): a nil
 // identity without an error, auth.ErrUnauthenticated or auth.ErrForbidden.
@@ -122,7 +134,7 @@ func identityGone(identity *auth.Identity, err error) bool {
 	return (identity == nil && err == nil) || errors.Is(err, auth.ErrUnauthenticated) || errors.Is(err, auth.ErrForbidden)
 }
 
-// originAllowed applies D9:an allowed origin or the request's own host; no Origin only for
+// originAllowed applies D9: an allowed origin or the request's own host; no Origin only for
 // a request without cookies, which no browser's socket is.
 func (e *Engine) originAllowed(request *http.Request) bool {
 	origin := request.Header.Get("Origin")

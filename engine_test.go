@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -320,27 +321,56 @@ func TestOriginCheck(t *testing.T) {
 func TestHandshakeIdentity(t *testing.T) {
 	t.Run("a gone identity is upgraded and closed 4401", func(t *testing.T) {
 		bed := newTestbed(t, nil)
-		connection, response, err := bed.dialRaw("nobody", http.Header{"Origin": {"https://app.example"}})
-		require.NoError(t, err)
-		require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
-		require.NoError(t, response.Body.Close())
-		defer func() { _ = connection.Close() }()
+		connection := dialGone(t, bed)
 		// a browser's client subscribes as soon as the socket opens: the close still arrives
 		require.NoError(t, connection.WriteJSON(livewire.RequestFrame{ID: "1", Operation: livewire.OperationSubscribe, Target: "gadgets"}))
-		require.NoError(t, connection.SetReadDeadline(time.Now().Add(frameWait)))
-		_, _, err = connection.ReadMessage()
-		var closeError *websocket.CloseError
-		require.ErrorAs(t, err, &closeError)
-		require.Equal(t, livewire.CloseIdentityGone, closeError.Code)
+		requireClosedGone(t, connection)
 		require.Eventually(t, func() bool {
 			closes := bed.outcomes.of(livewire.OutcomeClose)
 			return len(closes) == 1 && closes[0].Status == livewire.CloseIdentityGone
 		}, frameWait, time.Millisecond, "the close is observed")
-		require.Empty(t, bed.outcomes.of(livewire.OutcomeOpen), "no socket was served")
+		require.Len(t, bed.outcomes.of(livewire.OutcomeOpen), 1, "an open per close: an Observer pairing them (the sockets gauge) stays balanced")
+	})
+
+	t.Run("the close waits for the client's close", func(t *testing.T) {
+		bed := newTestbed(t, nil)
+		connection := dialGone(t, bed)
+		var code int
+		connection.SetCloseHandler(func(received int, _ string) error { code = received; return nil }) // no echo yet
+		require.NoError(t, connection.SetReadDeadline(time.Now().Add(frameWait)))
+		_, _, err := connection.ReadMessage()
+		require.Error(t, err)
+		require.Equal(t, livewire.CloseIdentityGone, code)
+		require.Never(t, func() bool { return len(bed.outcomes.of(livewire.OutcomeClose)) > 0 }, 200*time.Millisecond, 10*time.Millisecond,
+			"the server reads until the client's close: closing with unread frames resets the connection, which may lose the 4401")
+		require.NoError(t, connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, ""), time.Now().Add(frameWait)))
+		require.Eventually(t, func() bool { return len(bed.outcomes.of(livewire.OutcomeClose)) == 1 }, frameWait, time.Millisecond)
+	})
+
+	t.Run("a closing engine refuses it and Close waits for it", func(t *testing.T) {
+		bed := newTestbed(t, nil)
+		connection := dialGone(t, bed)
+		connection.SetCloseHandler(func(int, string) error { return nil }) // holds the server until its read deadline
+		go func() { _, _, _ = connection.ReadMessage() }()
+		closeContext, cancel := context.WithTimeout(t.Context(), frameWait)
+		defer cancel()
+		require.NoError(t, bed.engine.Close(closeContext))
+		require.Len(t, bed.outcomes.of(livewire.OutcomeClose), 1, "Close returned after the gone socket was observed")
+
+		_, response, err := bed.dialRaw("nobody", http.Header{})
+		require.Error(t, err)
+		require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+		require.NoError(t, response.Body.Close())
 	})
 
 	t.Run("the source names the identity without a middleware", func(t *testing.T) {
-		bed := newTestbed(t, nil)
+		var opened atomic.Pointer[auth.Identity]
+		bed := newTestbedWith(t, livewire.RegistryOptions{StartUnit: func(ctx context.Context, unit livewire.Unit) (context.Context, func()) {
+			if unit.Kind == livewire.OutcomeOpen {
+				opened.Store(auth.IdentityFrom(ctx))
+			}
+			return ctx, func() {}
+		}}, nil)
 		server := httptest.NewServer(bed.engine.Handler())
 		defer server.Close()
 		header := http.Header{subjectHeader: {"ada"}}
@@ -353,6 +383,8 @@ func TestHandshakeIdentity(t *testing.T) {
 		var answer livewire.ResponseFrame
 		require.NoError(t, connection.ReadJSON(&answer))
 		require.True(t, answer.OK, "the socket serves ada")
+		require.NotNil(t, opened.Load(), "the socket's units run on a context with its identity")
+		require.Equal(t, "ada", opened.Load().Subject)
 	})
 
 	t.Run("a failing source is refused before the upgrade", func(t *testing.T) {
@@ -370,6 +402,27 @@ func TestHandshakeIdentity(t *testing.T) {
 		require.Equal(t, http.StatusInternalServerError, response.StatusCode, "a panicking source")
 		require.NoError(t, response.Body.Close())
 	})
+}
+
+// dialGone opens a socket as a subject the IdentitySource does not know, from an allowed origin.
+func dialGone(t *testing.T, bed *testbed) *websocket.Conn {
+	t.Helper()
+	connection, response, err := bed.dialRaw("nobody", http.Header{"Origin": {"https://app.example"}})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+	t.Cleanup(func() { _ = connection.Close() })
+	return connection
+}
+
+// requireClosedGone reads the socket until its close, which must be 4401.
+func requireClosedGone(t *testing.T, connection *websocket.Conn) {
+	t.Helper()
+	require.NoError(t, connection.SetReadDeadline(time.Now().Add(frameWait)))
+	_, _, err := connection.ReadMessage()
+	var closeError *websocket.CloseError
+	require.ErrorAs(t, err, &closeError)
+	require.Equal(t, livewire.CloseIdentityGone, closeError.Code)
 }
 
 func TestSocketLimits(t *testing.T) {

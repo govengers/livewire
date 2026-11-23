@@ -81,6 +81,10 @@ type ChangeFeed interface {
 // auth.ErrUnauthenticated (no session, expired, revoked: what session.Guard.Identify
 // returns) or auth.ErrForbidden (a refused refresh), or a nil identity with a nil error. Any
 // other error is a failure of the source: the engine keeps the last identity and retries.
+// The engine also identifies a socket's upgrade with it when no middleware put an identity
+// into the request's context (D97), so it must apply every check the REST authentication
+// applies, and answer ErrForbidden only for a gone identity, never for a missing right of a
+// valid session: the client takes a 4401 for a logout.
 type IdentitySource interface {
 	Identify(ctx context.Context, request *http.Request) (*auth.Identity, error)
 }

@@ -152,7 +152,7 @@ func newReplica(t *testing.T, address string, logins *logins) *replica {
 	authginadapter.RegisterRoutes(router, logins.provider.Routes())
 	api := router.Group("", authginadapter.Middleware(logins.middleware))
 	require.NoError(t, ginadapter.RegisterRoutes(api, &ginadapter.Options{Engine: engine}))
-	api.GET("/api/socket", ginadapter.SocketHandler(engine))
+	router.GET("/api/socket", ginadapter.SocketHandler(engine)) // outside the 401: Identify names the socket (D97)
 	server := httptest.NewServer(router)
 	ctx, cancel := context.WithCancel(context.Background())
 	running := make(chan error, 1)
