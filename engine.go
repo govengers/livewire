@@ -232,13 +232,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		return errEngineRunning
 	}
 	defer e.running.Store(false)
-	e.mutex.Lock()
-	closing := e.closing
-	if !closing {
-		e.lifetimes.Add(1)
-	}
-	e.mutex.Unlock()
-	if closing {
+	if !e.enter() {
 		return nil
 	}
 	defer e.lifetimes.Done()
@@ -368,6 +362,19 @@ func (e *Engine) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return fmt.Errorf("livewire: close the engine: %w", ctx.Err())
 	}
+}
+
+// enter counts a lifetime Close waits for, unless the engine is closing: under the mutex
+// Close sets closing in, so no lifetime starts after Close began to wait. The caller ends a
+// counted lifetime with e.lifetimes.Done.
+func (e *Engine) enter() bool {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+	if e.closing {
+		return false
+	}
+	e.lifetimes.Add(1)
+	return true
 }
 
 // RevalidateAll re-validates the identity of every socket now, through the IdentitySource

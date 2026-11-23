@@ -41,11 +41,12 @@ var (
 
 // Handler is the socket endpoint: it refuses an Origin that is neither allowed nor the
 // request's own host with 403 (D9; a request without Origin is a browser's only when it
-// carries cookies, so it is refused then and admitted otherwise), a request without an
-// identity in its context (auth.IdentityFrom; put the handler behind the same
-// authentication as the REST routes) with 401, an owner past SocketsPerOwner with 429 and a
-// closing engine with 503, each with the one error body; then it upgrades and serves the
-// socket until it ends.
+// carries cookies, so it is refused then and admitted otherwise). The socket acts as the
+// identity in the request's context (auth.IdentityFrom), else as the one the IdentitySource
+// answers for the upgrade request (D97), so the handler needs no authentication in front of
+// it. A gone identity upgrades and closes 4401 at once; a failing source answers its error
+// body, an owner past SocketsPerOwner 429 and a closing engine 503; then it upgrades and
+// serves the socket until it ends.
 func (e *Engine) Handler() http.Handler {
 	return http.HandlerFunc(e.serveSocket)
 }
@@ -57,8 +58,23 @@ func (e *Engine) serveSocket(writer http.ResponseWriter, request *http.Request) 
 	}
 	identity := auth.IdentityFrom(request.Context())
 	if identity == nil {
-		writeError(writer, auth.ErrUnauthenticated)
-		return
+		identified := startUnit(OutcomeRevalidate, "", "")
+		err := recovering(func() error {
+			var identifyError error
+			identity, identifyError = e.options.IdentitySource.Identify(request.Context(), request)
+			return identifyError
+		})
+		switch {
+		case identityGone(identity, err):
+			e.closeGone(writer, request)
+			return
+		case err != nil:
+			e.observeAlone(request.Context(), identified, identified.outcome(request.Context(), err)) // the source's failure, a panic's stack included
+			writeError(writer, err)
+			return
+		}
+		// the socket's context carries its identity, as an authentication middleware's would
+		request = request.WithContext(auth.WithIdentity(request.Context(), identity))
 	}
 	clientSocket, err := e.admit(request, identity)
 	if err != nil {
@@ -72,6 +88,48 @@ func (e *Engine) serveSocket(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 	clientSocket.serve(connection)
+}
+
+// closeGone answers a handshake whose identity is gone (D97): it upgrades and closes 4401, so
+// a browser's client learns the identity is gone (a refused handshake only shows it 1006) and
+// the browser does not count a failed handshake against the host. It reads until the client's
+// close or the frame timeout before it closes: a close with unread frames (the subscribes a
+// client sends on open) resets the connection, which may discard the close frame. A closing
+// engine refuses it with 503 as it refuses every socket, and Close waits for it; it is
+// observed as an open and a close, as every upgraded socket is.
+func (e *Engine) closeGone(writer http.ResponseWriter, request *http.Request) {
+	if !e.enter() {
+		writeError(writer, errUnavailable)
+		return
+	}
+	defer e.lifetimes.Done()
+	connection, err := e.upgrader.Upgrade(writer, request, nil)
+	if err != nil {
+		return // the upgrader answered the handshake failure
+	}
+	ctx := request.Context()
+	opened := startUnit(OutcomeOpen, "", "")
+	e.observeAlone(ctx, opened, opened.outcome(ctx, nil))
+	closed := startUnit(OutcomeClose, "", "")
+	deadline := time.Now().Add(closeFrameTimeout)
+	_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(CloseIdentityGone, "the identity is gone"), deadline) // a peer that does not take it is gone
+	_ = connection.SetReadDeadline(deadline)
+	connection.SetReadLimit(e.options.FrameBytes)
+	for {
+		if _, _, err := connection.NextReader(); err != nil {
+			break // the client's close, the deadline or a broken connection
+		}
+	}
+	_ = connection.Close() // the close of a hijacked connection reports nothing to act on
+	outcome := closed.outcome(ctx, nil)
+	outcome.Status = CloseIdentityGone
+	e.observeAlone(ctx, closed, outcome)
+}
+
+// identityGone tells whether an IdentitySource answer says the identity is gone (D7): a nil
+// identity without an error, auth.ErrUnauthenticated or auth.ErrForbidden.
+func identityGone(identity *auth.Identity, err error) bool {
+	return (identity == nil && err == nil) || errors.Is(err, auth.ErrUnauthenticated) || errors.Is(err, auth.ErrForbidden)
 }
 
 // originAllowed applies D9: an allowed origin or the request's own host; no Origin only for
@@ -441,9 +499,8 @@ func (s *socket) freshIdentity(ctx context.Context) (*auth.Identity, error) {
 			return identifyError
 		})
 	})
-	gone := (identity == nil && err == nil) || errors.Is(err, auth.ErrUnauthenticated) || errors.Is(err, auth.ErrForbidden)
 	switch {
-	case gone:
+	case identityGone(identity, err):
 		s.close(CloseIdentityGone, "the identity is gone")
 		return nil, errIdentityGone
 	case err != nil:

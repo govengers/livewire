@@ -81,8 +81,8 @@ func ExampleRegistry_Add() {
 // ExampleNewEngine wires the engine in main: the registry, the IdentitySource that
 // re-validates every socket (session.Guard), the Transactor and the change feed of
 // postgresadapter, the browser origins that may open a socket. Handler serves the socket
-// behind the same authentication as the REST routes; Run consumes the change feed until the
-// context ends; Close ends every socket with 1001.
+// without the REST routes' authentication, the IdentitySource identifies it (D97); Run
+// consumes the change feed until the context ends; Close ends every socket with 1001.
 func ExampleNewEngine() {
 	var (
 		ctx            context.Context
@@ -90,7 +90,6 @@ func ExampleNewEngine() {
 		identitySource livewire.IdentitySource // session.Guard
 		transactor     livewire.Transactor     // postgresadapter
 		changeFeed     livewire.ChangeFeed     // postgresadapter's LISTEN feed
-		authenticate   func(http.Handler) http.Handler
 	)
 	engine, err := livewire.NewEngine(&livewire.EngineOptions{
 		Registry:       registry,
@@ -103,7 +102,7 @@ func ExampleNewEngine() {
 		fmt.Println(err)
 		return
 	}
-	http.Handle("/api/v1/socket", authenticate(engine.Handler())) // the Go client's default socket URL
+	http.Handle("/api/v1/socket", engine.Handler()) // the Go client's default socket URL
 	go func() { _ = engine.Run(ctx) }()
 	defer func() { _ = engine.Close(ctx) }()
 }

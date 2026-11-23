@@ -117,7 +117,9 @@ func NewRouter(options *Options) (*gin.Engine, error) {
 		return nil, err
 	}
 	socket := ginadapter.SocketHandler(engine)
-	api.GET(SocketPath, func(ginContext *gin.Context) {
+	// outside the authentication: the engine's IdentitySource names the socket, and a gone
+	// identity gets 4401 instead of a refused handshake, which a browser cannot read (D97)
+	router.GET(SocketPath, func(ginContext *gin.Context) {
 		// The socket's units of work are not the upgrade request: they get events of their own
 		// (NewUnitStarter), so nothing writes to the upgrade's event after it was emitted (LOG-008).
 		ginContext.Request = ginContext.Request.WithContext(wideevent.NewContext(ginContext.Request.Context(), nil))

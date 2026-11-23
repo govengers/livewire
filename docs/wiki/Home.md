@@ -34,7 +34,7 @@ Authorization is govengers/auth: `auth.IdentityFrom(ctx)` is the identity, `auth
 4. Build the services, then the registry with its `Tenant` function, its `Observer` (`prometheusadapter.Metrics.Observe`) and its `StartUnit` (one wide event per socket unit of work, D92).
 5. `livewire.NewEngine` with the registry, the adapters, the `IdentitySource` (`session.Guard` for sessions, or one that also resolves API keys, as the todo app's `authentication` package does) and the allowed origins.
 6. The govengers/jobs worker with the maintenance schedules of the stores.
-7. The gin router: the authentication middleware, `ginadapter.RegisterRoutes`, `ginadapter.SocketHandler` behind the same middleware.
+7. The gin router: the authentication middleware, `ginadapter.RegisterRoutes`, `ginadapter.SocketHandler` outside it (the `IdentitySource` identifies the socket, D97).
 8. Optionally the agents: `generate.NewCatalogue`, a `toolset.New` per agent, `mcpadapter.New` behind the authentication, `aikidoadapter.Register` for an in-process agent ([Agent-Tools](Agent-Tools.md)).
 9. Run `engine.Run`, the worker and the servers in one errgroup; on SIGTERM withdraw readiness, shut the server down, then `engine.Close(ctx)` ends every socket with 1001.
 

@@ -90,6 +90,20 @@ func TestASessionFollowsItsMembershipOnEveryRequest(t *testing.T) {
 	require.Equal(t, livewire.CloseIdentityGone, closed, "and its socket ends with 4401")
 }
 
+// TestASocketWithoutASessionClosesWith4401 pins D97 on the router: the socket is not behind the
+// REST authentication, so a browser whose session ended gets a socket that closes 4401 (its
+// client goes to the login) instead of a refused handshake it cannot read and retries forever.
+func TestASocketWithoutASessionClosesWith4401(t *testing.T) {
+	t.Parallel()
+	application := newTestApplication(t)
+	socket := application.dial(t, func(*http.Request) {})
+	require.NoError(t, socket.connection.SetReadDeadline(time.Now().Add(pushWait)))
+	var closed *websocket.CloseError
+	_, _, err := socket.connection.ReadMessage()
+	require.ErrorAs(t, err, &closed)
+	require.Equal(t, livewire.CloseIdentityGone, closed.Code)
+}
+
 // TestAMoveEndsAnOpenSubscriptionAtOnce pins the push-driven re-validation of a membership
 // change: the subscription of the old workspace ends with its error push without waiting for
 // the socket's next op or re-validation tick.
