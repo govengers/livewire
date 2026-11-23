@@ -3,7 +3,9 @@ package livewire_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -303,11 +305,6 @@ func TestOriginCheck(t *testing.T) {
 			}
 		})
 	}
-	_, response, err := bed.dialRaw("nobody", http.Header{})
-	require.Error(t, err)
-	require.Equal(t, http.StatusUnauthorized, response.StatusCode, "a request without an identity is refused")
-	require.NoError(t, response.Body.Close())
-
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, bed.server.URL, nil)
 	require.NoError(t, err)
 	request.Header.Set(subjectHeader, "ada")
@@ -315,6 +312,64 @@ func TestOriginCheck(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, plain.StatusCode, "a request that is no handshake")
 	require.NoError(t, plain.Body.Close())
+}
+
+// TestHandshakeIdentity pins D97: a handshake without an identity in its context asks the
+// IdentitySource; a gone identity is upgraded and closed 4401 (a refused handshake shows a
+// browser only 1006 and counts against the host), a failing source is refused before it.
+func TestHandshakeIdentity(t *testing.T) {
+	t.Run("a gone identity is upgraded and closed 4401", func(t *testing.T) {
+		bed := newTestbed(t, nil)
+		connection, response, err := bed.dialRaw("nobody", http.Header{"Origin": {"https://app.example"}})
+		require.NoError(t, err)
+		require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
+		require.NoError(t, response.Body.Close())
+		defer func() { _ = connection.Close() }()
+		// a browser's client subscribes as soon as the socket opens: the close still arrives
+		require.NoError(t, connection.WriteJSON(livewire.RequestFrame{ID: "1", Operation: livewire.OperationSubscribe, Target: "gadgets"}))
+		require.NoError(t, connection.SetReadDeadline(time.Now().Add(frameWait)))
+		_, _, err = connection.ReadMessage()
+		var closeError *websocket.CloseError
+		require.ErrorAs(t, err, &closeError)
+		require.Equal(t, livewire.CloseIdentityGone, closeError.Code)
+		require.Eventually(t, func() bool {
+			closes := bed.outcomes.of(livewire.OutcomeClose)
+			return len(closes) == 1 && closes[0].Status == livewire.CloseIdentityGone
+		}, frameWait, time.Millisecond, "the close is observed")
+		require.Empty(t, bed.outcomes.of(livewire.OutcomeOpen), "no socket was served")
+	})
+
+	t.Run("the source names the identity without a middleware", func(t *testing.T) {
+		bed := newTestbed(t, nil)
+		server := httptest.NewServer(bed.engine.Handler())
+		defer server.Close()
+		header := http.Header{subjectHeader: {"ada"}}
+		connection, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), header)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+		defer func() { _ = connection.Close() }()
+		require.NoError(t, connection.WriteJSON(livewire.RequestFrame{ID: "1", Operation: livewire.OperationPing}))
+		require.NoError(t, connection.SetReadDeadline(time.Now().Add(frameWait)))
+		var answer livewire.ResponseFrame
+		require.NoError(t, connection.ReadJSON(&answer))
+		require.True(t, answer.OK, "the socket serves ada")
+	})
+
+	t.Run("a failing source is refused before the upgrade", func(t *testing.T) {
+		bed := newTestbed(t, nil)
+		bed.identities.fail(errors.New("the session store is down"))
+		_, response, err := bed.dialRaw("nobody", http.Header{})
+		require.Error(t, err)
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+		require.NoError(t, response.Body.Close())
+
+		bed.identities.fail(nil)
+		bed.identities.panics.Store(true)
+		_, response, err = bed.dialRaw("nobody", http.Header{})
+		require.Error(t, err)
+		require.Equal(t, http.StatusInternalServerError, response.StatusCode, "a panicking source")
+		require.NoError(t, response.Body.Close())
+	})
 }
 
 func TestSocketLimits(t *testing.T) {

@@ -97,7 +97,7 @@ func TestParityNamesTheReadsItCannotRun(t *testing.T) {
 	unauthenticated := gateFailures(func(t testing.TB) {
 		livewiretest.Parity(t, &livewiretest.ParityOptions{Application: application.Application, Authenticate: as("nobody")})
 	})
-	requireFailure(t, unauthenticated, "the socket handshake answered 401")
+	requireFailure(t, unauthenticated, "REST answered 401") // the socket upgrades and closes 4401 (D97)
 	requireFailure(t, gateFailures(func(t testing.TB) { livewiretest.Parity(t, nil) }), "Parity needs options")
 	requireFailure(t, gateFailures(func(t testing.TB) {
 		livewiretest.Parity(t, &livewiretest.ParityOptions{Application: livewiretest.Application{Engine: application.Engine, Handler: application.Handler, SocketPath: "socket"}, Authenticate: as("alice")})

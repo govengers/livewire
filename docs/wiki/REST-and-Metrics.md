@@ -4,7 +4,7 @@
 
 ## Routes
 
-`ginadapter.RegisterRoutes(router, &ginadapter.Options{Engine, MaximumBodyBytes})` mounts every route of the engine's registry below its `BasePath`; `ginadapter.SocketHandler(engine)` is the socket. Both go behind the application's authentication, which puts the `auth.Identity` into the request context. From [examples/todo](../../examples/todo/internal/server/server.go):
+`ginadapter.RegisterRoutes(router, &ginadapter.Options{Engine, MaximumBodyBytes})` mounts every route of the engine's registry below its `BasePath`; `ginadapter.SocketHandler(engine)` is the socket. The routes go behind the application's authentication, which puts the `auth.Identity` into the request context; the socket goes outside it, the `IdentitySource` identifies its upgrade and a gone identity gets close 4401 instead of a 401 its browser cannot read (D97). From [examples/todo](../../examples/todo/internal/server/server.go):
 
 <!-- snippet: examples/todo/internal/server/server.go#routes -->
 ```go
@@ -13,7 +13,9 @@ if err := ginadapter.RegisterRoutes(api, &ginadapter.Options{Engine: engine}); e
     return nil, err
 }
 socket := ginadapter.SocketHandler(engine)
-api.GET(SocketPath, func(ginContext *gin.Context) {
+// outside the authentication: the engine's IdentitySource names the socket, and a gone
+// identity gets 4401 instead of a refused handshake, which a browser cannot read (D97)
+router.GET(SocketPath, func(ginContext *gin.Context) {
     // The socket's units of work are not the upgrade request: they get events of their own
     // (NewUnitStarter), so nothing writes to the upgrade's event after it was emitted (LOG-008).
     ginContext.Request = ginContext.Request.WithContext(wideevent.NewContext(ginContext.Request.Context(), nil))

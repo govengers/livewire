@@ -66,7 +66,8 @@ api := router.Group("", authginadapter.Middleware(guard.RequireAPI())) // the id
 if err := ginadapter.RegisterRoutes(api, &ginadapter.Options{Engine: engine}); err != nil {
     return err
 }
-api.GET("/api/v1/socket", ginadapter.SocketHandler(engine))
+// outside the 401: the guard identifies the socket, a gone session closes 4401 (D97)
+router.GET("/api/v1/socket", ginadapter.SocketHandler(engine))
 err = engine.Run(ctx) // the change feed and the ticks, until ctx ends
 closing, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 defer cancel()

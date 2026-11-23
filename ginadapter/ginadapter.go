@@ -66,8 +66,10 @@ func RegisterRoutes(router gin.IRoutes, options *Options) error {
 	return handlers.register(router, resolved.Engine.Registry())
 }
 
-// SocketHandler is the engine's socket endpoint as a gin handler; mount it behind the same
-// authentication as the REST routes. The engine must not be nil.
+// SocketHandler is the engine's socket endpoint as a gin handler. Mount it outside the
+// authentication that answers the REST routes 401: the engine's IdentitySource identifies the
+// upgrade and closes a gone identity's socket 4401, which a browser's client can read (D97).
+// The engine must not be nil.
 func SocketHandler(engine *livewire.Engine) gin.HandlerFunc {
 	return gin.WrapH(engine.Handler())
 }

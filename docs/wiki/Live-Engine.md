@@ -11,7 +11,7 @@ return livewire.NewEngine(&livewire.EngineOptions{
 })
 ```
 
-`Handler()` is the socket endpoint; mount it behind the same authentication as the REST routes (`ginadapter.SocketHandler` on gin). `Run(ctx)` consumes the change feed and drives the ticks until ctx ends; `Close(ctx)` ends every socket with 1001, refuses new ones with 503 and waits for them.
+`Handler()` is the socket endpoint (`ginadapter.SocketHandler` on gin); mount it outside the authentication that answers the REST routes 401. It identifies the upgrade through the `IdentitySource` when no middleware did and closes a gone identity's socket 4401 at once: a refused handshake shows a browser only 1006, so its client would retry forever, and Firefox delays every tab's next socket on the host after one (D97). `Run(ctx)` consumes the change feed and drives the ticks until ctx ends; `Close(ctx)` ends every socket with 1001, refuses new ones with 503 and waits for them.
 
 ## The socket
 
