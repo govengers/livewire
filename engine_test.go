@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -401,6 +402,34 @@ func TestHandshakeIdentity(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, http.StatusInternalServerError, response.StatusCode, "a panicking source")
 		require.NoError(t, response.Body.Close())
+
+		failures := bed.outcomes.of(livewire.OutcomeRevalidate)
+		require.Len(t, failures, 2, "each failure is observed")
+		require.ErrorContains(t, failures[0].Err, "the session store is down")
+		require.ErrorContains(t, failures[1].Err, "the identity source panicked")
+		require.Empty(t, bed.outcomes.of(livewire.OutcomeOpen))
+	})
+
+	t.Run("every gone answer closes 4401", func(t *testing.T) {
+		for name, gone := range map[string]error{
+			"forbidden":               auth.ErrForbidden,
+			"wrapped unauthenticated": fmt.Errorf("the session ended: %w", auth.ErrUnauthenticated),
+		} {
+			t.Run(name, func(t *testing.T) {
+				bed := newTestbed(t, nil)
+				bed.identities.fail(gone)
+				requireClosedGone(t, dialGone(t, bed))
+			})
+		}
+	})
+
+	t.Run("a foreign origin is refused before the source is asked", func(t *testing.T) {
+		bed := newTestbed(t, nil)
+		_, response, err := bed.dialRaw("nobody", http.Header{"Origin": {"https://evil.example"}, "Cookie": {"session=1"}})
+		require.Error(t, err)
+		require.Equal(t, http.StatusForbidden, response.StatusCode, "D9 before D97: a cross-site page never reaches the IdentitySource")
+		require.NoError(t, response.Body.Close())
+		require.Zero(t, bed.identities.calls.Load())
 	})
 }
 

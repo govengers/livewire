@@ -58,6 +58,7 @@ func (e *Engine) serveSocket(writer http.ResponseWriter, request *http.Request) 
 	}
 	identity := auth.IdentityFrom(request.Context())
 	if identity == nil {
+		identified := startUnit(OutcomeRevalidate, "", "")
 		err := recovering(func() error {
 			var identifyError error
 			identity, identifyError = e.options.IdentitySource.Identify(request.Context(), request)
@@ -68,6 +69,7 @@ func (e *Engine) serveSocket(writer http.ResponseWriter, request *http.Request) 
 			e.closeGone(writer, request)
 			return
 		case err != nil:
+			e.observeAlone(request.Context(), identified, identified.outcome(request.Context(), err)) // the source's failure, a panic's stack included
 			writeError(writer, err)
 			return
 		}
@@ -96,14 +98,10 @@ func (e *Engine) serveSocket(writer http.ResponseWriter, request *http.Request) 
 // engine refuses it with 503 as it refuses every socket, and Close waits for it; it is
 // observed as an open and a close, as every upgraded socket is.
 func (e *Engine) closeGone(writer http.ResponseWriter, request *http.Request) {
-	e.mutex.Lock()
-	if e.closing {
-		e.mutex.Unlock()
+	if !e.enter() {
 		writeError(writer, errUnavailable)
 		return
 	}
-	e.lifetimes.Add(1)
-	e.mutex.Unlock()
 	defer e.lifetimes.Done()
 	connection, err := e.upgrader.Upgrade(writer, request, nil)
 	if err != nil {

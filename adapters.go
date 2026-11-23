@@ -83,8 +83,8 @@ type ChangeFeed interface {
 // other error is a failure of the source: the engine keeps the last identity and retries.
 // The engine also identifies a socket's upgrade with it when no middleware put an identity
 // into the request's context (D97), so it must apply every check the REST authentication
-// applies, and answer ErrForbidden only for a gone identity, never for a missing right of a
-// valid session: the client takes a 4401 for a logout.
+// applies, and answer ErrForbidden only when the identity may act on nothing any more, never
+// for a missing right on one resource: the client takes a 4401 for a logout.
 type IdentitySource interface {
 	Identify(ctx context.Context, request *http.Request) (*auth.Identity, error)
 }
@@ -261,7 +261,7 @@ const (
 	OutcomeAfterCommit OutcomeKind = "after_commit" // a mutation's transaction committed (D41)
 	OutcomeOpen        OutcomeKind = "open"         // a socket was upgraded
 	OutcomeClose       OutcomeKind = "close"        // a socket ended; Status is its close code (1000, 1001, 1013, 4401, ...)
-	OutcomeRevalidate  OutcomeKind = "revalidate"   // a socket's identity re-validated on a tick or a Revalidate call (D6)
+	OutcomeRevalidate  OutcomeKind = "revalidate"   // a socket's identity re-validated on a tick or a Revalidate call (D6), or its upgrade's identification failed (D97)
 	OutcomeFeed        OutcomeKind = "feed"         // the change feed failed; the engine restarts it after a backoff
 	OutcomeHeartbeat   OutcomeKind = "heartbeat"    // the presence heartbeat and sweep of a tick (D37)
 	OutcomeExport      OutcomeKind = "export"       // one export (D35); Rows is how many rows it wrote
