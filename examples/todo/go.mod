@@ -15,7 +15,7 @@ require (
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
-	github.com/gorilla/websocket v1.5.3
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/govengers/aikido v1.2.0
 	github.com/govengers/auth v1.3.0
 	github.com/govengers/config/v2 v2.0.0
